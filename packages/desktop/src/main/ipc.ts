@@ -3,7 +3,15 @@ import { BrowserWindow, Notification, app, clipboard, dialog, ipcMain, shell } f
 import type { IpcMainEvent, IpcMainInvokeEvent } from "electron"
 import type { DesktopMenuAction } from "@opencode-ai/app/desktop-menu"
 
-import type { FatalRendererError, ServerReadyData, TitlebarTheme, WindowConfig, WslConfig } from "../preload/types"
+import type {
+  FatalRendererError,
+  ServerReadyData,
+  TitlebarTheme,
+  WindowConfig,
+  WslServerConfig,
+  WslServersEvent,
+  WslServersState,
+} from "../preload/types"
 import { runDesktopMenuAction } from "./desktop-menu-actions"
 import { getStore } from "./store"
 import { getPinchZoomEnabled, setPinchZoomEnabled, setTitlebar, updateTitlebar } from "./windows"
@@ -16,17 +24,29 @@ const pickerFilters = (ext?: string[]) => {
 type Deps = {
   killSidecar: () => Promise<void> | void
   awaitInitialization: () => Promise<ServerReadyData>
+  relaunch: () => void
+  getWslServersState: () => Promise<WslServersState> | WslServersState
+  onWslServersEvent: (listener: (event: WslServersEvent) => void) => () => void
+  wslServersProbeRuntime: () => Promise<void> | void
+  wslServersRefreshDistros: () => Promise<void> | void
+  wslServersInstallWsl: () => Promise<void> | void
+  wslServersInstallDistro: (name: string) => Promise<void> | void
+  wslServersProbeDistro: (name: string) => Promise<void> | void
+  wslServersProbeOpencode: (name: string) => Promise<void> | void
+  wslServersInstallOpencode: (name: string) => Promise<void> | void
+  wslServersOpenTerminal: (name: string) => Promise<void> | void
+  wslServersAddServer: (distro: string) => Promise<WslServerConfig> | WslServerConfig
+  wslServersRemoveServer: (id: string) => Promise<void> | void
+  wslServersStartServer: (id: string) => Promise<void> | void
   getWindowConfig: () => Promise<WindowConfig> | WindowConfig
   consumeInitialDeepLinks: () => Promise<string[]> | string[]
   getDefaultServerUrl: () => Promise<string | null> | string | null
   setDefaultServerUrl: (url: string | null) => Promise<void> | void
-  getWslConfig: () => Promise<WslConfig>
-  setWslConfig: (config: WslConfig) => Promise<void> | void
   getDisplayBackend: () => Promise<string | null>
   setDisplayBackend: (backend: string | null) => Promise<void> | void
   parseMarkdown: (markdown: string) => Promise<string> | string
   checkAppExists: (appName: string) => Promise<boolean> | boolean
-  wslPath: (path: string, mode: "windows" | "linux" | null) => Promise<string>
+  wslPath: (path: string, mode: "windows" | "linux" | null, distro?: string | null) => Promise<string>
   resolveAppPath: (appName: string) => Promise<string | null>
   runUpdater: (alertOnFail: boolean) => Promise<void> | void
   checkUpdate: () => Promise<{ updateAvailable: boolean; version?: string }>
@@ -37,24 +57,86 @@ type Deps = {
 }
 
 export function registerIpcHandlers(deps: Deps) {
+  const requireString = (name: string, value: unknown) => {
+    if (typeof value === "string" && value.length > 0) return value
+    throw new Error(`Invalid ${name}`)
+  }
+
+  const wslSubscriptions = new Map<number, () => void>()
+  const unsubscribeWsl = (id: number) => {
+    const off = wslSubscriptions.get(id)
+    if (!off) return
+    off()
+    wslSubscriptions.delete(id)
+  }
+
+  app.once("will-quit", () => {
+    for (const off of wslSubscriptions.values()) off()
+    wslSubscriptions.clear()
+  })
+
   ipcMain.handle("kill-sidecar", () => deps.killSidecar())
   ipcMain.handle("await-initialization", () => deps.awaitInitialization())
+  ipcMain.handle("wsl-servers-subscribe", (event) => {
+    const id = event.sender.id
+    if (wslSubscriptions.has(id)) return
+    wslSubscriptions.set(
+      id,
+      deps.onWslServersEvent((payload) => {
+        if (event.sender.isDestroyed()) {
+          unsubscribeWsl(id)
+          return
+        }
+        event.sender.send("wsl-servers-event", payload)
+      }),
+    )
+    event.sender.once("destroyed", () => unsubscribeWsl(id))
+  })
+  ipcMain.handle("wsl-servers-unsubscribe", (event) => unsubscribeWsl(event.sender.id))
+  ipcMain.handle("wsl-servers-get-state", () => deps.getWslServersState())
+  ipcMain.handle("wsl-servers-probe-runtime", () => deps.wslServersProbeRuntime())
+  ipcMain.handle("wsl-servers-refresh-distros", () => deps.wslServersRefreshDistros())
+  ipcMain.handle("wsl-servers-install-wsl", () => deps.wslServersInstallWsl())
+  ipcMain.handle("wsl-servers-install-distro", (_event: IpcMainInvokeEvent, name: string) =>
+    deps.wslServersInstallDistro(requireString("distro", name)),
+  )
+  ipcMain.handle("wsl-servers-probe-distro", (_event: IpcMainInvokeEvent, name: string) =>
+    deps.wslServersProbeDistro(requireString("distro", name)),
+  )
+  ipcMain.handle("wsl-servers-probe-opencode", (_event: IpcMainInvokeEvent, name: string) =>
+    deps.wslServersProbeOpencode(requireString("distro", name)),
+  )
+  ipcMain.handle("wsl-servers-install-opencode", (_event: IpcMainInvokeEvent, name: string) =>
+    deps.wslServersInstallOpencode(requireString("distro", name)),
+  )
+  ipcMain.handle("wsl-servers-open-terminal", (_event: IpcMainInvokeEvent, name: string) =>
+    deps.wslServersOpenTerminal(requireString("distro", name)),
+  )
+  ipcMain.handle("wsl-servers-add", (_event: IpcMainInvokeEvent, distro: string) =>
+    deps.wslServersAddServer(requireString("distro", distro)),
+  )
+  ipcMain.handle("wsl-servers-remove", (_event: IpcMainInvokeEvent, id: string) =>
+    deps.wslServersRemoveServer(requireString("server id", id)),
+  )
+  ipcMain.handle("wsl-servers-start", (_event: IpcMainInvokeEvent, id: string) =>
+    deps.wslServersStartServer(requireString("server id", id)),
+  )
   ipcMain.handle("get-window-config", () => deps.getWindowConfig())
   ipcMain.handle("consume-initial-deep-links", () => deps.consumeInitialDeepLinks())
   ipcMain.handle("get-default-server-url", () => deps.getDefaultServerUrl())
   ipcMain.handle("set-default-server-url", (_event: IpcMainInvokeEvent, url: string | null) =>
     deps.setDefaultServerUrl(url),
   )
-  ipcMain.handle("get-wsl-config", () => deps.getWslConfig())
-  ipcMain.handle("set-wsl-config", (_event: IpcMainInvokeEvent, config: WslConfig) => deps.setWslConfig(config))
   ipcMain.handle("get-display-backend", () => deps.getDisplayBackend())
   ipcMain.handle("set-display-backend", (_event: IpcMainInvokeEvent, backend: string | null) =>
     deps.setDisplayBackend(backend),
   )
   ipcMain.handle("parse-markdown", (_event: IpcMainInvokeEvent, markdown: string) => deps.parseMarkdown(markdown))
   ipcMain.handle("check-app-exists", (_event: IpcMainInvokeEvent, appName: string) => deps.checkAppExists(appName))
-  ipcMain.handle("wsl-path", (_event: IpcMainInvokeEvent, path: string, mode: "windows" | "linux" | null) =>
-    deps.wslPath(path, mode),
+  ipcMain.handle(
+    "wsl-path",
+    (_event: IpcMainInvokeEvent, path: string, mode: "windows" | "linux" | null, distro?: string | null) =>
+      deps.wslPath(path, mode, distro),
   )
   ipcMain.handle("resolve-app-path", (_event: IpcMainInvokeEvent, appName: string) => deps.resolveAppPath(appName))
   ipcMain.handle("run-updater", (_event: IpcMainInvokeEvent, alertOnFail: boolean) => deps.runUpdater(alertOnFail))
@@ -178,8 +260,7 @@ export function registerIpcHandlers(deps: Deps) {
   })
 
   ipcMain.on("relaunch", () => {
-    app.relaunch()
-    app.exit(0)
+    deps.relaunch()
   })
 
   ipcMain.handle("get-zoom-factor", (event: IpcMainInvokeEvent) => event.sender.getZoomFactor())

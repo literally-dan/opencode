@@ -5,21 +5,28 @@ import { DropdownMenu } from "@opencode-ai/ui/dropdown-menu"
 import { Icon } from "@opencode-ai/ui/icon"
 import { IconButton } from "@opencode-ai/ui/icon-button"
 import { List } from "@opencode-ai/ui/list"
+import { Spinner } from "@opencode-ai/ui/spinner"
 import { TextField } from "@opencode-ai/ui/text-field"
 import { useMutation } from "@tanstack/solid-query"
 import { showToast } from "@/utils/toast"
 import { useNavigate } from "@solidjs/router"
-import { createEffect, createMemo, createResource, Show } from "solid-js"
-import { createStore } from "solid-js/store"
+import { batch, createEffect, createMemo, createResource, For, onCleanup, Show, untrack } from "solid-js"
+import { createStore, reconcile } from "solid-js/store"
+import { DialogWslServer } from "@/components/dialog-wsl-server"
 import { ServerHealthIndicator, ServerRow } from "@/components/server/server-row"
 import { useGlobal } from "@/context/global"
 import { useLanguage } from "@/context/language"
 import { usePlatform } from "@/context/platform"
 import { normalizeServerUrl, ServerConnection, useServer } from "@/context/server"
+import { useWslServers } from "@/context/wsl-servers"
 import { type ServerHealth, useCheckServerHealth } from "@/utils/server-health"
 import { useSettings } from "@/context/settings"
 
 const DEFAULT_USERNAME = "opencode"
+
+interface DialogSelectServerProps {
+  onNavigateHome?: () => void
+}
 
 interface ServerFormProps {
   value: string
@@ -29,7 +36,6 @@ interface ServerFormProps {
   placeholder: string
   busy: boolean
   error: string
-  status: boolean | undefined
   onChange: (value: string) => void
   onNameChange: (value: string) => void
   onUsernameChange: (value: string) => void
@@ -46,15 +52,17 @@ function showRequestError(language: ReturnType<typeof useLanguage>, err: unknown
   })
 }
 
+function isWslSidecar(conn: ServerConnection.Any): conn is ServerConnection.Sidecar & { variant: "wsl" } {
+  return conn.type === "sidecar" && conn.variant === "wsl"
+}
+
 function useDefaultServer() {
   const language = useLanguage()
   const platform = usePlatform()
-  const [defaultKey, defaultUrlActions] = createResource(
+  const [defaultKey, defaultActions] = createResource(
     async () => {
       try {
-        const key = await platform.getDefaultServer?.()
-        if (!key) return null
-        return key
+        return (await platform.getDefaultServer?.()) ?? null
       } catch (err) {
         showRequestError(language, err)
         return null
@@ -62,50 +70,16 @@ function useDefaultServer() {
     },
     { initialValue: null },
   )
-
   const canDefault = createMemo(() => !!platform.getDefaultServer && !!platform.setDefaultServer)
   const setDefault = async (key: ServerConnection.Key | null) => {
     try {
       await platform.setDefaultServer?.(key)
-      defaultUrlActions.mutate(key)
+      defaultActions.mutate(key)
     } catch (err) {
       showRequestError(language, err)
     }
   }
-
-  return { defaultKey: () => defaultKey.latest, canDefault, setDefault }
-}
-
-function useServerPreview() {
-  const checkServerHealth = useCheckServerHealth()
-
-  const looksComplete = (value: string) => {
-    const normalized = normalizeServerUrl(value)
-    if (!normalized) return false
-    const host = normalized.replace(/^https?:\/\//, "").split("/")[0]
-    if (!host) return false
-    if (host.includes("localhost") || host.startsWith("127.0.0.1")) return true
-    return host.includes(".") || host.includes(":")
-  }
-
-  const previewStatus = async (
-    value: string,
-    username: string,
-    password: string,
-    setStatus: (value: boolean | undefined) => void,
-  ) => {
-    setStatus(undefined)
-    if (!looksComplete(value)) return
-    const normalized = normalizeServerUrl(value)
-    if (!normalized) return
-    const http: ServerConnection.HttpBase = { url: normalized }
-    if (username) http.username = username
-    if (password) http.password = password
-    const result = await checkServerHealth(http)
-    setStatus(result.healthy)
-  }
-
-  return { previewStatus }
+  return { defaultKey, canDefault, setDefault }
 }
 
 function ServerForm(props: ServerFormProps) {
@@ -173,9 +147,9 @@ function ServerForm(props: ServerFormProps) {
   )
 }
 
-export function DialogSelectServer() {
+export function DialogSelectServer(props: DialogSelectServerProps = {}) {
   const dialog = useDialog()
-  const controller = useServerManagementController({ onSelect: dialog.close })
+  const controller = useServerManagementController({ onSelect: dialog.close, onNavigateHome: props.onNavigateHome })
 
   return (
     <Dialog title={controller.formTitle()}>
@@ -188,16 +162,21 @@ export function DialogSelectServer() {
   )
 }
 
-export function useServerManagementController(options: { onSelect?: () => void } = {}) {
+export function useServerManagementController(options: { onSelect?: () => void; onNavigateHome?: () => void } = {}) {
   const navigate = useNavigate()
   const server = useServer()
   const global = useGlobal()
   const platform = usePlatform()
   const language = useLanguage()
-  const { defaultKey, canDefault, setDefault } = useDefaultServer()
-  const { previewStatus } = useServerPreview()
+  const wslServers = useWslServers()
+  const defaultServer = useDefaultServer()
   const checkServerHealth = useCheckServerHealth()
+  let disposed = false
+  onCleanup(() => {
+    disposed = true
+  })
   const [store, setStore] = createStore({
+    status: {} as Record<ServerConnection.Key, ServerHealth>,
     addServer: {
       url: "",
       name: "",
@@ -205,7 +184,9 @@ export function useServerManagementController(options: { onSelect?: () => void }
       password: "",
       error: "",
       showForm: false,
-      status: undefined as boolean | undefined,
+    },
+    addWsl: {
+      showWizard: false,
     },
     editServer: {
       id: undefined as string | undefined,
@@ -214,7 +195,6 @@ export function useServerManagementController(options: { onSelect?: () => void }
       username: "",
       password: "",
       error: "",
-      status: undefined as boolean | undefined,
     },
   })
 
@@ -226,7 +206,6 @@ export function useServerManagementController(options: { onSelect?: () => void }
       password: "",
       error: "",
       showForm: false,
-      status: undefined,
     })
   }
   const resetEdit = () => {
@@ -237,7 +216,6 @@ export function useServerManagementController(options: { onSelect?: () => void }
       username: "",
       password: "",
       error: "",
-      status: undefined,
     })
   }
 
@@ -310,6 +288,32 @@ export function useServerManagementController(options: { onSelect?: () => void }
     },
   }))
 
+  const removeWslMutation = useMutation(() => ({
+    mutationFn: async (key: ServerConnection.Key) => {
+      await platform.wslServers?.removeServer(key)
+      return key
+    },
+    onSuccess: async (key) => {
+      if (defaultServer.defaultKey() === key) await defaultServer.setDefault(null)
+      server.remove(key)
+    },
+    onError: (err) => showRequestError(language, err),
+  }))
+
+  const retryWslMutation = useMutation(() => ({
+    mutationFn: async (key: ServerConnection.Key) => {
+      await platform.wslServers?.startServer(key)
+    },
+    onError: (err) => showRequestError(language, err),
+  }))
+
+  const updateWslMutation = useMutation(() => ({
+    mutationFn: async (distro: string) => {
+      await platform.wslServers?.installOpencode(distro)
+    },
+    onError: (err) => showRequestError(language, err),
+  }))
+
   const replaceServer = (original: ServerConnection.Http, next: ServerConnection.Http) => {
     const active = server.key
     const newConn = server.add(next)
@@ -333,6 +337,32 @@ export function useServerManagementController(options: { onSelect?: () => void }
       ? undefined
       : (items().find((x) => ServerConnection.key(x) === server.key) ?? items()[0]),
   )
+  const wslState = () => wslServers.data
+  const healthPollKey = createMemo(() =>
+    items()
+      .map((conn) =>
+        [ServerConnection.key(conn), conn.http.url, conn.http.username ?? "", conn.http.password ?? ""].join("\n"),
+      )
+      .join("\n\n"),
+  )
+  const health = (key: ServerConnection.Key) => store.status[key]
+  const wslRuntime = (conn: ServerConnection.Any) => {
+    if (!isWslSidecar(conn)) return
+    return wslState()?.servers.find((item) => item.config.id === ServerConnection.key(conn))?.runtime
+  }
+  const nonReadyWslServers = createMemo(() =>
+    (wslState()?.servers ?? []).filter((item) => item.runtime.kind !== "ready"),
+  )
+  const canRetryWsl = (conn: ServerConnection.Any) => {
+    const runtime = wslRuntime(conn)
+    return runtime?.kind === "failed" || runtime?.kind === "stopped"
+  }
+  const canRetryWslRuntime = (kind: string) => kind === "failed" || kind === "stopped"
+  const wslRuntimeLabel = (kind: string) => {
+    if (kind === "starting") return "Starting"
+    if (kind === "failed") return "Failed"
+    return "Stopped"
+  }
 
   const sortedItems = createMemo(() => {
     const list = items()
@@ -347,31 +377,61 @@ export function useServerManagementController(options: { onSelect?: () => void }
     return list.slice().sort((a, b) => {
       if (a === active) return -1
       if (b === active) return 1
-      const diff =
-        rank(global.servers.health[ServerConnection.key(a)]) - rank(global.servers.health[ServerConnection.key(b)])
+      const diff = rank(health(ServerConnection.key(a))) - rank(health(ServerConnection.key(b)))
       if (diff !== 0) return diff
       return (order.get(a) ?? 0) - (order.get(b) ?? 0)
     })
   })
 
+  async function refreshHealth() {
+    const results: Record<ServerConnection.Key, ServerHealth> = {}
+    const list = untrack(items)
+    await Promise.all(
+      list.map(async (conn) => {
+        results[ServerConnection.key(conn)] = await checkServerHealth(conn.http)
+      }),
+    )
+    if (disposed) return
+    setStore("status", reconcile(results))
+  }
+
+  createEffect(() => {
+    healthPollKey()
+    void refreshHealth()
+    const interval = setInterval(refreshHealth, 10_000)
+    onCleanup(() => clearInterval(interval))
+  })
+
+  const wslCheck = (conn: ServerConnection.Any) => {
+    if (!isWslSidecar(conn)) return null
+    return wslState()?.opencodeChecks[conn.distro] ?? null
+  }
+
   async function select(conn: ServerConnection.Any, persist?: boolean) {
-    if (!persist && global.servers.health[ServerConnection.key(conn)]?.healthy === false) return
+    if (!persist && health(ServerConnection.key(conn))?.healthy === false) return
+    const navigateHome = () => {
+      if (options.onNavigateHome) {
+        options.onNavigateHome()
+        return
+      }
+      navigate("/")
+    }
     options.onSelect?.()
     if (persist && conn.type === "http") {
       server.add(conn)
-      navigate("/")
+      navigateHome()
       return
     }
-    navigate("/")
-    queueMicrotask(() => server.setActive(ServerConnection.key(conn)))
+
+    batch(() => {
+      navigateHome()
+      server.setActive(ServerConnection.key(conn))
+    })
   }
 
   const handleAddChange = (value: string) => {
     if (addMutation.isPending) return
     setStore("addServer", { url: value, error: "" })
-    void previewStatus(value, store.addServer.username, store.addServer.password, (next) =>
-      setStore("addServer", { status: next }),
-    )
   }
 
   const handleAddNameChange = (value: string) => {
@@ -382,25 +442,16 @@ export function useServerManagementController(options: { onSelect?: () => void }
   const handleAddUsernameChange = (value: string) => {
     if (addMutation.isPending) return
     setStore("addServer", { username: value, error: "" })
-    void previewStatus(store.addServer.url, value, store.addServer.password, (next) =>
-      setStore("addServer", { status: next }),
-    )
   }
 
   const handleAddPasswordChange = (value: string) => {
     if (addMutation.isPending) return
     setStore("addServer", { password: value, error: "" })
-    void previewStatus(store.addServer.url, store.addServer.username, value, (next) =>
-      setStore("addServer", { status: next }),
-    )
   }
 
   const handleEditChange = (value: string) => {
     if (editMutation.isPending) return
     setStore("editServer", { value, error: "" })
-    void previewStatus(value, store.editServer.username, store.editServer.password, (next) =>
-      setStore("editServer", { status: next }),
-    )
   }
 
   const handleEditNameChange = (value: string) => {
@@ -411,20 +462,15 @@ export function useServerManagementController(options: { onSelect?: () => void }
   const handleEditUsernameChange = (value: string) => {
     if (editMutation.isPending) return
     setStore("editServer", { username: value, error: "" })
-    void previewStatus(store.editServer.value, value, store.editServer.password, (next) =>
-      setStore("editServer", { status: next }),
-    )
   }
 
   const handleEditPasswordChange = (value: string) => {
     if (editMutation.isPending) return
     setStore("editServer", { password: value, error: "" })
-    void previewStatus(store.editServer.value, store.editServer.username, value, (next) =>
-      setStore("editServer", { status: next }),
-    )
   }
 
-  const mode = createMemo<"list" | "add" | "edit">(() => {
+  const mode = createMemo<"list" | "add-wsl" | "add" | "edit">(() => {
+    if (store.addWsl.showWizard) return "add-wsl"
     if (store.editServer.id) return "edit"
     if (store.addServer.showForm) return "add"
     return "list"
@@ -438,9 +484,11 @@ export function useServerManagementController(options: { onSelect?: () => void }
   const resetForm = () => {
     resetAdd()
     resetEdit()
+    setStore("addWsl", "showWizard", false)
   }
 
   const startAdd = () => {
+    setStore("addWsl", "showWizard", false)
     resetEdit()
     setStore("addServer", {
       showForm: true,
@@ -449,11 +497,11 @@ export function useServerManagementController(options: { onSelect?: () => void }
       username: DEFAULT_USERNAME,
       password: "",
       error: "",
-      status: undefined,
     })
   }
 
   const startEdit = (conn: ServerConnection.Http) => {
+    setStore("addWsl", "showWizard", false)
     resetAdd()
     setStore("editServer", {
       id: conn.http.url,
@@ -462,8 +510,20 @@ export function useServerManagementController(options: { onSelect?: () => void }
       username: conn.http.username ?? "",
       password: conn.http.password ?? "",
       error: "",
-      status: global.servers.health[ServerConnection.key(conn)]?.healthy,
     })
+  }
+
+  const startAddWsl = () => {
+    resetAdd()
+    resetEdit()
+    setStore("addWsl", "showWizard", true)
+  }
+
+  const handleAddedWsl = async (distro: string) => {
+    const key = ServerConnection.Key.make(`wsl:${distro}`)
+    setStore("addWsl", "showWizard", false)
+    const conn = items().find((item) => ServerConnection.key(item) === key)
+    if (conn) await select(conn)
   }
 
   const submitForm = () => {
@@ -482,14 +542,22 @@ export function useServerManagementController(options: { onSelect?: () => void }
 
   const isFormMode = createMemo(() => mode() !== "list")
   const isAddMode = createMemo(() => mode() === "add")
+  const isAddWslMode = createMemo(() => mode() === "add-wsl")
   const formBusy = createMemo(() => (isAddMode() ? addMutation.isPending : editMutation.isPending))
+  const canAddWsl = createMemo(() => !!platform.wslServers && platform.os === "windows")
 
   const formTitle = createMemo(() => {
     if (!isFormMode()) return language.t("dialog.server.title")
     return (
       <div class="flex items-center gap-2 -ml-2">
         <IconButton icon="arrow-left" variant="ghost" onClick={resetForm} aria-label={language.t("common.goBack")} />
-        <span>{isAddMode() ? language.t("dialog.server.add.title") : language.t("dialog.server.edit.title")}</span>
+        <span>
+          {isAddWslMode()
+            ? "Add WSL server"
+            : isAddMode()
+              ? language.t("dialog.server.add.title")
+              : language.t("dialog.server.edit.title")}
+        </span>
       </div>
     )
   })
@@ -500,19 +568,17 @@ export function useServerManagementController(options: { onSelect?: () => void }
     resetEdit()
   })
 
-  async function handleRemove(url: ServerConnection.Key) {
-    server.remove(url)
-    if ((await platform.getDefaultServer?.()) === url) {
-      void platform.setDefaultServer?.(null)
-    }
+  async function handleRemove(key: ServerConnection.Key) {
+    server.remove(key)
+    if (defaultServer.defaultKey() === key) await defaultServer.setDefault(null)
   }
 
   return {
-    defaultKey,
-    canDefault,
+    defaultKey: defaultServer.defaultKey,
+    canDefault: defaultServer.canDefault,
     current,
     sortedItems,
-    status: () => global.servers.health,
+    status: () => store.status,
     isFormMode,
     isAddMode,
     formTitle,
@@ -522,9 +588,8 @@ export function useServerManagementController(options: { onSelect?: () => void }
     formUsername: () => (isAddMode() ? store.addServer.username : store.editServer.username),
     formPassword: () => (isAddMode() ? store.addServer.password : store.editServer.password),
     formError: () => (isAddMode() ? store.addServer.error : store.editServer.error),
-    formStatus: () => (isAddMode() ? store.addServer.status : store.editServer.status),
     select,
-    setDefault,
+    setDefault: defaultServer.setDefault,
     startAdd,
     startEdit,
     resetForm,
@@ -661,7 +726,6 @@ export function ServerConnectionForm(props: { controller: ReturnType<typeof useS
         placeholder={language.t("dialog.server.add.placeholder")}
         busy={props.controller.formBusy()}
         error={props.controller.formError()}
-        status={props.controller.formStatus()}
         onChange={props.controller.handleFormChange()}
         onNameChange={props.controller.handleFormNameChange()}
         onUsernameChange={props.controller.handleFormUsernameChange()}

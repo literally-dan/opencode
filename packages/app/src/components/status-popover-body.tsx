@@ -287,7 +287,7 @@ function ServerStatusList(props: { state: ServerStatusState }) {
   )
 }
 
-export function StatusPopoverBody(props: { shown: Accessor<boolean> }) {
+export function StatusPopoverBody(props: { shown: Accessor<boolean>; close?: () => void }) {
   const sync = useSync()
   const global = useGlobal()
   const server = useServer()
