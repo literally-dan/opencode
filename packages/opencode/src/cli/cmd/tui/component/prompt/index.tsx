@@ -823,6 +823,67 @@ export function Prompt(props: PromptProps) {
     )
   }
 
+  function expandPasteExtmark(extmark: { id: number; start: number; end: number }) {
+    const partIndex = store.extmarkToPartIndex.get(extmark.id)
+    const part = partIndex === undefined ? undefined : store.prompt.parts[partIndex]
+    if (part?.type !== "text" || !part.source?.text) return false
+
+    const nextInput = store.prompt.input.slice(0, extmark.start) + part.text + store.prompt.input.slice(extmark.end)
+    const delta = part.text.length - (extmark.end - extmark.start)
+    const nextParts = store.prompt.parts
+      .flatMap((item, index) => {
+        if (index === partIndex) return []
+        const next = structuredClone(unwrap(item))
+        if (next.type === "agent" && next.source && next.source.start >= extmark.end) {
+          next.source.start += delta
+          next.source.end += delta
+        }
+        if (next.type === "file" && next.source?.text && next.source.text.start >= extmark.end) {
+          next.source.text.start += delta
+          next.source.text.end += delta
+        }
+        if (next.type === "text" && next.source?.text && next.source.text.start >= extmark.end) {
+          next.source.text.start += delta
+          next.source.text.end += delta
+        }
+        return [next]
+      })
+      .filter((item): item is PromptInfo["parts"][number] => item !== undefined)
+
+    input.setText(nextInput)
+    setStore("prompt", {
+      input: nextInput,
+      parts: nextParts,
+    })
+    restoreExtmarksFromParts(nextParts)
+    input.cursorOffset = extmark.start + part.text.length
+    return true
+  }
+
+  function expandPasteBlockAtMouse(event: MouseEvent) {
+    if (event.button !== 0) return false
+    const localX = event.x - input.x
+    const localY = event.y - input.y
+    if (localX < 0 || localY < 0 || localX >= input.width || localY >= input.height) return false
+
+    const previousOffset = input.cursorOffset
+    input.editorView.setLocalSelection(localX, localY, localX, localY, undefined, undefined, true, false)
+    input.editorView.resetLocalSelection()
+    const offset = input.cursorOffset
+    const extmark = input.extmarks.getAllForTypeId(promptPartTypeId).find((item) => {
+      const partIndex = store.extmarkToPartIndex.get(item.id)
+      const part = partIndex === undefined ? undefined : store.prompt.parts[partIndex]
+      if (part?.type !== "text") return false
+      return (offset >= item.start && offset <= item.end) || (offset + 1 >= item.start && offset + 1 <= item.end)
+    })
+    if (!extmark) {
+      input.cursorOffset = previousOffset
+      return false
+    }
+
+    return expandPasteExtmark(extmark)
+  }
+
   const stashCommands = createMemo(() =>
     [
       {
@@ -1578,6 +1639,11 @@ export function Prompt(props: PromptProps) {
                 }, 0)
               }}
               onMouseDown={(r: MouseEvent) => r.target?.focus()}
+              onMouseUp={(event: MouseEvent) => {
+                if (!expandPasteBlockAtMouse(event)) return
+                event.preventDefault()
+                event.stopPropagation()
+              }}
               focusedBackgroundColor={theme.backgroundElement}
               cursorColor={props.disabled ? theme.backgroundElement : theme.text}
               syntaxStyle={syntax()}
