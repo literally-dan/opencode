@@ -3,12 +3,14 @@ import { fileURLToPath } from "bun"
 import { useTheme } from "../context/theme"
 import { useDialog } from "@tui/ui/dialog"
 import { useSync } from "@tui/context/sync"
+import { useSDK } from "@tui/context/sdk"
 import { For, Match, Switch, Show, createMemo } from "solid-js"
 
 export type DialogStatusProps = {}
 
 export function DialogStatus() {
   const sync = useSync()
+  const sdk = useSDK()
   const { theme } = useTheme()
   const dialog = useDialog()
 
@@ -50,6 +52,10 @@ export function DialogStatus() {
           esc
         </text>
       </box>
+      <text fg={theme.text}>
+        Server{" "}
+        <span style={{ fg: theme.textMuted }}>{sdk.url === "http://opencode.internal" ? "Embedded" : sdk.url}</span>
+      </text>
       <Show when={Object.keys(sync.data.mcp).length > 0} fallback={<text fg={theme.text}>No MCP Servers</text>}>
         <box>
           <text fg={theme.text}>{Object.keys(sync.data.mcp).length} MCP Servers</text>
