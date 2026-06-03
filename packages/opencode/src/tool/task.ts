@@ -10,7 +10,7 @@ import { Agent } from "../agent/agent"
 import { deriveSubagentSessionPermission } from "../agent/subagent-permissions"
 import type { SessionPrompt } from "../session/prompt"
 import { Config } from "@/config/config"
-import { Cause, Effect, Exit, Schema, Scope } from "effect"
+import { Cause, Deferred, Effect, Exit, Schema, Scope } from "effect"
 import { EffectBridge } from "@/effect/bridge"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Database } from "@opencode-ai/core/database/database"
@@ -231,37 +231,60 @@ export const TaskTool = Tool.define(
           .pipe(Effect.ignore, Effect.forkIn(scope, { startImmediately: true }))
       })
 
+      const detached = yield* Deferred.make<void>()
+      if (runInBackground) yield* Deferred.succeed(detached, undefined).pipe(Effect.asVoid)
+
       const existing = yield* background.get(nextSession.id)
       if (existing?.status === "running") {
         return yield* Effect.fail(new Error(`Task ${nextSession.id} is already running.`))
       }
 
-      if (runInBackground) {
-        const info = yield* background.start({
-          id: nextSession.id,
-          type: id,
-          title: params.description,
-          metadata,
-          run: runTask().pipe(
-            Effect.tap((text) => inject("completed", text).pipe(Effect.ignore)),
-            Effect.catchCause((cause) =>
-              (Cause.hasInterruptsOnly(cause)
-                ? Effect.void
-                : inject("error", errorText(Cause.squash(cause))).pipe(Effect.ignore)
-              ).pipe(Effect.andThen(Effect.failCause(cause))),
-            ),
+      const info = yield* background.start({
+        id: nextSession.id,
+        type: id,
+        title: params.description,
+        metadata,
+        onPromote: Effect.all(
+          [
+            Deferred.succeed(detached, undefined),
+            ctx.metadata({
+              title: params.description,
+              metadata: { ...metadata, background: true, jobId: nextSession.id },
+            }),
+          ],
+          { discard: true },
+        ),
+        run: runTask().pipe(
+          Effect.onInterrupt(() => ops.cancel(nextSession.id)),
+          Effect.tap((text) =>
+            Deferred.isDone(detached).pipe(Effect.flatMap((done) => (done ? inject("completed", text) : Effect.void))),
           ),
-        })
+          Effect.catchCause((cause) =>
+            (Cause.hasInterruptsOnly(cause)
+              ? Effect.void
+              : Deferred.isDone(detached).pipe(
+                  Effect.flatMap((done) =>
+                    done ? inject("error", errorText(Cause.squash(cause))).pipe(Effect.ignore) : Effect.void,
+                  ),
+                )
+            ).pipe(Effect.andThen(Effect.failCause(cause))),
+          ),
+        ),
+      })
 
+      function backgroundResult() {
         return {
           title: params.description,
           metadata: {
             ...metadata,
+            background: true,
             jobId: info.id,
           },
           output: backgroundOutput(nextSession.id),
         }
       }
+
+      if (runInBackground) return backgroundResult()
 
       const runCancel = yield* EffectBridge.make()
       const cancel = ops.cancel(nextSession.id)
@@ -276,16 +299,23 @@ export const TaskTool = Tool.define(
         }),
         () =>
           Effect.gen(function* () {
-            const text = yield* runTask()
+            const result = yield* Effect.raceFirst(
+              background.wait({ id: nextSession.id }).pipe(Effect.map((waited) => waited.info)),
+              background.waitForPromotion(nextSession.id),
+            )
+            if (result?.metadata?.background === true) return backgroundResult()
+            if (result?.status === "error") return yield* Effect.fail(new Error(result.error ?? "Task failed"))
+            if (result?.status === "cancelled") return yield* Effect.fail(new Error("Task cancelled"))
             return {
               title: params.description,
               metadata,
-              output: output(nextSession.id, text),
+              output: output(nextSession.id, result?.output ?? ""),
             }
           }),
         (_, exit) =>
           Effect.gen(function* () {
-            if (Exit.hasInterrupts(exit)) yield* cancel
+            if (Exit.hasInterrupts(exit))
+              yield* Effect.all([cancel, background.cancel(nextSession.id)], { discard: true })
           }).pipe(
             Effect.ensuring(
               Effect.sync(() => {
