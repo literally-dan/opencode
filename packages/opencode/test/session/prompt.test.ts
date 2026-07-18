@@ -1492,7 +1492,11 @@ it.instance("prompt submitted during an active run is included in the next LLM i
     expect(inputs).toHaveLength(2)
     const messages = inputs.at(-1)?.messages
     if (!Array.isArray(messages)) throw new Error("expected LLM messages")
-    expect(messages.at(-1)).toEqual({ role: "user", content: "second" })
+    // This test is about prompt admission during an active run, so assert the
+    // admitted text and leave the metadata stamp to message-v2's own tests.
+    const sent = messages.at(-1) as { role: string; content: { type: string; text: string }[] }
+    expect(sent.role).toBe("user")
+    expect(sent.content[0]).toEqual({ type: "text", text: "second" })
   }),
 )
 

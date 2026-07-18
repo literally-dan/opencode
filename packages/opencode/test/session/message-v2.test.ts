@@ -247,6 +247,58 @@ describe("session.message-v2.toModelMessage", () => {
     ])
   })
 
+  test("experiment: stampUser stamps only user messages with a stable per-message ts + 4 bytes", async () => {
+    const userID = "m-user"
+    const input: SessionV1.WithParts[] = [
+      {
+        info: userInfo(userID),
+        parts: [{ ...basePart(userID, "p1"), type: "text", text: "hello" }] as SessionV1.Part[],
+      },
+      {
+        info: assistantInfo("m-assistant", userID),
+        parts: [{ ...basePart("m-assistant", "a1"), type: "text", text: "assistant" }] as SessionV1.Part[],
+      },
+    ]
+
+    // default (no stampUser) leaves everything untouched
+    expect(await MessageV2.toModelMessages(input, model)).toStrictEqual([
+      { role: "user", content: [{ type: "text", text: "hello" }] },
+      { role: "assistant", content: [{ type: "text", text: "assistant" }] },
+    ])
+
+    const stamped = await MessageV2.toModelMessages(input, model, { stampUser: true })
+    // assistant message is untouched
+    expect(stamped[1]).toStrictEqual({ role: "assistant", content: [{ type: "text", text: "assistant" }] })
+    // user message gains exactly one trailing JSON stamp text part
+    const userContent = stamped[0].content as Array<{ type: string; text?: string }>
+    expect(userContent[0]).toStrictEqual({ type: "text", text: "hello" })
+    expect(userContent.length).toBe(2)
+    expect(userContent[1].type).toBe("text")
+    expect(userContent[1].text!).toMatch(/^<message-metadata>\{"ts":0,"rand":"[0-9a-f]{8}"\}<\/message-metadata>$/)
+
+    // Stability is load-bearing: a stamp that changed per request would rewrite
+    // the tail of every historical user message and break prompt caching.
+    const again = await MessageV2.toModelMessages(input, model, { stampUser: true })
+    expect((again[0].content as Array<{ text?: string }>)[1].text).toBe(userContent[1].text)
+
+    // ts carries the message's own creation time, not the time of the request,
+    // which is what makes it usable for reasoning about gaps between turns.
+    const later: SessionV1.WithParts[] = [
+      {
+        info: { ...userInfo("m-user-later"), time: { created: 1_700_000_000_000 } },
+        parts: [{ ...basePart("m-user-later", "p1"), type: "text", text: "hello" }],
+      },
+    ]
+    const laterStamp = (
+      (await MessageV2.toModelMessages(later, model, { stampUser: true }))[0].content as Array<{
+        text?: string
+      }>
+    )[1].text!
+    expect(laterStamp).toContain('"ts":1700000000000')
+    // Distinct per message, so repeated identical prompts do not read as one input.
+    expect(laterStamp).not.toBe(userContent[1].text)
+  })
+
   test("converts user text/file parts and injects compaction/subtask prompts", async () => {
     const messageID = "m-user"
 
