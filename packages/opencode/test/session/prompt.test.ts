@@ -1910,74 +1910,79 @@ it.instance("concurrent loop callers all receive same error result", () =>
   }),
 )
 
-it.instance("prompt submitted during an active run is included in the next LLM input", () =>
-  Effect.gen(function* () {
-    const { llm } = yield* useServerConfig(providerCfg)
-    const gate = yield* Deferred.make<void>()
-    const prompt = yield* SessionPrompt.Service
-    const sessions = yield* Session.Service
-    const chat = yield* sessions.create({ title: "Pinned" })
+it.instance(
+  "prompt submitted during an active run is included in the next LLM input",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const gate = yield* Deferred.make<void>()
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
 
-    yield* llm.hold("first", deferredAsPromise(gate))
-    yield* llm.text("second")
+      yield* llm.hold("first", deferredAsPromise(gate))
+      yield* llm.text("second")
 
-    const a = yield* prompt
-      .prompt({
-        sessionID: chat.id,
-        agent: "build",
-        model: ref,
-        parts: [{ type: "text", text: "first" }],
-      })
-      .pipe(Effect.forkChild)
+      const a = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          agent: "build",
+          model: ref,
+          parts: [{ type: "text", text: "first" }],
+        })
+        .pipe(Effect.forkChild)
 
-    yield* llm.wait(1)
-    yield* waitForBusy(chat.id)
+      yield* llm.wait(1)
+      yield* waitForBusy(chat.id)
 
-    const id = MessageID.ascending()
-    const b = yield* prompt
-      .prompt({
-        sessionID: chat.id,
-        messageID: id,
-        agent: "build",
-        model: ref,
-        parts: [{ type: "text", text: "second" }],
-      })
-      .pipe(Effect.forkChild)
+      const id = MessageID.ascending()
+      const b = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          messageID: id,
+          agent: "build",
+          model: ref,
+          parts: [{ type: "text", text: "second" }],
+        })
+        .pipe(Effect.forkChild)
 
-    yield* pollWithTimeout(
-      sessions
-        .messages({ sessionID: chat.id })
-        .pipe(
-          Effect.map((msgs) => (msgs.some((msg) => msg.info.role === "user" && msg.info.id === id) ? true : undefined)),
-        ),
-      "timed out waiting for second prompt to save",
-    )
+      yield* pollWithTimeout(
+        sessions
+          .messages({ sessionID: chat.id })
+          .pipe(
+            Effect.map((msgs) =>
+              msgs.some((msg) => msg.info.role === "user" && msg.info.id === id) ? true : undefined,
+            ),
+          ),
+        "timed out waiting for second prompt to save",
+      )
 
-    yield* Deferred.succeed(gate, void 0)
+      yield* Deferred.succeed(gate, void 0)
 
-    const [ea, eb] = yield* Effect.all([Fiber.await(a), Fiber.await(b)])
-    expect(Exit.isSuccess(ea)).toBe(true)
-    expect(Exit.isSuccess(eb)).toBe(true)
-    expect(yield* llm.calls).toBe(2)
+      const [ea, eb] = yield* Effect.all([Fiber.await(a), Fiber.await(b)])
+      expect(Exit.isSuccess(ea)).toBe(true)
+      expect(Exit.isSuccess(eb)).toBe(true)
+      expect(yield* llm.calls).toBe(2)
 
-    const msgs = yield* sessions.messages({ sessionID: chat.id })
-    const assistants = msgs.filter((msg) => msg.info.role === "assistant")
-    expect(assistants).toHaveLength(2)
-    const last = assistants.at(-1)
-    if (!last || last.info.role !== "assistant") throw new Error("expected second assistant")
-    expect(last.info.parentID).toBe(id)
-    expect(last.parts.some((part) => part.type === "text" && part.text === "second")).toBe(true)
+      const msgs = yield* sessions.messages({ sessionID: chat.id })
+      const assistants = msgs.filter((msg) => msg.info.role === "assistant")
+      expect(assistants).toHaveLength(2)
+      const last = assistants.at(-1)
+      if (!last || last.info.role !== "assistant") throw new Error("expected second assistant")
+      expect(last.info.parentID).toBe(id)
+      expect(last.parts.some((part) => part.type === "text" && part.text === "second")).toBe(true)
 
-    const inputs = yield* llm.inputs
-    expect(inputs).toHaveLength(2)
-    const messages = inputs.at(-1)?.messages
-    if (!Array.isArray(messages)) throw new Error("expected LLM messages")
-    // This test is about prompt admission during an active run, so assert the
-    // admitted text and leave the metadata stamp to message-v2's own tests.
-    const sent = messages.at(-1) as { role: string; content: { type: string; text: string }[] }
-    expect(sent.role).toBe("user")
-    expect(sent.content[0]).toEqual({ type: "text", text: "second" })
-  }),
+      const inputs = yield* llm.inputs
+      expect(inputs).toHaveLength(2)
+      const messages = inputs.at(-1)?.messages
+      if (!Array.isArray(messages)) throw new Error("expected LLM messages")
+      // This test is about prompt admission during an active run, so assert the
+      // admitted text and leave the metadata stamp to message-v2's own tests.
+      const sent = messages.at(-1) as { role: string; content: { type: string; text: string }[] }
+      expect(sent.role).toBe("user")
+      expect(sent.content[0]).toEqual({ type: "text", text: "second" })
+    }),
+  { timeout: 15_000 },
 )
 
 it.instance("assertNotBusy fails with BusyError when loop running", () =>

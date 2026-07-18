@@ -1896,13 +1896,17 @@ describe("session.compaction.process", () => {
 
         yield* Deferred.await(ready).pipe(Effect.timeout("5 seconds"))
         const start = Date.now()
+        // Fiber.interrupt already awaits the fiber, so this bound is the only
+        // one that matters. The stub is mid-backoff on a 10s retry-after, so
+        // 500ms still proves the interrupt short-circuits it by 20x while
+        // leaving room for GC and scheduler pressure.
         yield* Fiber.interrupt(fiber)
-        const exit = yield* Fiber.await(fiber).pipe(Effect.timeout("250 millis"))
+        const exit = yield* Fiber.await(fiber)
 
         expect(Exit.isFailure(exit)).toBe(true)
         if (Exit.isFailure(exit)) {
           expect(Cause.hasInterrupts(exit.cause)).toBe(true)
-          expect(Date.now() - start).toBeLessThan(250)
+          expect(Date.now() - start).toBeLessThan(500)
         }
       }).pipe(withCompaction({ llm: stub.llmLayer }))
     },

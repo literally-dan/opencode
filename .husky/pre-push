@@ -17,4 +17,10 @@ if (process.versions.bun !== expectedBunVersion) {
   console.warn(`Warning: Bun version ${process.versions.bun} differs from expected ${expectedBunVersion}`);
 }
 '
-bun typecheck
+# 36 typecheck tasks at turbo's default concurrency of 10 can put ten concurrent
+# tsgo processes on a memory-tight machine, which thrashes. 4 keeps most of the
+# parallelism without that. Scope to packages affected since the base branch so
+# an incremental push doesn't pay for the whole graph — a hook slow enough to be
+# routinely bypassed with --no-verify is worse than no hook.
+# Override with TYPECHECK_CONCURRENCY (an integer or a percentage like "100%").
+bun turbo typecheck --filter="...[origin/dev]" --concurrency="${TYPECHECK_CONCURRENCY:-4}"

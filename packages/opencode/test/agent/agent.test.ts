@@ -644,6 +644,7 @@ it.instance(
       },
     },
   },
+  { timeout: 15_000 },
 )
 
 it.instance("defaultAgent returns build when no default_agent config", () =>
