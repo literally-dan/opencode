@@ -1,7 +1,7 @@
 /** @jsxImportSource @opentui/solid */
 import { createDefaultOpenTuiKeymap } from "@opentui/keymap/opentui"
 import { testRender, useRenderer, type JSX } from "@opentui/solid"
-import type { Event, GlobalEvent, Session as SessionInfo } from "@opencode-ai/sdk/v2"
+import type { AssistantMessage, Event, GlobalEvent, Session as SessionInfo, ToolPart } from "@opencode-ai/sdk/v2"
 import { expect, test } from "bun:test"
 import { mkdir } from "node:fs/promises"
 import path from "node:path"
@@ -269,6 +269,7 @@ test("shows the interrupt hint while subagents run under an idle root", async ()
     mounted.app.renderer.destroy()
   }
 })
+
 test("aborts busy Task children in another location on the second escape", async () => {
   await using tmp = await tmpdir()
   const moved = { ...root, directory: path.join(directory, "moved") }
@@ -299,3 +300,54 @@ test("aborts busy Task children in another location on the second escape", async
   }
 })
 
+test("ignores subagent session loads aborted by quitting", async () => {
+  await using tmp = await tmpdir()
+  let childLoads = 0
+  const message = {
+    id: "msg_task",
+    sessionID: root.id,
+    role: "assistant",
+    agent: "build",
+    modelID: "model",
+    providerID: "test",
+    mode: "build",
+    parentID: "msg_user",
+    path: { cwd: directory, root: directory },
+    cost: 0,
+    tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+    time: { created: 2 },
+  } satisfies AssistantMessage
+  const part = {
+    id: "prt_task",
+    sessionID: root.id,
+    messageID: message.id,
+    type: "tool",
+    callID: "call_task",
+    tool: "task",
+    state: { status: "running", input: {}, metadata: { sessionId: child.id }, time: { start: 2 } },
+  } satisfies ToolPart
+  const mounted = await mountRoute(
+    tmp.path,
+    () => <Session />,
+    (request) => {
+      const url = new URL(request.url)
+      if (url.pathname === `/session/${root.id}/message`) return json([{ info: message, parts: [part] }])
+      if (url.pathname !== `/session/${child.id}`) return
+      childLoads++
+      return new Promise<Response>((_resolve, reject) => {
+        request.signal.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), {
+          once: true,
+        })
+      })
+    },
+  )
+
+  try {
+    await wait(() => childLoads > 0)
+    mounted.app.renderer.destroy()
+    // An unhandled rejection fails the running bun test. In the TUI process it exits with code 1.
+    await Bun.sleep(50)
+  } finally {
+    if (!mounted.app.renderer.isDestroyed) mounted.app.renderer.destroy()
+  }
+})
