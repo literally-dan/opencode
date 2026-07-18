@@ -2016,6 +2016,44 @@ describe("session.compaction.process", () => {
   )
 
   itCompaction.instance(
+    "does not count user message stamps as fixed request overhead",
+    () => {
+      const stub = llm()
+      stub.push(reply("summary"))
+      return Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const test = yield* TestInstance
+        const session = yield* ssn.create({})
+        // Provider usage includes the metadata stamp on every user message. An
+        // unstamped history estimate moves those stamps into fixed overhead,
+        // where they survive compaction of the messages that carried them.
+        const users = yield* Effect.forEach(Array.from({ length: 100 }), () => createUserMessage(session.id, "u"))
+        const observed = yield* createAssistantMessage(session.id, users.at(-1)!.id, test.directory)
+        yield* ssn.updateMessage({
+          ...observed,
+          tokens: { input: 70_500, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        })
+        yield* createCompactionMarker(session.id)
+        const msgs = yield* ssn.messages({ sessionID: session.id })
+
+        const result = yield* SessionCompaction.use.process({
+          parentID: msgs.at(-1)!.info.id,
+          messages: msgs,
+          sessionID: session.id,
+          auto: true,
+        })
+
+        const summary = (yield* ssn.messages({ sessionID: session.id })).find(
+          (message) => message.info.role === "assistant" && message.info.summary,
+        )
+        expect(summary?.info.role === "assistant" ? summary.info.error : undefined).toBeUndefined()
+        expect(result).toBe("continue")
+      }).pipe(withCompaction({ llm: stub.llmLayer, config: cfg({ tail_turns: 0 }) }))
+    },
+    { git: true },
+  )
+
+  itCompaction.instance(
     "validates projected context with the full automatic summary",
     () => {
       const stub = llm()

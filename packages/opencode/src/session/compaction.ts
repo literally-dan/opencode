@@ -307,7 +307,7 @@ const layer = Layer.effect(
     })
 
     const projection = Effect.fnUntraced(function* (input: { messages: SessionV1.WithParts[]; model: Provider.Model }) {
-      const msgs = yield* MessageV2.toModelMessagesEffect(input.messages, input.model)
+      const msgs = yield* MessageV2.toModelMessagesEffect(input.messages, input.model, { stampUser: true })
       return JSON.stringify(msgs)
     })
 

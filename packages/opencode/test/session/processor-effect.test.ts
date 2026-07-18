@@ -501,6 +501,61 @@ it.live("session.processor effect tests re-estimate overflow without history hid
   ),
 )
 
+it.live("session.processor effect tests re-estimate overflow with stamped user messages", () =>
+  provideTmpdirServer(
+    ({ dir, llm }) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+
+        yield* llm.text("after", { usage: { input: 6_000, output: 0 } })
+
+        const chat = yield* session.create({})
+        // Each live request stamps every user message with creation metadata,
+        // so many short user messages cost far more than their text.
+        yield* Effect.forEach(Array.from({ length: 100 }), () => user(chat.id, "u"), { discard: true })
+        const parent = yield* session.updateMessage({
+          id: MessageID.ascending(),
+          role: "user",
+          sessionID: chat.id,
+          agent: "build",
+          model: ref,
+          time: { created: Date.now() },
+        })
+        yield* session.updatePart({
+          id: PartID.ascending(),
+          messageID: parent.id,
+          sessionID: chat.id,
+          type: "text",
+          text: "large settled request",
+          compacted: Date.now(),
+          compactionGroup: "manual-group",
+          compactionSummary: "manual note",
+        })
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const base = yield* provider.getModel(ref.providerID, ref.modelID)
+        const mdl = { ...base, limit: { context: 4_500, output: 1_000 } }
+        const handle = yield* processors.create({
+          assistantMessage: msg,
+          sessionID: chat.id,
+          model: mdl,
+        })
+
+        const value = yield* handle.process({
+          user: parent,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "large settled request" }],
+          tools: {},
+        })
+
+        expect(value).toBe("compact")
+      }),
+    { config: (url) => providerCfg(url) },
+  ),
+)
+
 it.live("session.processor effect tests capture reasoning from http mock", () =>
   provideTmpdirServer(
     ({ dir, llm }) =>

@@ -432,10 +432,38 @@ function withoutItemIDs(metadata: Record<string, any> | undefined) {
   )
 }
 
+// Stamps each USER message, and nothing else, with its creation time and a short
+// token. The model is the only consumer: `ts` gives it temporal grounding across
+// turns, and `rand` gives every message a distinct identity so repeated
+// identical prompts do not read as one input.
+//
+// Both fields are stable per message across every request: `ts` is the immutable
+// creation time and the token is an FNV-1a hash of it. That stability is
+// load-bearing — a value that changed per request would rewrite the tail of every
+// historical user message and invalidate provider prompt caching on each turn.
+//
+// The token comes from the creation time and not from the message id. A forked
+// session gives each copied message a new id but keeps its creation time, and the
+// copy must carry the same stamp: otherwise the copied history misses the
+// provider prompt cache and one message has two identities.
+//
+// Gated behind `stampUser` so only the live prompt loop stamps; title, summary
+// and compaction requests are unaffected.
+const userStamp = (ts: number) => {
+  const seed = String(ts)
+  let h = 0x811c9dc5
+  for (let i = 0; i < seed.length; i++) {
+    h ^= seed.charCodeAt(i)
+    h = Math.imul(h, 0x01000193)
+  }
+  const json = JSON.stringify({ ts, rand: (h >>> 0).toString(16).padStart(8, "0") })
+  return `<message-metadata>${json}</message-metadata>`
+}
+
 export const toModelMessagesEffect = Effect.fnUntraced(function* (
   input: WithParts[],
   model: Provider.Model,
-  options?: { stripMedia?: boolean; toolOutputMaxChars?: number },
+  options?: { stripMedia?: boolean; toolOutputMaxChars?: number; stampUser?: boolean },
 ) {
   const projected = projectErroredTurns(input)
   const result: UIMessage[] = []
@@ -587,8 +615,11 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
           })
         }
       }
-      if (userMessage.parts.length > 0) result.push(userMessage)
       closeRun()
+      if (userMessage.parts.length > 0) {
+        if (options?.stampUser) userMessage.parts.push({ type: "text", text: userStamp(msg.info.time.created) })
+        result.push(userMessage)
+      }
     }
 
     if (msg.info.role === "assistant") {
@@ -843,7 +874,7 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
 export function toModelMessages(
   input: WithParts[],
   model: Provider.Model,
-  options?: { stripMedia?: boolean; toolOutputMaxChars?: number },
+  options?: { stripMedia?: boolean; toolOutputMaxChars?: number; stampUser?: boolean },
 ): Promise<ModelMessage[]> {
   return Effect.runPromise(toModelMessagesEffect(input, model, options))
 }

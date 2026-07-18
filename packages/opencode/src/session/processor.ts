@@ -723,7 +723,7 @@ const layer = Layer.effect(
                   message.parts.some((part) => compactionOf(part)?.native === false),
                 )
                 const current = manuallyCompacted
-                  ? yield* MessageV2.toModelMessagesEffect(messages, ctx.model).pipe(
+                  ? yield* MessageV2.toModelMessagesEffect(messages, ctx.model, { stampUser: true }).pipe(
                       Effect.map((messages) =>
                         estimateRequest({
                           system: ctx.request?.system ?? [],
