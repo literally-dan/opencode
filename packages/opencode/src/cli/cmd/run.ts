@@ -22,9 +22,11 @@ import { UI } from "../ui"
 import { effectCmd } from "../effect-cmd"
 import { EOL } from "os"
 import { Filesystem } from "@/util/filesystem"
-import { createOpencodeClient, type OpencodeClient, type ToolPart } from "@opencode-ai/sdk/v2"
+import { createOpencodeClient, type OpencodeClient, type PermissionRequest, type ToolPart } from "@opencode-ai/sdk/v2"
 import { FormatError, FormatUnknownError } from "../error"
 import { INTERACTIVE_INPUT_ERROR, resolveInteractiveStdin } from "./run/runtime.stdin"
+import { DescendantFetchError, fetchDescendantIDs, resolveSessionTreeOwnership } from "./run/tree"
+import { replyPermission } from "@/session/permission-reply"
 
 type ModelInput = Parameters<OpencodeClient["session"]["prompt"]>[0]["model"]
 
@@ -690,135 +692,265 @@ export const RunCommand = effectCmd({
           return false
         }
 
+        let finishAttachRecovery = async () => {}
+
         // Consume one subscribed event stream for the active session and mirror it
         // to stdout/UI. `client` is passed explicitly because attach mode may
         // rebind the SDK to the session's directory after the subscription is
         // created, and replies issued from inside the loop must use that client.
-        async function loop(client: OpencodeClient, events: Awaited<ReturnType<typeof sdk.event.subscribe>>) {
+        async function loop(
+          client: OpencodeClient,
+          events: Awaited<ReturnType<typeof sdk.event.subscribe>>,
+          earlierPermissions: ReadonlySet<string> | undefined,
+        ) {
           const toggles = new Map<string, boolean>()
-          const sessions = new Set([sessionID])
           let error: string | undefined
+          let idle = false
+          // `tree` is the transitive set of sessions under this run. It is
+          // the membership oracle for "should this permission prompt count
+          // as ours" — a nested subagent's permission event carries the
+          // deepest session's id, and equality against the root id would
+          // miss it.
+          //
+          // Maintenance:
+          //   - seeded with the entire descendant chain so attach mode can
+          //     identify prompts pending from before the subscription;
+          //   - extended on `session.created`/`session.updated` whenever a
+          //     new session's parent is already in the tree;
+          //   - on out-of-order events (grandchild seen before parent),
+          //     `resolveSessionTreeOwnership` walks the chain via the SDK as a fallback.
+          const ancestryAbort = new AbortController()
+          const tree = new Set<string>([sessionID])
+          // Resolved in the background. Awaiting it here would delay the `/event`
+          // subscription below by a round trip, and that route has no replay, so
+          // anything published in the gap — including the `session.status: idle`
+          // this loop breaks on — would be lost.
+          const seeded = fetchDescendantIDs(client, sessionID, { signal: ancestryAbort.signal })
+            .catch((error) => {
+              UI.error(
+                `failed to seed complete session tree; permission ancestry will be checked on demand (${String(error)})`,
+              )
+              return new Set<string>(error instanceof DescendantFetchError ? error.partial.map((item) => item.id) : [])
+            })
+            .then((ids) => {
+              for (const id of ids) tree.add(id)
+            })
+          const pendingPermissions = new Map<string, Promise<void>>()
+          const seenPermissions = new Set<string>()
 
-          for await (const event of events.stream) {
-            if (event.type === "session.created" && event.properties.info.parentID) {
-              if (sessions.has(event.properties.info.parentID)) sessions.add(event.properties.info.id)
-            }
+          function answerPermission(requestID: string, reply: "once" | "always" | "reject") {
+            return replyPermission(client, {
+              requestID,
+              reply,
+              signal: ancestryAbort.signal,
+              onRetry: (retry) => {
+                if (retry.attempt !== 1 && retry.attempt % 5 !== 0) return
+                UI.error(
+                  `permission reply failed; retrying ${requestID} in ${retry.retryIn}ms (${String(retry.error)})`,
+                )
+              },
+            })
+          }
 
-            if (
-              event.type === "message.updated" &&
-              event.properties.sessionID === sessionID &&
-              event.properties.info.role === "assistant" &&
-              args.format !== "json" &&
-              toggles.get("start") !== true
-            ) {
-              UI.empty()
-              UI.println(`> ${event.properties.info.agent} · ${event.properties.info.modelID}`)
-              UI.empty()
-              toggles.set("start", true)
-            }
+          function routePermission(permission: PermissionRequest) {
+            if (seenPermissions.has(permission.id)) return pendingPermissions.get(permission.id)
+            seenPermissions.add(permission.id)
+            const task = (async () => {
+              const ownership = tree.has(permission.sessionID)
+                ? ({ type: "owned" } as const)
+                : await (async () => {
+                    // The seed makes an already-pending prompt from before
+                    // the subscription ours, but known sessions should not
+                    // wait for unrelated descendant branches to finish.
+                    await seeded
+                    if (tree.has(permission.sessionID)) return { type: "owned" } as const
+                    return resolveSessionTreeOwnership(client, tree, permission.sessionID, {
+                      signal: ancestryAbort.signal,
+                      onUnknown: (retry) => {
+                        if (retry.attempt !== 1 && retry.attempt % 5 !== 0) return
+                        UI.error(
+                          `permission ownership unresolved; retrying ${permission.id} in ${retry.retryIn}ms (${String(retry.error)})`,
+                        )
+                      },
+                    })
+                  })()
+              if (ownership.type === "foreign" || ownership.type === "cancelled") return
+              if (ownership.type === "exhausted") {
+                // A cycle or deleted parent never resolves, and the server
+                // waits on an untimed deferred, so reject rather than hang.
+                UI.error(`permission ancestry unresolvable for ${permission.id}; rejecting (${String(ownership.error)})`)
+                await answerPermission(permission.id, "reject")
+                return
+              }
 
-            if (event.type === "message.part.updated") {
-              const part = event.properties.part
-              if (part.sessionID !== sessionID) continue
+              // Auto-accept/reject behaviour applies to every descendant
+              // because they are all part of this run.
+              if (auto) {
+                await answerPermission(permission.id, "once")
+                return
+              }
 
-              if (part.type === "tool" && (part.state.status === "completed" || part.state.status === "error")) {
-                if (emit("tool_use", { part })) continue
-                if (part.state.status === "completed") {
-                  await tool(part)
-                  continue
-                }
-                await toolError(part)
-                UI.error(part.state.error)
+              UI.println(
+                UI.Style.TEXT_WARNING_BOLD + "!",
+                UI.Style.TEXT_NORMAL +
+                  `permission requested: ${permission.permission} (${permission.patterns.join(", ")}); auto-rejecting`,
+              )
+              await answerPermission(permission.id, "reject")
+            })().catch((failure) => {
+              seenPermissions.delete(permission.id)
+              if (ancestryAbort.signal.aborted) return
+              const message = `failed to route permission ${permission.id}: ${String(failure)}`
+              error = error ? error + EOL + message : message
+              UI.error(message)
+            })
+            const pending = task.finally(() => {
+              if (pendingPermissions.get(permission.id) === pending) pendingPermissions.delete(permission.id)
+            })
+            pendingPermissions.set(permission.id, pending)
+            return pending
+          }
+
+          // The event stream has no replay. Recover requests that predate the
+          // subscription and deduplicate them against events arriving while the
+          // list call is in flight. Requests that were already pending when this
+          // run started wait for a human, so recovery leaves them alone. If that
+          // list is unknown, recovery answers nothing.
+          const recoverPermissions = async () => {
+            if (!earlierPermissions) return
+            const response = await client.permission.list(undefined, {
+              signal: ancestryAbort.signal,
+              throwOnError: true,
+            })
+            await Promise.all(
+              (response.data ?? []).filter((permission) => !earlierPermissions.has(permission.id)).map(routePermission),
+            )
+          }
+          const recoveredPermissions = args.attach
+            ? recoverPermissions().catch((failure) =>
+                UI.error(`failed to recover pending permissions (${String(failure)})`),
+              )
+            : Promise.resolve()
+          finishAttachRecovery = async () => {
+            await recoveredPermissions
+            await recoverPermissions().catch((failure) =>
+              UI.error(`failed to finish pending permission recovery (${String(failure)})`),
+            )
+            ancestryAbort.abort()
+            await Promise.allSettled(pendingPermissions.values())
+          }
+
+          try {
+            for await (const event of events.stream) {
+              if (event.type === "session.created" || event.type === "session.updated") {
+                const info = event.properties.info
+                if (info.parentID && tree.has(info.parentID)) tree.add(info.id)
               }
 
               if (
-                part.type === "tool" &&
-                part.tool === "task" &&
-                part.state.status === "running" &&
-                args.format !== "json"
+                event.type === "message.updated" &&
+                event.properties.sessionID === sessionID &&
+                event.properties.info.role === "assistant" &&
+                args.format !== "json" &&
+                toggles.get("start") !== true
               ) {
-                if (toggles.get(part.id) === true) continue
-                await tool(part)
-                toggles.set(part.id, true)
-              }
-
-              if (part.type === "step-start") {
-                if (emit("step_start", { part })) continue
-              }
-
-              if (part.type === "step-finish") {
-                if (emit("step_finish", { part })) continue
-              }
-
-              if (part.type === "text" && part.time?.end) {
-                if (emit("text", { part })) continue
-                const text = part.text.trim()
-                if (!text) continue
-                if (!process.stdout.isTTY) {
-                  process.stdout.write(text + EOL)
-                  continue
-                }
                 UI.empty()
-                UI.println(text)
+                UI.println(`> ${event.properties.info.agent} · ${event.properties.info.modelID}`)
                 UI.empty()
+                toggles.set("start", true)
               }
 
-              if (part.type === "reasoning" && part.time?.end && thinking) {
-                if (emit("reasoning", { part })) continue
-                const text = part.text.trim()
-                if (!text) continue
-                const line = `Thinking: ${text}`
-                if (process.stdout.isTTY) {
-                  UI.empty()
-                  UI.println(`${UI.Style.TEXT_DIM}\u001b[3m${line}\u001b[0m${UI.Style.TEXT_NORMAL}`)
-                  UI.empty()
-                  continue
+              if (event.type === "message.part.updated") {
+                const part = event.properties.part
+                if (part.sessionID !== sessionID) continue
+
+                if (part.type === "tool" && (part.state.status === "completed" || part.state.status === "error")) {
+                  if (emit("tool_use", { part })) continue
+                  if (part.state.status === "completed") {
+                    await tool(part)
+                    continue
+                  }
+                  await toolError(part)
+                  UI.error(part.state.error)
                 }
-                process.stdout.write(line + EOL)
+
+                if (
+                  part.type === "tool" &&
+                  part.tool === "task" &&
+                  part.state.status === "running" &&
+                  args.format !== "json"
+                ) {
+                  if (toggles.get(part.id) === true) continue
+                  await tool(part)
+                  toggles.set(part.id, true)
+                }
+
+                if (part.type === "step-start") {
+                  if (emit("step_start", { part })) continue
+                }
+
+                if (part.type === "step-finish") {
+                  if (emit("step_finish", { part })) continue
+                }
+
+                if (part.type === "text" && part.time?.end) {
+                  if (emit("text", { part })) continue
+                  const text = part.text.trim()
+                  if (!text) continue
+                  if (!process.stdout.isTTY) {
+                    process.stdout.write(text + EOL)
+                    continue
+                  }
+                  UI.empty()
+                  UI.println(text)
+                  UI.empty()
+                }
+
+                if (part.type === "reasoning" && part.time?.end && thinking) {
+                  if (emit("reasoning", { part })) continue
+                  const text = part.text.trim()
+                  if (!text) continue
+                  const line = `Thinking: ${text}`
+                  if (process.stdout.isTTY) {
+                    UI.empty()
+                    UI.println(`${UI.Style.TEXT_DIM}\u001b[3m${line}\u001b[0m${UI.Style.TEXT_NORMAL}`)
+                    UI.empty()
+                    continue
+                  }
+                  process.stdout.write(line + EOL)
+                }
+              }
+
+              if (event.type === "session.error") {
+                const props = event.properties
+                if (props.sessionID !== sessionID || !props.error) continue
+                let err = String(props.error.name)
+                if ("data" in props.error && props.error.data && "message" in props.error.data) {
+                  err = String(props.error.data.message)
+                }
+                error = error ? error + EOL + err : err
+                if (emit("error", { error: props.error })) continue
+                UI.error(err)
+              }
+
+              if (
+                event.type === "session.status" &&
+                event.properties.sessionID === sessionID &&
+                event.properties.status.type === "idle"
+              ) {
+                idle = true
+                break
+              }
+
+              if (event.type === "permission.asked") {
+                // Tree membership covers any depth; prompts from parallel runs
+                // are ignored after the bounded ancestry check.
+                routePermission(event.properties)
               }
             }
-
-            if (event.type === "session.error") {
-              const props = event.properties
-              if (props.sessionID !== sessionID || !props.error) continue
-              let err = String(props.error.name)
-              if ("data" in props.error && props.error.data && "message" in props.error.data) {
-                err = String(props.error.data.message)
-              }
-              error = error ? error + EOL + err : err
-              if (emit("error", { error: props.error })) continue
-              UI.error(err)
-            }
-
-            if (
-              event.type === "session.status" &&
-              event.properties.sessionID === sessionID &&
-              event.properties.status.type === "idle"
-            ) {
-              break
-            }
-
-            if (event.type === "permission.asked") {
-              const permission = event.properties
-              if (!sessions.has(permission.sessionID)) continue
-
-              if (auto) {
-                await client.permission.reply({
-                  requestID: permission.id,
-                  reply: "once",
-                })
-              } else {
-                UI.println(
-                  UI.Style.TEXT_WARNING_BOLD + "!",
-                  UI.Style.TEXT_NORMAL +
-                    `permission requested: ${permission.permission} (${permission.patterns.join(", ")}); auto-rejecting`,
-                )
-                await client.permission.reply({
-                  requestID: permission.id,
-                  reply: "reject",
-                })
-              }
-            }
+          } finally {
+            if (!idle || !args.attach) ancestryAbort.abort()
+            await recoveredPermissions
+            await Promise.allSettled(pendingPermissions.values())
           }
           return error
         }
@@ -831,13 +963,26 @@ export const RunCommand = effectCmd({
         await share(client, sessionID)
 
         if (!interactive) {
+          // Record requests pending before this run starts. Attach recovery answers only later requests.
+          const earlierPermissions = args.attach
+            ? await client.permission
+                .list(undefined, { throwOnError: true })
+                .then((response) => new Set((response.data ?? []).map((permission) => permission.id)))
+                .catch((failure) => {
+                  UI.error(`failed to list pending permissions; permission recovery is off (${String(failure)})`)
+                  return undefined
+                })
+            : new Set<string>()
           const events = await client.event.subscribe()
-          const completed = loop(client, events).catch((e) => {
+          const completed = loop(client, events, earlierPermissions).catch((e) => {
             console.error(e)
             process.exitCode = 1
           })
           async function finish() {
-            if (args.attach) return
+            if (args.attach) {
+              await finishAttachRecovery()
+              return
+            }
             const error = await completed
             if (error) process.exitCode = 1
           }

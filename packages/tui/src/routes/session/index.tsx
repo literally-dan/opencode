@@ -26,6 +26,7 @@ import { Spinner } from "../../component/spinner"
 import { createSyntaxStyleMemo, generateSubtleSyntax, selectedForeground, useTheme } from "../../context/theme"
 import { BoxRenderable, ScrollBoxRenderable, addDefaultParsers, TextAttributes, RGBA } from "@opentui/core"
 import { Prompt, type PromptRef } from "../../component/prompt"
+import { sessionTree } from "./tree"
 import type {
   AssistantMessage,
   Part,
@@ -209,6 +210,14 @@ export function Session() {
       .filter((x) => x.parentID === parentID || x.id === parentID)
       .toSorted((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
   })
+  // Root + every transitive subagent. The prompt UI scopes to descendants
+  // (not just direct children) so blockers raised inside a nested
+  // subagent surface against the root view the user is looking at.
+  const descendants = createMemo(() => {
+    const s = session()
+    if (!s || s.parentID) return []
+    return sessionTree(sync.data.session, s.id)
+  })
   const messages = createMemo(() => sync.data.message[route.sessionID] ?? [])
   const messagesBeforeRevert = () => {
     const messageID = session()?.revert?.messageID
@@ -231,11 +240,11 @@ export function Session() {
   )
   const permissions = createMemo(() => {
     if (session()?.parentID) return []
-    return children().flatMap((x) => sync.data.permission[x.id] ?? [])
+    return descendants().flatMap((x) => sync.data.permission[x.id] ?? [])
   })
   const questions = createMemo(() => {
     if (session()?.parentID) return []
-    return children().flatMap((x) => sync.data.question[x.id] ?? [])
+    return descendants().flatMap((x) => sync.data.question[x.id] ?? [])
   })
   const visible = createMemo(() => !session()?.parentID && permissions().length === 0 && questions().length === 0)
   const disabled = createMemo(() => permissions().length > 0 || questions().length > 0)
@@ -1294,17 +1303,15 @@ export function Session() {
                 </For>
               </scrollbox>
               <box flexShrink={0}>
-                <Show when={permissions().length > 0}>
-                  <PermissionPrompt
-                    request={permissions()[0]}
-                    directory={sync.session.get(permissions()[0].sessionID)?.directory}
-                  />
+                <Show when={permissions()[0]} keyed>
+                  {(request) => (
+                    <PermissionPrompt request={request} directory={sync.session.get(request.sessionID)?.directory} />
+                  )}
                 </Show>
-                <Show when={permissions().length === 0 && questions().length > 0}>
-                  <QuestionPrompt
-                    request={questions()[0]}
-                    directory={sync.session.get(questions()[0].sessionID)?.directory}
-                  />
+                <Show when={permissions().length === 0 && questions()[0]} keyed>
+                  {(request) => (
+                    <QuestionPrompt request={request} directory={sync.session.get(request.sessionID)?.directory} />
+                  )}
                 </Show>
                 <Show when={session()?.parentID}>
                   <SubagentFooter />
