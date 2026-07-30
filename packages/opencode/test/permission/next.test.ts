@@ -1,7 +1,7 @@
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { test, expect } from "bun:test"
 import os from "os"
-import { Cause, Deferred, Effect, Exit, Fiber, Layer } from "effect"
+import { Cause, Deferred, Effect, Exit, Fiber, Layer, Logger, References } from "effect"
 import { EventV2Bridge } from "../../src/event-v2-bridge"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Permission } from "../../src/permission"
@@ -587,6 +587,63 @@ it.instance(
         }),
       )
       expect(err).toBeInstanceOf(PermissionV1.DeniedError)
+    }),
+  { git: true },
+)
+
+it.instance(
+  "ask - keeps allowed evaluations at debug and denial diagnostics at info",
+  () =>
+    Effect.gen(function* () {
+      const logs: { level: string; message: unknown }[] = []
+      const logger = Logger.make<unknown, void>((entry) => {
+        logs.push({ level: entry.logLevel, message: entry.message })
+      })
+      const capture = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+        effect.pipe(Effect.provideService(References.MinimumLogLevel, "Debug"), Effect.provide(Logger.layer([logger])))
+
+      yield* capture(
+        ask({
+          sessionID: SessionID.make("session_log_allow"),
+          permission: "bash",
+          patterns: ["ls"],
+          metadata: {},
+          always: [],
+          ruleset: [{ permission: "bash", pattern: "*", action: "allow" }],
+        }),
+      )
+      yield* fail(
+        capture(
+          ask({
+            sessionID: SessionID.make("session_log_deny"),
+            permission: "bash",
+            patterns: ["rm -rf /"],
+            metadata: {},
+            always: [],
+            ruleset: [{ permission: "bash", pattern: "*", action: "deny" }],
+          }),
+        ),
+      )
+
+      const allowed = logs.find(
+        (entry) => entry.level === "Debug" && Array.isArray(entry.message) && entry.message[0] === "evaluated",
+      )
+      const denied = logs.find(
+        (entry) => entry.level === "Info" && Array.isArray(entry.message) && entry.message[0] === "denied",
+      )
+      expect(allowed).toBeDefined()
+      expect(denied).toBeDefined()
+      expect(
+        logs.some(
+          (entry) => entry.level === "Info" && Array.isArray(entry.message) && entry.message[0] === "evaluated",
+        ),
+      ).toBe(false)
+      // Per-pattern noise moved to Debug, but the outcome has to stay auditable
+      // from a default log bundle: "why was this allowed to run" is the question
+      // a user actually needs answered.
+      expect(
+        logs.some((entry) => entry.level === "Info" && Array.isArray(entry.message) && entry.message[0] === "allowed"),
+      ).toBe(true)
     }),
   { git: true },
 )

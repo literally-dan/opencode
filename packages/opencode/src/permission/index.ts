@@ -71,17 +71,24 @@ const layer = Layer.effect(
 
       for (const pattern of request.patterns) {
         const rule = evaluate(request.permission, pattern, ruleset, approved)
-        yield* Effect.logInfo("evaluated", { permission: request.permission, pattern, action: rule })
         if (rule.action === "deny") {
+          yield* Effect.logInfo("denied", { permission: request.permission, pattern, rule })
           return yield* new PermissionV1.DeniedError({
             ruleset: ruleset.filter((rule) => Wildcard.match(request.permission, rule.permission)),
           })
         }
+        yield* Effect.logDebug("evaluated", { permission: request.permission, pattern, rule })
         if (rule.action === "allow") continue
         needsAsk = true
       }
 
-      if (!needsAsk) return
+      // Per-pattern evaluations are Debug because arity expansion emits several
+      // per command, but the outcome stays at Info: "why was this allowed to
+      // run" has to be answerable from a default log bundle.
+      if (!needsAsk) {
+        yield* Effect.logInfo("allowed", { permission: request.permission, patterns: request.patterns })
+        return
+      }
 
       const id = request.id ?? PermissionV1.ID.ascending()
       const info: PermissionV1.Request = {
