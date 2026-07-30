@@ -120,6 +120,7 @@ describe("session.system", () => {
       { providerID: "acme", api: { id: "trinity-large" } },
       { providerID: "moonshotai", api: { id: "kimi-k2" } },
       { providerID: "acme", api: { id: "other-model" } },
+      { providerID: "openai", api: { id: "gpt-6" } },
     ] as Provider.Model[]
 
     for (const model of models) {
