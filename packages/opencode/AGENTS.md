@@ -105,7 +105,7 @@ See `specs/effect/migration.md` for the compact pattern reference and examples.
 - Use `Effect.addFinalizer` or `Effect.acquireRelease` inside the `InstanceState.make` closure for cleanup (subscriptions, process teardown, etc.).
 - Use `Effect.forkScoped` inside the closure for background stream consumers — the fiber is interrupted when the instance is disposed.
 - To make a service's `init()` non-blocking, fork `InstanceState.get(state)` at the `init()` call site (e.g. `Effect.forkIn(scope)`), not by forking work inside the `InstanceState.make` closure. Forking inside the closure leaves state incomplete for other methods that read it.
-- `src/project/bootstrap.ts` already wraps every service `init()` in `Effect.forkDetach`, so `init()` is fire-and-forget in production. Keep `init()` methods synchronous internally; the caller controls concurrency.
+- `src/project/bootstrap.ts` awaits the `init()` effects of its explicitly registered bootstrap services in parallel; it does not discover or materialize every service. Each `init()` defines its own readiness contract: await state callers need immediately, and fork only work that may intentionally continue in the instance scope. Keep `init()` cheap where possible and let the service own its background fibers.
 
 ## Effect v4 beta API
 
