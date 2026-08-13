@@ -13,6 +13,7 @@ import { Config } from "@/config/config"
 import { Deferred, Effect, Exit, Option, Ref, Schema, Scope } from "effect"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Database } from "@opencode-ai/core/database/database"
+import { Provider } from "@/provider/provider"
 
 export interface TaskPromptOps {
   cancel(sessionID: SessionID): Effect.Effect<void>
@@ -56,6 +57,10 @@ const BaseParameterFields = {
   description: Schema.String.annotate({ description: "A short (3-5 words) description of the task" }),
   prompt: Schema.String.annotate({ description: "The task for the agent to perform" }),
   subagent_type: Schema.String.annotate({ description: "The type of specialized agent to use for this task" }),
+  model: Schema.optional(Schema.String).annotate({
+    description:
+      "Optional provider/model to use for the subagent (for example, anthropic/claude-sonnet-4-5). Defaults to the subagent's configured model, or the current model when none is configured. A resumed task keeps the model it last used",
+  }),
   task_id: Schema.optional(Schema.String).annotate({
     description:
       "This should only be set if you mean to resume a previous task (you can pass a prior task_id and the task will continue the same subagent session as before instead of creating a fresh one)",
@@ -111,6 +116,7 @@ export const TaskTool = Tool.define(
     const scope = yield* Scope.Scope
     const flags = yield* RuntimeFlags.Service
     const database = yield* Database.Service
+    const provider = yield* Provider.Service
 
     const run = Effect.fn("TaskTool.execute")(function* (
       params: Schema.Schema.Type<typeof Parameters>,
@@ -158,6 +164,9 @@ export const TaskTool = Tool.define(
           ),
         )
       }
+      // parseModel accepts any string. Check the model before a child Session is created or claimed.
+      const explicitModel = params.model ? Provider.parseModel(params.model) : undefined
+      if (explicitModel) yield* provider.getModel(explicitModel.providerID, explicitModel.modelID)
 
       const resume = Effect.fn("TaskTool.resume")(function* (taskID: string) {
         const decoded = Schema.decodeUnknownExit(SessionID)(taskID)
@@ -263,10 +272,37 @@ export const TaskTool = Tool.define(
       if (msg.info.role !== "assistant") return yield* Effect.fail(new Error("Not an assistant message"))
       const variant = msg.info.variant
 
-      const model = next.model ?? {
-        modelID: msg.info.modelID,
-        providerID: msg.info.providerID,
-      }
+      // A resumed Task keeps the model and variant its Session last ran with, unless this call names a model. A stored
+      // model that no longer exists is skipped: the agent or caller model applies, and the tool result says so.
+      const stored =
+        session?.model && !explicitModel
+          ? yield* provider.getModel(session.model.providerID, session.model.id).pipe(
+              Effect.as(session.model),
+              Effect.catchIf(Provider.ModelNotFoundError.isInstance, () => Effect.succeed(undefined)),
+            )
+          : undefined
+      const model = explicitModel ??
+        (stored ? { modelID: stored.id, providerID: stored.providerID } : undefined) ??
+        next.model ?? {
+          modelID: msg.info.modelID,
+          providerID: msg.info.providerID,
+        }
+      // The caller's variant belongs to the caller's model. An explicit model that names the caller's own model keeps it.
+      // An agent's configured model takes the agent's variant when the prompt is created.
+      const usesCallerModel = explicitModel
+        ? explicitModel.providerID === msg.info.providerID && explicitModel.modelID === msg.info.modelID
+        : !next.model
+      const childVariant = stored
+        ? stored.variant === "default"
+          ? undefined
+          : stored.variant
+        : usesCallerModel
+          ? variant
+          : undefined
+      const modelNote =
+        session?.model && !explicitModel && !stored
+          ? `The model this task last used (${session.model.providerID}/${session.model.id}) is not available. The task continues on ${model.providerID}/${model.modelID}.`
+          : undefined
       const metadata = {
         parentSessionId: ctx.sessionID,
         sessionId: nextSession.id,
@@ -343,7 +379,7 @@ export const TaskTool = Tool.define(
             modelID: model.modelID,
             providerID: model.providerID,
           },
-          variant: next.model ? undefined : variant,
+          variant: childVariant,
           agent: next.name,
           parts,
         })
@@ -709,8 +745,15 @@ export const TaskTool = Tool.define(
         ),
       )
       if (Option.isNone(admitted)) return yield* Effect.interrupt
-      if (admitted.value === "extended") return backgroundResult("Background task updated", BACKGROUND_UPDATED)
-      return backgroundResult("Background task started", BACKGROUND_STARTED)
+      if (admitted.value === "extended")
+        return backgroundResult(
+          "Background task updated",
+          modelNote ? `${BACKGROUND_UPDATED}\n${modelNote}` : BACKGROUND_UPDATED,
+        )
+      return backgroundResult(
+        "Background task started",
+        modelNote ? `${BACKGROUND_STARTED}\n${modelNote}` : BACKGROUND_STARTED,
+      )
     })
 
     return {

@@ -18,6 +18,7 @@ import { SessionStatus } from "@/session/status"
 import { SessionActivity } from "@/session/activity"
 import { SessionTaskState } from "@/session/task-state"
 import { Permission } from "@/permission"
+import { Provider } from "@/provider/provider"
 import { Question } from "@/question"
 
 import { TaskTool, type TaskPromptOps } from "../../src/tool/task"
@@ -55,6 +56,7 @@ const layer = (flags: Partial<RuntimeFlags.Info> = {}) =>
       SessionStatus.node,
       SessionTaskState.node,
       Permission.node,
+      Provider.node,
       Question.node,
       Truncate.node,
       ToolRegistry.node,
@@ -394,6 +396,258 @@ describe("tool.task", () => {
         `Subagent failed (task_id: ${child?.id}): The user rejected permission to use this specific tool call.`,
       )
     }),
+  )
+
+  it.instance(
+    "execute uses an explicit model override",
+    () =>
+      Effect.gen(function* () {
+        const { chat, assistant } = yield* seed()
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+        let seen: SessionPrompt.PromptInput | undefined
+
+        const result = yield* def.execute(
+          {
+            description: "inspect bug",
+            prompt: "look into the cache key path",
+            subagent_type: "general",
+            model: "other/nested/model",
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps: stubOps({ onPrompt: (input) => (seen = input) }) },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+
+        expect(result.metadata.model).toEqual({
+          providerID: ProviderV2.ID.make("other"),
+          modelID: ModelV2.ID.make("nested/model"),
+        })
+        expect(seen?.model).toEqual({
+          providerID: ProviderV2.ID.make("other"),
+          modelID: ModelV2.ID.make("nested/model"),
+        })
+        expect(seen?.variant).toBeUndefined()
+      }),
+    { config: { provider: { other: { models: { "nested/model": { name: "Nested model" } } } } } },
+  )
+
+  it.instance("execute rejects an unknown model before creating or resuming a child", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const existing = yield* sessions.create({ parentID: chat.id, title: "Existing child", agent: "general" })
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      let prompts = 0
+      const context = {
+        sessionID: chat.id,
+        messageID: assistant.id,
+        agent: "build",
+        abort: new AbortController().signal,
+        extra: { promptOps: stubOps({ onPrompt: () => prompts++ }) },
+        messages: [],
+        metadata: () => Effect.void,
+        ask: () => Effect.void,
+      }
+      const params = {
+        description: "inspect bug",
+        prompt: "look into the cache key path",
+        subagent_type: "general",
+        model: "missing/model",
+      }
+
+      expect(failureMessage(yield* def.execute(params, context).pipe(Effect.exit))).toStartWith(
+        "Model not found: missing/model.",
+      )
+      expect(
+        failureMessage(yield* def.execute({ ...params, task_id: existing.id }, context).pipe(Effect.exit)),
+      ).toStartWith("Model not found: missing/model.")
+      expect(yield* sessions.children(chat.id)).toEqual([existing])
+      expect((yield* sessions.get(existing.id)).taskParentID).toBeUndefined()
+      expect(yield* jobs.list()).toEqual([])
+      expect(prompts).toBe(0)
+    }),
+  )
+
+  it.instance(
+    "execute prefers an explicit model over the subagent model",
+    () =>
+      Effect.gen(function* () {
+        const { chat, assistant } = yield* seed()
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+        let seen: SessionPrompt.PromptInput | undefined
+
+        yield* def.execute(
+          {
+            description: "inspect bug",
+            prompt: "look into the cache key path",
+            subagent_type: "specialized",
+            model: "override/model",
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps: stubOps({ onPrompt: (input) => (seen = input) }) },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+
+        expect(seen?.model).toEqual({
+          providerID: ProviderV2.ID.make("override"),
+          modelID: ModelV2.ID.make("model"),
+        })
+      }),
+    {
+      config: {
+        agent: {
+          specialized: {
+            mode: "subagent",
+            model: "configured/model",
+          },
+        },
+        provider: { override: { models: { model: { name: "Override model" } } } },
+      },
+    },
+  )
+
+  it.instance(
+    "execute keeps the model and variant of a resumed task",
+    () =>
+      Effect.gen(function* () {
+        const sessions = yield* Session.Service
+        const { chat, assistant } = yield* seed()
+        const child = yield* sessions.create({ parentID: chat.id, title: "Existing child", agent: "general" })
+        // A Task Session records the model and variant of its last prompt.
+        yield* sessions.setAgentModel({
+          sessionID: child.id,
+          agent: "general",
+          model: { providerID: ProviderV2.ID.make("other"), id: ModelV2.ID.make("nested/model"), variant: "high" },
+          time: Date.now(),
+        })
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+        let seen: SessionPrompt.PromptInput | undefined
+
+        const result = yield* def.execute(
+          {
+            description: "inspect bug",
+            prompt: "continue with the cache key path",
+            subagent_type: "general",
+            task_id: child.id,
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps: stubOps({ onPrompt: (input) => (seen = input) }) },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+
+        expect(seen?.model).toEqual({
+          providerID: ProviderV2.ID.make("other"),
+          modelID: ModelV2.ID.make("nested/model"),
+        })
+        expect(seen?.variant).toBe("high")
+        expect(result.metadata.model).toEqual({
+          providerID: ProviderV2.ID.make("other"),
+          modelID: ModelV2.ID.make("nested/model"),
+        })
+        expect(result.output).not.toContain("is not available")
+      }),
+    { config: { provider: { other: { models: { "nested/model": { name: "Nested model" } } } } } },
+  )
+
+  it.instance("execute uses the caller model and says so when the model of a resumed task is gone", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const child = yield* sessions.create({ parentID: chat.id, title: "Existing child", agent: "general" })
+      yield* sessions.setAgentModel({
+        sessionID: child.id,
+        agent: "general",
+        model: { providerID: ProviderV2.ID.make("removed"), id: ModelV2.ID.make("model"), variant: "high" },
+        time: Date.now(),
+      })
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      let seen: SessionPrompt.PromptInput | undefined
+
+      const result = yield* def.execute(
+        {
+          description: "inspect bug",
+          prompt: "continue with the cache key path",
+          subagent_type: "general",
+          task_id: child.id,
+        },
+        {
+          sessionID: chat.id,
+          messageID: assistant.id,
+          agent: "build",
+          abort: new AbortController().signal,
+          extra: { promptOps: stubOps({ onPrompt: (input) => (seen = input) }) },
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        },
+      )
+
+      expect(seen?.model).toEqual(ref)
+      expect(seen?.variant).toBe("xhigh")
+      expect(result.output).toContain("The model this task last used (removed/model) is not available.")
+      expect(result.output).toContain("The task continues on test/test-model.")
+    }),
+  )
+
+  it.instance(
+    "execute keeps the caller variant when the explicit model is the caller model",
+    () =>
+      Effect.gen(function* () {
+        const { chat, assistant } = yield* seed()
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+        let seen: SessionPrompt.PromptInput | undefined
+
+        yield* def.execute(
+          {
+            description: "inspect bug",
+            prompt: "look into the cache key path",
+            subagent_type: "general",
+            model: "test/test-model",
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps: stubOps({ onPrompt: (input) => (seen = input) }) },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+
+        expect(seen?.model).toEqual(ref)
+        expect(seen?.variant).toBe("xhigh")
+      }),
+    { config: { provider: { test: { models: { "test-model": { name: "Test model" } } } } } },
   )
 
   it.instance("execute asks by default and skips checks when bypassed", () =>
