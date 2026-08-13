@@ -16497,6 +16497,9 @@
           },
           "command": {
             "type": "string"
+          },
+          "background": {
+            "type": "boolean"
           }
         },
         "required": ["id", "sessionID", "messageID", "type", "prompt", "description", "agent"],
@@ -22559,6 +22562,9 @@
           "subtask": {
             "type": "boolean"
           },
+          "background": {
+            "type": "boolean"
+          },
           "hints": {
             "type": "array",
             "items": {
@@ -23284,6 +23290,9 @@
           },
           "command": {
             "type": "string"
+          },
+          "background": {
+            "type": "boolean"
           }
         },
         "required": ["type", "prompt", "description", "agent"],

@@ -409,6 +409,7 @@ export type SubtaskPart = {
     modelID: string
   }
   command?: string
+  background?: boolean
 }
 
 export type ReasoningPart = {
@@ -2362,6 +2363,7 @@ export type Command = {
   source?: "command" | "mcp" | "skill"
   template: string
   subtask?: boolean
+  background?: boolean
   hints: Array<string>
 }
 
@@ -2611,6 +2613,7 @@ export type SubtaskPartInput = {
     modelID: string
   }
   command?: string
+  background?: boolean
 }
 
 export type SessionBusyError = {

@@ -12,7 +12,9 @@ import { ProviderTransform } from "@/provider/transform"
 import PROMPT_GENERATE from "./generate.txt"
 import PROMPT_COMPACTION from "./prompt/compaction.txt"
 import PROMPT_EXPLORE from "./prompt/explore.txt"
+import PROMPT_REVIEWER from "./prompt/reviewer.txt"
 import PROMPT_SUMMARY from "./prompt/summary.txt"
+import PROMPT_TARGET from "./prompt/target.txt"
 import PROMPT_TITLE from "./prompt/title.txt"
 import { Permission } from "@/permission"
 import { mergeDeep, pipe, sortBy, values } from "remeda"
@@ -215,6 +217,54 @@ const layer = Layer.effect(
             options: {},
             mode: "subagent",
             native: true,
+          },
+          "target-reviewer": {
+            name: "target-reviewer",
+            description:
+              "Independent completion reviewer for target loops. Inspects and verifies a worker's changes, then returns a complete or continue verdict without editing files.",
+            // The denies follow the global user rules so `"*": "allow"` cannot restore
+            // edits or delegation. Per-agent config merges later and can still override.
+            permission: Permission.merge(
+              defaults,
+              user,
+              Permission.fromConfig({
+                edit: "deny",
+                write: "deny",
+                apply_patch: "deny",
+                todowrite: "deny",
+                task: "deny",
+              }),
+            ),
+            prompt: PROMPT_REVIEWER,
+            options: {},
+            mode: "subagent",
+            native: true,
+          },
+          "target-coordinator": {
+            name: "target-coordinator",
+            description:
+              "Coordinates an autonomous worker-reviewer loop until a target is complete. Only reachable through the /target command.",
+            permission: Permission.merge(
+              defaults,
+              Permission.fromConfig({
+                // The coordinator delegates implementation and review, so it may
+                // launch subagents and interview the user but never write code.
+                question: "allow",
+                task: "allow",
+              }),
+              user,
+              // As for target-reviewer, the edit denies follow the global user rules.
+              Permission.fromConfig({
+                edit: "deny",
+                write: "deny",
+                apply_patch: "deny",
+              }),
+            ),
+            prompt: PROMPT_TARGET,
+            options: {},
+            mode: "subagent",
+            native: true,
+            hidden: true,
           },
           compaction: {
             name: "compaction",
