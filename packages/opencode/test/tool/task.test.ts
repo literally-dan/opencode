@@ -371,6 +371,87 @@ describe("tool.task", () => {
     }),
   )
 
+  it.instance("execute uses an explicit model override", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      let seen: SessionPrompt.PromptInput | undefined
+
+      const result = yield* def.execute(
+        {
+          description: "inspect bug",
+          prompt: "look into the cache key path",
+          subagent_type: "general",
+          model: "other/nested/model",
+        },
+        {
+          sessionID: chat.id,
+          messageID: assistant.id,
+          agent: "build",
+          abort: new AbortController().signal,
+          extra: { promptOps: stubOps({ onPrompt: (input) => (seen = input) }) },
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        },
+      )
+
+      expect(result.metadata.model).toEqual({
+        providerID: ProviderV2.ID.make("other"),
+        modelID: ModelV2.ID.make("nested/model"),
+      })
+      expect(seen?.model).toEqual({
+        providerID: ProviderV2.ID.make("other"),
+        modelID: ModelV2.ID.make("nested/model"),
+      })
+      expect(seen?.variant).toBeUndefined()
+    }),
+  )
+
+  it.instance("execute prefers an explicit model over the subagent model", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      let seen: SessionPrompt.PromptInput | undefined
+
+      yield* def.execute(
+        {
+          description: "inspect bug",
+          prompt: "look into the cache key path",
+          subagent_type: "specialized",
+          model: "override/model",
+        },
+        {
+          sessionID: chat.id,
+          messageID: assistant.id,
+          agent: "build",
+          abort: new AbortController().signal,
+          extra: { promptOps: stubOps({ onPrompt: (input) => (seen = input) }) },
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        },
+      )
+
+      expect(seen?.model).toEqual({
+        providerID: ProviderV2.ID.make("override"),
+        modelID: ModelV2.ID.make("model"),
+      })
+    }),
+    {
+      config: {
+        agent: {
+          specialized: {
+            mode: "subagent",
+            model: "configured/model",
+          },
+        },
+      },
+    },
+  )
+
   it.instance("execute asks by default and skips checks when bypassed", () =>
     Effect.gen(function* () {
       const { chat, assistant } = yield* seed()
