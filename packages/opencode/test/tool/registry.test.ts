@@ -50,6 +50,21 @@ const brokenPluginLayer = Layer.succeed(
   }),
 )
 
+const readReplacementPluginLayer = Layer.mock(Plugin.Service, {
+  list: () =>
+    Effect.succeed([
+      {
+        tool: {
+          read: {
+            description: "plugin replacement for read",
+            args: {},
+            execute: async () => "plugin read result",
+          },
+        },
+      },
+    ]),
+})
+
 const root = LayerNode.group([ToolRegistry.node, Agent.node])
 const replacements = [
   [Config.node, configLayer],
@@ -100,12 +115,69 @@ const withCompactionDisabled = testEffect(
   ]),
 )
 const withBrokenPlugin = testEffect(LayerNode.compile(root, [...replacements, [Plugin.node, brokenPluginLayer]]))
+const withAskFeatures = testEffect(
+  LayerNode.compile(root, [
+    [Config.node, configLayer],
+    [RuntimeFlags.node, RuntimeFlags.layer({ enableExa: true, experimentalLspTool: true })],
+  ]),
+)
+const withReadReplacement = testEffect(
+  LayerNode.compile(root, [...replacements, [Plugin.node, readReplacementPluginLayer]]),
+)
 
 afterEach(async () => {
   await disposeAllInstances()
 })
 
 describe("tool.registry", () => {
+  it.instance("returns only available source-owned read-only tools for Ask", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+
+      expect((yield* registry.askTools({ providerID: ProviderV2.ID.opencode })).map((tool) => tool.id)).toEqual([
+        "read",
+        "glob",
+        "grep",
+        "webfetch",
+        "websearch",
+      ])
+      expect((yield* registry.askTools({ providerID: ProviderV2.ID.openai })).map((tool) => tool.id)).toEqual([
+        "read",
+        "glob",
+        "grep",
+        "webfetch",
+      ])
+    }),
+  )
+
+  withAskFeatures.instance("includes available web search and flagged read-only LSP for Ask", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+
+      expect((yield* registry.askTools({ providerID: ProviderV2.ID.openai })).map((tool) => tool.id)).toEqual([
+        "read",
+        "glob",
+        "grep",
+        "webfetch",
+        "websearch",
+        "lsp",
+      ])
+    }),
+  )
+
+  withReadReplacement.instance("keeps the source-owned read tool when a plugin registers the same ID", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const read = (yield* registry.askTools({ providerID: ProviderV2.ID.opencode })).find((tool) => tool.id === "read")
+      const registered = (yield* registry.all()).filter((tool) => tool.id === "read")
+
+      expect(registered).toHaveLength(2)
+      expect(read).toBe((yield* registry.named()).read)
+      expect(read).not.toBe(registered.at(-1))
+      expect(read?.description).not.toBe("plugin replacement for read")
+    }),
+  )
+
   // One switch for the whole feature. The recovery tools exist only to read back
   // what compaction replaced, so with compaction off they would cost description
   // tokens for nothing and still hand every subagent read access to its parent's

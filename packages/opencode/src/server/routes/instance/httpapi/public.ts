@@ -38,6 +38,7 @@ type OpenApiSchema = {
   enum?: Array<string | boolean>
   items?: OpenApiSchema
   maximum?: number
+  maxLength?: number
   minimum?: number
   oneOf?: OpenApiSchema[]
   pattern?: string
@@ -66,6 +67,10 @@ const QueryParameterSchemas: Record<string, OpenApiSchema> = {
   "GET /session roots": QueryBooleanOpenApi,
   "GET /session limit": { type: "number" },
   "GET /session/{sessionID}/message limit": { type: "integer", minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+  "GET /session/{sessionID}/ask limit": { type: "integer", minimum: 1, maximum: 100 },
+  "GET /session/{sessionID}/ask before": { type: "string", maxLength: 512 },
+  "GET /session/{sessionID}/ask/{threadID} limit": { type: "integer", minimum: 1, maximum: 100 },
+  "GET /session/{sessionID}/ask/{threadID} before": { type: "string", maxLength: 512 },
   "GET /vcs/diff context": { type: "integer", minimum: 0 },
   "GET /api/session limit": { type: "number" },
   "GET /api/session start": { type: "number" },
@@ -96,7 +101,6 @@ function matchLegacyOpenApi(input: Record<string, unknown>) {
     spec.components!.schemas![name] = stripOptionalNull(structuredClone(schema))
   }
   normalizeComponentNames(spec)
-  collapseDuplicateComponents(spec)
   applyLegacySchemaOverrides(spec)
   normalizeComponentDescriptions(spec)
   addLegacyErrorSchemas(spec)
@@ -173,6 +177,7 @@ function matchLegacyOpenApi(input: Record<string, unknown>) {
       for (const param of operation.parameters ?? []) normalizeParameter(param, route)
     }
   }
+  collapseDuplicateComponents(spec)
   deleteUnusedLegacyErrorComponents(spec)
   return input
 }
@@ -344,8 +349,9 @@ function rewriteRefs(input: unknown, from: string, to: string): void {
 }
 
 function normalizeLegacyErrorResponses(operation: OpenApiOperation) {
-  if (operation.responses?.["400"] && isLegacyBadRequestResponse(operation.responses["400"])) {
-    operation.responses["400"] = legacyErrorResponse("Bad request", "BadRequestError")
+  if (operation.responses?.["400"]) {
+    const response = normalizeLegacyBadRequestResponse(operation.responses["400"])
+    if (response) operation.responses["400"] = response
   }
   if (operation.responses?.["404"] && isBuiltInErrorResponse(operation.responses["404"], "NotFound")) {
     operation.responses["404"] = legacyErrorResponse("Not found", "NotFoundError")
@@ -398,8 +404,38 @@ function isBuiltInErrorResponse(response: OpenApiResponse, name: "BadRequest" | 
   return response.description === name || isRefResponse(response, `EffectHttpApiError${name}`)
 }
 
-function isLegacyBadRequestResponse(response: OpenApiResponse) {
-  return isBuiltInErrorResponse(response, "BadRequest") || isRefResponse(response, "InvalidRequestError")
+function normalizeLegacyBadRequestResponse(response: OpenApiResponse) {
+  if (isBuiltInErrorResponse(response, "BadRequest")) return legacyErrorResponse("Bad request", "BadRequestError")
+  const content = response.content?.["application/json"]
+  const schema = content?.schema
+  const options = schema?.anyOf ?? schema?.oneOf
+  if (!content || !schema || !options) return
+  // The schema middleware declares InvalidRequestError globally for /api routes,
+  // but its legacy branch writes BadRequest directly. Numbered duplicates are
+  // endpoint-declared errors and remain until component collapse below.
+  const normalized = options
+    .filter((option) => option.$ref !== "#/components/schemas/InvalidRequestError")
+    .map((option) => (isBuiltInBadRequestSchema(option) ? { $ref: "#/components/schemas/BadRequestError" } : option))
+  if (normalized.length === 1 && normalized[0]?.$ref === "#/components/schemas/BadRequestError") {
+    return legacyErrorResponse("Bad request", "BadRequestError")
+  }
+  if (normalized.length === options.length && normalized.every((option, index) => option === options[index])) return
+  return {
+    ...response,
+    content: {
+      ...response.content,
+      "application/json": {
+        ...content,
+        schema: schema.anyOf ? { ...schema, anyOf: normalized } : { ...schema, oneOf: normalized },
+      },
+    },
+  }
+}
+
+function isBuiltInBadRequestSchema(schema: OpenApiSchema) {
+  return ["EffectHttpApiErrorBadRequest", "effect_HttpApiError_BadRequest"].some(
+    (name) => schema.$ref === `#/components/schemas/${name}`,
+  )
 }
 
 function legacyErrorResponse(description: string, name: "BadRequestError" | "NotFoundError"): OpenApiResponse {

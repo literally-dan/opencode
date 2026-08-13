@@ -1,7 +1,12 @@
 import { afterEach, describe, expect, test } from "bun:test"
 import { EventV2 } from "@opencode-ai/core/event"
+import { memoMap } from "@opencode-ai/core/effect/memo-map"
 import { Location } from "@opencode-ai/core/location"
-import { Context, Schema } from "effect"
+import { AbsolutePath } from "@opencode-ai/core/schema"
+import { SessionAskEvent } from "@opencode-ai/schema/session-ask-event"
+import { SessionID } from "@opencode-ai/schema/session-id"
+import { Context, ManagedRuntime, Schema } from "effect"
+import { AppNodeBuilderV1 } from "../../src/effect/app-node-builder-v1"
 import { HttpApiApp } from "../../src/server/routes/instance/httpapi/server"
 import { resetDatabase } from "../fixture/db"
 import { disposeAllInstances, tmpdir } from "../fixture/fixture"
@@ -122,5 +127,49 @@ describe("v2 location HttpApi", () => {
       data: { sessionID: expect.any(String) },
     })
     await reader.return(undefined)
+  })
+
+  test("skips legacy Ask activity and continues streaming canonical events", async () => {
+    await using subscriber = await tmpdir({ git: true })
+    await using publisher = await tmpdir({ git: true })
+    const seeded = await request("/session", publisher.path, { method: "POST" })
+    expect(seeded.status).toBe(200)
+    const session = (await seeded.json()) as { id: string }
+    const response = await request("/api/event", subscriber.path)
+    const reader = eventStream(response.body!)
+    expect((await readEvent(reader)).type).toBe("server.connected")
+
+    const runtime = ManagedRuntime.make(AppNodeBuilderV1.build(EventV2.node), { memoMap })
+    await runtime.runPromise(
+      EventV2.Service.use((events) =>
+        events.publish(
+          SessionAskEvent.ToolActivity,
+          {
+            sessionID: SessionID.make(session.id),
+            requestID: SessionAskEvent.RequestID.make("request-test"),
+            threadID: "ask_test",
+            turnID: "atn_test",
+            callID: "call-test",
+            tool: "read",
+            status: "running",
+            input: "{}",
+          },
+          { location: { directory: AbsolutePath.make(publisher.path) } },
+        ),
+      ),
+    )
+    const following = await request("/session", publisher.path, { method: "POST" })
+    expect(following.status).toBe(200)
+
+    const received: Array<typeof Event.Type> = []
+    while (!received.some((event) => event.type === "session.created")) {
+      received.push(await readEvent(reader))
+    }
+    expect(received.map((event) => event.type)).not.toContain("session.ask.tool.activity")
+    expect(received.find((event) => event.type === "session.created")).toMatchObject({
+      location: { directory: publisher.path },
+    })
+    await reader.return(undefined)
+    await runtime.dispose()
   })
 })

@@ -28,7 +28,10 @@ GlobalBus.on("event", (event) => {
 let server: Awaited<ReturnType<typeof Server.listen>> | undefined
 
 export const rpc = {
-  async fetch(input: { url: string; method: string; headers: Record<string, string>; body?: string }) {
+  async fetch(
+    input: { url: string; method: string; headers: Record<string, string>; body?: string },
+    signal: AbortSignal,
+  ) {
     const headers = { ...input.headers }
     const auth = ServerAuth.header()
     if (auth && !headers["authorization"] && !headers["Authorization"]) {
@@ -38,14 +41,22 @@ export const rpc = {
       method: input.method,
       headers,
       body: input.body,
+      signal,
     })
-    const response = await Server.Default().app.fetch(request)
-    const body = await response.text()
-    return {
-      status: response.status,
-      headers: Object.fromEntries(response.headers.entries()),
-      body,
-    }
+    signal.throwIfAborted()
+    const cancelled = Promise.withResolvers<never>()
+    const onAbort = () => cancelled.reject(signal.reason)
+    signal.addEventListener("abort", onAbort, { once: true })
+    const result = Promise.resolve().then(async () => {
+      const response = await Server.Default().app.fetch(request)
+      const body = await response.text()
+      return {
+        status: response.status,
+        headers: Object.fromEntries(response.headers.entries()),
+        body,
+      }
+    })
+    return Promise.race([result, cancelled.promise]).finally(() => signal.removeEventListener("abort", onAbort))
   },
   snapshot() {
     const result = writeHeapSnapshot("server.heapsnapshot")

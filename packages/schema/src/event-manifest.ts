@@ -21,6 +21,7 @@ import { Question } from "./question"
 import { QuestionV1 } from "./question-v1"
 import { Reference } from "./reference"
 import { ServerEvent } from "./server-event"
+import { SessionAskEvent } from "./session-ask-event"
 import { SessionCompactionEvent } from "./session-compaction-event"
 import { SessionEvent } from "./session-event"
 import { SessionStatusEvent } from "./session-status-event"
@@ -63,6 +64,7 @@ export const ServerDefinitions = Event.inventory(
 export const Definitions = Event.inventory(
   ...foundationDefinitions,
   ...sessionV1LiveDefinitions,
+  ...SessionAskEvent.Definitions,
   ...InstallationEvent.Definitions,
   ...featureDefinitions,
   ...SessionTodo.Event.Definitions,

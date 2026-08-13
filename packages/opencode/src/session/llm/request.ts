@@ -5,7 +5,6 @@ import type { RuntimeFlags } from "@/effect/runtime-flags"
 import { InstanceState } from "@/effect/instance-state"
 import { Permission } from "@/permission"
 import type { Agent } from "@/agent/agent"
-import type { MessageV2 } from "../message-v2"
 import type { Provider } from "@/provider/provider"
 import { ProviderTransform } from "@/provider/transform"
 import { SystemPrompt } from "../system"
@@ -25,6 +24,7 @@ type PrepareInput = {
   readonly agent: Agent.Info
   readonly permission?: PermissionV1.Ruleset
   readonly system: string[]
+  readonly preparedSystem?: readonly string[]
   readonly messages: ModelMessage[]
   readonly small?: boolean
   readonly tools: Record<string, Tool>
@@ -50,32 +50,36 @@ export type Prepared = {
   readonly headers: Record<string, string>
 }
 
-const mergeOptions = (target: Record<string, any>, source: Record<string, any> | undefined): Record<string, any> =>
-  mergeDeep(target, source ?? {}) as Record<string, any>
-
-export const prepare = Effect.fn("LLMRequestPrep.prepare")(function* (input: PrepareInput) {
-  const isOpenaiOauth = input.provider.id === "openai" && input.auth?.type === "oauth"
-  const system = [
-    [
-      ...(input.agent.prompt ? [input.agent.prompt] : SystemPrompt.provider(input.model)),
-      ...input.system,
-      ...(input.user.system ? [input.user.system] : []),
-    ]
-      .filter((x) => x)
-      .join("\n"),
+export function effectiveSystem(input: Pick<PrepareInput, "agent" | "model" | "system" | "user">) {
+  return [
+    ...(input.agent.prompt ? [input.agent.prompt] : SystemPrompt.provider(input.model)),
+    ...input.system,
+    ...(input.user.system ? [input.user.system] : []),
   ]
+    .filter((item) => item)
+    .join("\n")
+}
 
+export const prepareSystem = Effect.fn("LLMRequestPrep.prepareSystem")(function* (
+  input: Pick<PrepareInput, "agent" | "model" | "system" | "user" | "sessionID" | "plugin">,
+) {
+  const system = [effectiveSystem(input)]
   const header = system[0]
   yield* input.plugin.trigger(
     "experimental.chat.system.transform",
     { sessionID: input.sessionID, model: input.model },
     { system },
   )
-  if (system.length > 2 && system[0] === header) {
-    const rest = system.slice(1)
-    system.length = 0
-    system.push(header, rest.join("\n"))
-  }
+  if (system.length <= 2 || system[0] !== header) return system
+  return [header, system.slice(1).join("\n")]
+})
+
+const mergeOptions = (target: Record<string, any>, source: Record<string, any> | undefined): Record<string, any> =>
+  mergeDeep(target, source ?? {}) as Record<string, any>
+
+export const prepare = Effect.fn("LLMRequestPrep.prepare")(function* (input: PrepareInput) {
+  const isOpenaiOauth = input.provider.id === "openai" && input.auth?.type === "oauth"
+  const system = input.preparedSystem ? [...input.preparedSystem] : yield* prepareSystem(input)
 
   const variant =
     !input.small && input.model.variants && input.user.model.variant

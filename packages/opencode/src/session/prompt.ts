@@ -53,7 +53,7 @@ import { Truncate } from "@/tool/truncate"
 import { Image } from "@/image/image"
 import { decodeDataUrl } from "@/util/data-url"
 import { Process } from "@/util/process"
-import { Cause, Deferred, Effect, Exit, Latch, Layer, Option, Scope, Context, Schema, Types } from "effect"
+import { Cause, Effect, Exit, Latch, Layer, Option, Scope, Context, Schema, Types } from "effect"
 import { InstanceState } from "@/effect/instance-state"
 import { TaskTool, type TaskPromptOps } from "@/tool/task"
 import { SessionRunState } from "./run-state"
@@ -67,6 +67,7 @@ import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionReminders } from "./reminders"
 import { SessionTools } from "./tools"
 import { LLMEvent } from "@opencode-ai/llm"
+import { SessionAsk } from "./ask"
 
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -179,7 +180,7 @@ const CONTEXT_PRESSURE_TARGET = 0.45
 const COMPACTION_MIN_RECLAIM_CHARS = 8_000
 
 // Context-pressure nudge: once usage crosses CONTEXT_PRESSURE_SOFT of the usable
-  // window, remind the model to inspect a fresh inventory before compacting. Returns a
+// window, remind the model to inspect a fresh inventory before compacting. Returns a
 // candidate fingerprint alongside the text so the caller can dedupe across
 // completed runs. Suppressed when compaction is disabled.
 // What the request about to be sent actually costs, rather than what the last
@@ -309,7 +310,8 @@ export type NotificationContinuation = Effect.Effect<SessionV1.WithParts | undef
 export interface Interface {
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
   readonly checkpoint: (sessionID: SessionID) => Effect.Effect<number>
-  readonly prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
+  readonly ask: (input: AskInput) => Effect.Effect<AskOutput, unknown>
+  readonly prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error | Session.RemovingError>
   readonly admitNotification: (
     input: PromptInput,
     checkpoint: number,
@@ -320,7 +322,7 @@ export interface Interface {
   ) => Effect.Effect<SessionV1.WithParts | undefined, Image.Error>
   readonly loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts>
   readonly shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError>
-  readonly command: (input: CommandInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
+  readonly command: (input: CommandInput) => Effect.Effect<SessionV1.WithParts, Image.Error | Session.RemovingError>
   readonly resolvePromptParts: (template: string) => Effect.Effect<PromptInput["parts"]>
 }
 
@@ -356,6 +358,7 @@ const layer = Layer.effect(
     const events = yield* EventV2Bridge.Service
     const flags = yield* RuntimeFlags.Service
     const database = yield* Database.Service
+    const asks = yield* SessionAsk.Service
     const { db } = database
     type ContextState = {
       calibration?: { estimated: number; actual: number }
@@ -392,7 +395,10 @@ const layer = Layer.effect(
 
     const cancel = Effect.fn("SessionPrompt.cancel")(function* (sessionID: SessionID) {
       yield* Effect.logInfo("cancel", { "session.id": sessionID })
-      yield* state.cancel(sessionID)
+      yield* Effect.all([state.cancel(sessionID), asks.cancel({ sessionID }).pipe(Effect.orDie)], {
+        concurrency: "unbounded",
+        discard: true,
+      })
     })
 
     const resolvePromptParts = Effect.fn("SessionPrompt.resolvePromptParts")(function* (template: string) {
@@ -1313,19 +1319,25 @@ const layer = Layer.effect(
     })
 
     const savePrompt = Effect.fn("SessionPrompt.savePrompt")(function* (input: PromptInput) {
-      return yield* persistPrompt(yield* prepareUserMessage(input), input)
+      const prepared = yield* prepareUserMessage(input)
+      const admitted = yield* state.admit(
+        [{ sessionID: input.sessionID }],
+        Effect.gen(function* () {
+          yield* revert.cleanup(yield* sessions.get(input.sessionID).pipe(Effect.orDie))
+          return yield* persistPrompt(prepared, input)
+        }),
+      )
+      if (Option.isNone(admitted)) return yield* new Session.RemovingError({ sessionID: input.sessionID })
+      return admitted.value
     })
 
-    const prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error> = Effect.fn(
-      "SessionPrompt.prompt",
-    )(function* (input: PromptInput) {
-      const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
-      yield* revert.cleanup(session)
-      const message = yield* savePrompt(input)
+    const prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error | Session.RemovingError> =
+      Effect.fn("SessionPrompt.prompt")(function* (input: PromptInput) {
+        const message = yield* savePrompt(input)
 
-      if (input.noReply === true) return message
-      return yield* loop({ sessionID: input.sessionID })
-    })
+        if (input.noReply === true) return message
+        return yield* loop({ sessionID: input.sessionID })
+      })
 
     const lastAssistant = Effect.fnUntraced(function* (sessionID: SessionID) {
       const match = yield* sessions.findMessage(sessionID, (m) => m.info.role !== "user").pipe(Effect.orDie)
@@ -1628,8 +1640,7 @@ const layer = Layer.effect(
             // Candidate identity, generation, and conservative savings are the
             // reminder clock. Unchanged high-pressure context stays quiet across
             // both provider steps and completed user-message runs.
-            const progressed =
-              lastAssistant?.parentID === lastUser.id && successfulContextCompaction(lastAssistantMsg)
+            const progressed = lastAssistant?.parentID === lastUser.id && successfulContextCompaction(lastAssistantMsg)
             const pressureText =
               pressure && !progressed && pressure.fingerprint !== remembered.reminder ? pressure.text : undefined
             if (pressure && (pressureText || progressed)) remembered.reminder = pressure.fingerprint
@@ -1955,6 +1966,7 @@ const layer = Layer.effect(
     return Service.of({
       cancel,
       checkpoint: state.checkpoint,
+      ask: asks.ask,
       prompt,
       admitNotification,
       notify,
@@ -1970,6 +1982,12 @@ const ModelRef = Schema.Struct({
   providerID: ProviderV2.ID,
   modelID: ModelV2.ID,
 })
+
+export const AskInput = SessionAsk.AskInput
+export type AskInput = SessionAsk.AskInput
+
+export const AskOutput = SessionAsk.AskOutput
+export type AskOutput = SessionAsk.AskOutput
 
 export const PromptInput = Schema.Struct({
   sessionID: SessionID,
@@ -2100,6 +2118,7 @@ export const node = LayerNode.make({
     EventV2Bridge.node,
     RuntimeFlags.node,
     Database.node,
+    SessionAsk.node,
   ],
 })
 
