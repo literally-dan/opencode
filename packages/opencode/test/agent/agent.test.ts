@@ -52,6 +52,8 @@ it.instance("returns default native agents when no config", () =>
     expect(names).toContain("plan")
     expect(names).toContain("general")
     expect(names).toContain("explore")
+    expect(names).toContain("reviewer")
+    expect(names).toContain("target")
     expect(names).toContain("compaction")
     expect(names).toContain("title")
     expect(names).toContain("summary")
@@ -117,6 +119,35 @@ it.instance("explore agent denies edit and write", () =>
     expect(evalPerm(explore, "edit")).toBe("deny")
     expect(evalPerm(explore, "write")).toBe("deny")
     expect(evalPerm(explore, "todowrite")).toBe("deny")
+  }),
+)
+
+it.instance("reviewer agent can inspect but cannot modify or delegate", () =>
+  Effect.gen(function* () {
+    const reviewer = yield* load((svc) => svc.get("reviewer"))
+    expect(reviewer?.mode).toBe("subagent")
+    expect(evalPerm(reviewer, "read")).toBe("allow")
+    expect(evalPerm(reviewer, "bash")).toBe("allow")
+    expect(evalPerm(reviewer, "edit")).toBe("deny")
+    expect(evalPerm(reviewer, "write")).toBe("deny")
+    expect(evalPerm(reviewer, "apply_patch")).toBe("deny")
+    expect(evalPerm(reviewer, "task")).toBe("deny")
+  }),
+)
+
+it.instance("target agent delegates and interviews but cannot edit", () =>
+  Effect.gen(function* () {
+    const target = yield* load((svc) => svc.get("target"))
+    expect(target?.mode).toBe("subagent")
+    // Hidden so the coordinator is only reachable through /target, not offered
+    // to models as a subagent they can launch.
+    expect(target?.hidden).toBe(true)
+    expect(evalPerm(target, "task")).toBe("allow")
+    expect(evalPerm(target, "question")).toBe("allow")
+    expect(evalPerm(target, "read")).toBe("allow")
+    expect(evalPerm(target, "edit")).toBe("deny")
+    expect(evalPerm(target, "write")).toBe("deny")
+    expect(evalPerm(target, "apply_patch")).toBe("deny")
   }),
 )
 

@@ -292,7 +292,7 @@ const layer = Layer.effect(
     })
 
     const describeTask = Effect.fn("ToolRegistry.describeTask")(function* (agent: Agent.Info) {
-      const items = (yield* agents.list()).filter((item) => item.mode !== "primary")
+      const items = (yield* agents.list()).filter((item) => item.mode !== "primary" && !item.hidden)
       const filtered = items.filter(
         (item) => Permission.evaluate("task", item.name, agent.permission).action !== "deny",
       )

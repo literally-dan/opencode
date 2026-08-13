@@ -449,7 +449,12 @@ const seed = Effect.fn("test.seed")(function* (sessionID: SessionID, opts?: { fi
   return { user: msg, assistant }
 })
 
-const addSubtask = (sessionID: SessionID, messageID: MessageID, model = ref) =>
+const addSubtask = (
+  sessionID: SessionID,
+  messageID: MessageID,
+  model = ref,
+  opts?: { command?: string; background?: boolean },
+) =>
   Effect.gen(function* () {
     const session = yield* Session.Service
     yield* session.updatePart({
@@ -461,6 +466,7 @@ const addSubtask = (sessionID: SessionID, messageID: MessageID, model = ref) =>
       description: "inspect bug",
       agent: "general",
       model,
+      ...opts,
     })
   })
 
@@ -1730,6 +1736,31 @@ it.instance("failed subtask preserves metadata on error tool state", () =>
       providerID: ProviderV2.ID.make("test"),
       modelID: ModelV2.ID.make("missing-model"),
     })
+  }),
+)
+
+it.instance("background subtask returns to the parent without waiting for the child", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+    yield* llm.text("launched")
+    const msg = yield* user(chat.id, "hello")
+    yield* addSubtask(chat.id, msg.id, ref, { command: "target", background: true })
+
+    yield* prompt.loop({ sessionID: chat.id })
+
+    const msgs = yield* MessageV2.filterCompactedEffect(chat.id)
+    const taskMsg = msgs.find((item) => item.info.role === "assistant" && item.info.agent === "general")
+    const tool = taskMsg ? completedTool(taskMsg.parts) : undefined
+    if (!tool) return
+
+    expect(tool.state.metadata?.background).toBe(true)
+    // The parent's turn finished while the child was still marked running, so it
+    // did not block on the subagent.
+    expect(tool.state.output).toContain(`state="running"`)
+    expect((yield* sessions.get(SessionID.make(tool.state.metadata?.sessionId as string))).parentID).toBe(chat.id)
   }),
 )
 

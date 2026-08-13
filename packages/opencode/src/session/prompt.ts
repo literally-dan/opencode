@@ -470,6 +470,7 @@ const layer = Layer.effect(
             description: task.description,
             subagent_type: task.agent,
             command: task.command,
+            background: task.background,
           },
           time: { start: Date.now() },
         },
@@ -479,6 +480,7 @@ const layer = Layer.effect(
         description: task.description,
         subagent_type: task.agent,
         command: task.command,
+        ...(task.background === true ? { background: true } : {}),
       }
       yield* plugin.trigger(
         "tool.execute.before",
@@ -1875,6 +1877,7 @@ const layer = Layer.effect(
               command: input.command,
               model: { providerID: taskModel.providerID, modelID: taskModel.modelID },
               prompt: templateParts.find((y) => y.type === "text")?.text ?? "",
+              ...(cmd.background === true ? { background: true } : {}),
             },
           ]
         : [...uniqueTemplateParts, ...(input.parts ?? [])]

@@ -9,6 +9,7 @@ import { MCP } from "../mcp"
 import { Skill } from "../skill"
 import PROMPT_INITIALIZE from "./template/initialize.txt"
 import PROMPT_REVIEW from "./template/review.txt"
+import PROMPT_TARGET from "./template/target.txt"
 import { LegacyEvent } from "@opencode-ai/schema/legacy-event"
 
 type State = {
@@ -28,6 +29,9 @@ export const Info = Schema.Struct({
   // Some command templates are lazy promises from MCP prompt resolution.
   template: Schema.Unknown,
   subtask: Schema.optional(Schema.Boolean),
+  // Only meaningful with `subtask`: dispatch the subtask as a background job so
+  // the calling session stays idle and is notified when the subagent finishes.
+  background: Schema.optional(Schema.Boolean),
   hints: Schema.Array(Schema.String),
 }).annotate({ identifier: "Command" })
 
@@ -46,6 +50,7 @@ export function hints(template: string) {
 export const Default = {
   INIT: "init",
   REVIEW: "review",
+  TARGET: "target",
 } as const
 
 export interface Interface {
@@ -85,6 +90,16 @@ const layer = Layer.effect(
         },
         subtask: true,
         hints: hints(PROMPT_REVIEW),
+      }
+      commands[Default.TARGET] = {
+        name: Default.TARGET,
+        description: "run a worker-reviewer loop until a target is complete",
+        source: "command",
+        agent: "target",
+        template: PROMPT_TARGET,
+        subtask: true,
+        background: true,
+        hints: hints(PROMPT_TARGET),
       }
 
       for (const [name, command] of Object.entries(cfg.command ?? {})) {

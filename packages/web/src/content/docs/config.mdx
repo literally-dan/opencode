@@ -551,11 +551,11 @@ You can control how deeply subagents can invoke other subagents using the `subag
 ```json title="opencode.json"
 {
   "$schema": "https://opencode.ai/config.json",
-  "subagent_depth": 2
+  "subagent_depth": 1
 }
 ```
 
-The default is `1`, which allows primary agents to launch subagents but prevents those subagents from launching additional subagents. Set it to `2` to allow one additional level of nested subagents, or `0` to prevent all subagent launches.
+The default is `2`, which allows primary agents to launch subagents and lets a coordinating subagent delegate one additional level — for example the `/target` coordinator delegating to a worker and a reviewer. Set it to `1` to prevent subagents from launching subagents, or `0` to prevent all subagent launches.
 
 ---
 

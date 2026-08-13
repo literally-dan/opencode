@@ -24,6 +24,10 @@ export interface TaskPromptOps {
 }
 
 const id = "task"
+// Two levels so a coordinating subagent (for example the `/target` coordinator)
+// can delegate to a worker and a reviewer. The worker sits at the limit and
+// cannot nest further.
+const DEFAULT_SUBAGENT_DEPTH = 2
 const BACKGROUND_DESCRIPTION = [
   "Background mode: background=true launches the subagent asynchronously and returns immediately.",
   "Foreground is the default; use it when you need the result before continuing.",
@@ -121,11 +125,10 @@ export const TaskTool = Tool.define(
         depth++
         current = yield* sessions.get(current.parentID)
       }
-      if (depth >= (cfg.subagent_depth ?? 1)) {
+      const maxDepth = cfg.subagent_depth ?? DEFAULT_SUBAGENT_DEPTH
+      if (depth >= maxDepth) {
         return yield* Effect.fail(
-          new Error(
-            `Subagent depth limit reached (${cfg.subagent_depth ?? 1}). Increase "subagent_depth" to allow nested subagents.`,
-          ),
+          new Error(`Subagent depth limit reached (${maxDepth}). Increase "subagent_depth" to allow nested subagents.`),
         )
       }
 

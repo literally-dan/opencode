@@ -591,49 +591,8 @@ describe("tool.task", () => {
     }),
   )
 
-  it.instance("prevents subagents from launching subagents by default", () =>
-    Effect.gen(function* () {
-      const sessions = yield* Session.Service
-      const { chat, assistant } = yield* seed()
-      const child = yield* sessions.create({ parentID: chat.id, title: "child" })
-      const nestedAssistant = yield* sessions.updateMessage({
-        ...assistant,
-        id: MessageID.ascending(),
-        parentID: MessageID.ascending(),
-        sessionID: child.id,
-      })
-      const tool = yield* TaskTool
-      const def = yield* tool.init()
-      let asked = false
-
-      const exit = yield* def
-        .execute(
-          {
-            description: "inspect bug",
-            prompt: "look into the cache key path",
-            subagent_type: "general",
-          },
-          {
-            sessionID: child.id,
-            messageID: nestedAssistant.id,
-            agent: "general",
-            abort: new AbortController().signal,
-            extra: { promptOps: stubOps() },
-            messages: [],
-            metadata: () => Effect.void,
-            ask: () => Effect.sync(() => (asked = true)),
-          },
-        )
-        .pipe(Effect.exit)
-
-      expect(Exit.isFailure(exit)).toBe(true)
-      expect(asked).toBe(false)
-      expect(yield* sessions.children(child.id)).toHaveLength(0)
-    }),
-  )
-
   it.instance(
-    "allows nested subagents up to the configured depth",
+    "prevents subagents from launching subagents when subagent_depth is 1",
     () =>
       Effect.gen(function* () {
         const sessions = yield* Session.Service
@@ -647,15 +606,95 @@ describe("tool.task", () => {
         })
         const tool = yield* TaskTool
         const def = yield* tool.init()
+        let asked = false
 
-        const result = yield* def.execute(
+        const exit = yield* def
+          .execute(
+            {
+              description: "inspect bug",
+              prompt: "look into the cache key path",
+              subagent_type: "general",
+            },
+            {
+              sessionID: child.id,
+              messageID: nestedAssistant.id,
+              agent: "general",
+              abort: new AbortController().signal,
+              extra: { promptOps: stubOps() },
+              messages: [],
+              metadata: () => Effect.void,
+              ask: () => Effect.sync(() => (asked = true)),
+            },
+          )
+          .pipe(Effect.exit)
+
+        expect(Exit.isFailure(exit)).toBe(true)
+        expect(asked).toBe(false)
+        expect(yield* sessions.children(child.id)).toHaveLength(0)
+      }),
+    { config: { subagent_depth: 1 } },
+  )
+
+  it.instance("lets a coordinating subagent launch a subagent by default", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const child = yield* sessions.create({ parentID: chat.id, title: "child" })
+      const nestedAssistant = yield* sessions.updateMessage({
+        ...assistant,
+        id: MessageID.ascending(),
+        parentID: MessageID.ascending(),
+        sessionID: child.id,
+      })
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+
+      const result = yield* def.execute(
+        {
+          description: "inspect bug",
+          prompt: "look into the cache key path",
+          subagent_type: "general",
+        },
+        {
+          sessionID: child.id,
+          messageID: nestedAssistant.id,
+          agent: "general",
+          abort: new AbortController().signal,
+          extra: { promptOps: stubOps() },
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        },
+      )
+
+      expect((yield* sessions.get(result.metadata.sessionId)).parentID).toBe(child.id)
+    }),
+  )
+
+  it.instance("stops nesting once the default depth is reached", () =>
+    Effect.gen(function* () {
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const child = yield* sessions.create({ parentID: chat.id, title: "child" })
+      const grandchild = yield* sessions.create({ parentID: child.id, title: "grandchild" })
+      const nestedAssistant = yield* sessions.updateMessage({
+        ...assistant,
+        id: MessageID.ascending(),
+        parentID: MessageID.ascending(),
+        sessionID: grandchild.id,
+      })
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+
+      const exit = yield* def
+        .execute(
           {
             description: "inspect bug",
             prompt: "look into the cache key path",
             subagent_type: "general",
           },
           {
-            sessionID: child.id,
+            sessionID: grandchild.id,
             messageID: nestedAssistant.id,
             agent: "general",
             abort: new AbortController().signal,
@@ -665,10 +704,11 @@ describe("tool.task", () => {
             ask: () => Effect.void,
           },
         )
+        .pipe(Effect.exit)
 
-        expect((yield* sessions.get(result.metadata.sessionId)).parentID).toBe(child.id)
-      }),
-    { config: { subagent_depth: 2 } },
+      expect(Exit.isFailure(exit)).toBe(true)
+      expect(yield* sessions.children(grandchild.id)).toHaveLength(0)
+    }),
   )
 
   it.instance("reports a classifier-rejected subagent turn as a failure", () =>
@@ -770,7 +810,7 @@ describe("tool.task", () => {
           {
             description: "inspect bug",
             prompt: "look into the cache key path",
-            subagent_type: "reviewer",
+            subagent_type: "delegating",
           },
           {
             sessionID: chat.id,
@@ -786,7 +826,7 @@ describe("tool.task", () => {
 
         const child = yield* sessions.get(result.metadata.sessionId)
         expect(child.parentID).toBe(chat.id)
-        expect(child.agent).toBe("reviewer")
+        expect(child.agent).toBe("delegating")
         expect(child.permission).toEqual([
           {
             permission: "todowrite",
@@ -809,7 +849,7 @@ describe("tool.task", () => {
     {
       config: {
         agent: {
-          reviewer: {
+          delegating: {
             mode: "subagent",
             permission: {
               task: "allow",
