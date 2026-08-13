@@ -1473,6 +1473,40 @@ const scenarios: Scenario[] = [
       "status",
     ),
   http.protected
+    .post("/session/{sessionID}/ask", "session.ask")
+    .preserveDatabase()
+    .withLlm()
+    .seeded((ctx) =>
+      Effect.gen(function* () {
+        const session = yield* ctx.session({ title: "Ask session" })
+        yield* ctx.message(session.id, { text: "The established number is 42." })
+        const messages = yield* ctx.messages(session.id)
+        yield* ctx.llmText("The number is 42.")
+        return { session, messages: messages.map((message) => message.info.id) }
+      }),
+    )
+    .at((ctx) => ({
+      path: route("/session/{sessionID}/ask", { sessionID: ctx.state.session.id }),
+      headers: ctx.headers(),
+      body: {
+        question: "What number did we establish?",
+        agent: "build",
+        model: { providerID: "test", modelID: "test-model" },
+      },
+    }))
+    .jsonEffect(200, (body, ctx) =>
+      Effect.gen(function* () {
+        object(body)
+        check(body.text === "The number is 42.", "ask should return fake LLM text")
+        const messages = yield* ctx.messages(ctx.state.session.id)
+        check(
+          JSON.stringify(messages.map((message) => message.info.id)) === JSON.stringify(ctx.state.messages),
+          "ask should not persist the question or answer",
+        )
+        yield* ctx.llmWait(1)
+      }),
+    ),
+  http.protected
     .post("/session/{sessionID}/prompt_async", "session.prompt_async")
     .preserveDatabase()
     .withLlm()
@@ -1745,6 +1779,7 @@ const scenarios: Scenario[] = [
 const llmScenarios = new Set([
   "session.init",
   "session.prompt",
+  "session.ask",
   "session.prompt_async",
   "session.command",
   "session.summarize",

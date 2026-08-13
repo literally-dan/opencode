@@ -50,6 +50,7 @@ import { useKV } from "../../context/kv"
 import { createFadeIn } from "../../util/signal"
 import { DialogSkill } from "../dialog-skill"
 import { DialogWorkspaceUnavailable } from "../dialog-workspace-unavailable"
+import { DialogAsk } from "../dialog-ask"
 import { useArgs } from "../../context/args"
 import { OPENCODE_BASE_MODE, useBindings, useCommandShortcut, useLeaderActive, useOpencodeKeymap } from "../../keymap"
 import { useTuiConfig } from "../../config"
@@ -232,6 +233,8 @@ export function Prompt(props: PromptProps) {
   const agentStyleId = syntax().getStyleId("extmark.agent")!
   const pasteStyleId = syntax().getStyleId("extmark.paste")!
   let promptPartTypeId = 0
+  let askRequest = 0
+  onCleanup(() => askRequest++)
   const event = useEvent()
 
   event.on("tui.prompt.append", (evt, { workspace }) => {
@@ -510,6 +513,20 @@ export function Prompt(props: PromptProps) {
           })
           restoreExtmarksFromParts(updatedNonTextParts)
           input.cursorOffset = Bun.stringWidth(normalized)
+        },
+      },
+      {
+        title: "Ask current context",
+        desc: "Ask without adding the question or answer to history",
+        name: "prompt.ask",
+        category: "Prompt",
+        slashName: "ask",
+        run: () => {
+          input.extmarks.clear()
+          input.setText("/ask ")
+          setStore("prompt", { input: "/ask ", parts: [] })
+          setStore("extmarkToPartIndex", new Map())
+          input.gotoBufferEnd()
         },
       },
       {
@@ -960,7 +977,16 @@ export function Prompt(props: PromptProps) {
     if (!store.prompt.input) return false
     const agent = local.agent.current()
     if (!agent) return false
-    const trimmed = store.prompt.input.trim()
+    const inputText = expandTrackedPastedText(
+      store.prompt.input,
+      input.extmarks.getAllForTypeId(promptPartTypeId).flatMap((extmark) => {
+        const partIndex = store.extmarkToPartIndex.get(extmark.id)
+        const part = partIndex === undefined ? undefined : store.prompt.parts[partIndex]
+        if (part?.type !== "text") return []
+        return [{ start: extmark.start, end: extmark.end, text: part.text }]
+      }),
+    )
+    const trimmed = inputText.trim()
     if (trimmed === "exit" || trimmed === "quit" || trimmed === ":q") {
       void exit()
       return true
@@ -970,6 +996,7 @@ export function Prompt(props: PromptProps) {
       void promptModelWarning()
       return false
     }
+    const variant = local.model.variant.current()
 
     const workspaceSession = props.sessionID ? sync.session.get(props.sessionID) : undefined
     const workspaceID = workspaceSession?.workspaceID
@@ -986,7 +1013,63 @@ export function Prompt(props: PromptProps) {
       return false
     }
 
-    const variant = local.model.variant.current()
+    const askQuestion = /^\/ask(?:\s|$)/.test(trimmed) ? trimmed.slice(4).trim() : undefined
+    if (askQuestion !== undefined) {
+      if (!askQuestion) {
+        toast.show({ message: "Add a question after /ask", variant: "warning" })
+        return false
+      }
+      if (!props.sessionID) {
+        toast.show({ message: "/ask needs an existing conversation", variant: "warning" })
+        return false
+      }
+      if (editorContext() && editor.labelState() === "pending") {
+        toast.show({ message: "/ask does not support editor selections", variant: "warning" })
+        return false
+      }
+      if (store.prompt.parts.some((part) => part.type !== "text")) {
+        toast.show({ message: "/ask only supports text questions", variant: "warning" })
+        return false
+      }
+
+      history.append({ ...store.prompt, mode: store.mode })
+      input.extmarks.clear()
+      input.clear()
+      setStore("prompt", { input: "", parts: [] })
+      setStore("extmarkToPartIndex", new Map())
+      dialog.setSize("large")
+      const request = ++askRequest
+      let pending = true
+      dialog.replace(
+        () => <DialogAsk question={askQuestion} />,
+        () => {
+          if (pending && askRequest === request) askRequest++
+        },
+      )
+      void sdk.client.session
+        .ask({
+          sessionID: props.sessionID,
+          question: askQuestion,
+          agent: agent.name,
+          model: selectedModel,
+          variant,
+        })
+        .then((result) => {
+          if (askRequest !== request) return
+          if (result.error) throw result.error
+          pending = false
+          dialog.setSize("large")
+          dialog.replace(() => <DialogAsk question={askQuestion} answer={result.data.text} />)
+        })
+        .catch((error) => {
+          if (askRequest !== request) return
+          pending = false
+          dialog.clear()
+          toast.show({ title: "Failed to ask", message: errorMessage(error), variant: "error" })
+        })
+      return true
+    }
+
     let sessionID = props.sessionID
     let finishMoveProgress = false
     if (sessionID == null) {
@@ -1022,16 +1105,6 @@ export function Prompt(props: PromptProps) {
 
       sessionID = res.data.id
     }
-
-    const inputText = expandTrackedPastedText(
-      store.prompt.input,
-      input.extmarks.getAllForTypeId(promptPartTypeId).flatMap((extmark) => {
-        const partIndex = store.extmarkToPartIndex.get(extmark.id)
-        const part = partIndex === undefined ? undefined : store.prompt.parts[partIndex]
-        if (part?.type !== "text") return []
-        return [{ start: extmark.start, end: extmark.end, text: part.text }]
-      }),
-    )
 
     // Filter out text parts (pasted content) since they're now expanded inline
     const nonTextParts = store.prompt.parts.filter((part) => part.type !== "text")

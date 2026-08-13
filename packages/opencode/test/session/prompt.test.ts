@@ -827,6 +827,29 @@ it.instance("loop calls LLM and returns assistant message", () =>
   }),
 )
 
+it.instance("ask uses session context without persisting the question or answer", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+    yield* seed(chat.id, { finish: "stop" })
+    const before = yield* sessions.messages({ sessionID: chat.id })
+    yield* llm.text("The answer is 42.")
+
+    const result = yield* prompt.ask({ sessionID: chat.id, question: "What number did we establish?" })
+    const after = yield* sessions.messages({ sessionID: chat.id })
+    const hit = (yield* llm.hits)[0]
+
+    expect(result).toEqual({ text: "The answer is 42." })
+    expect(after.map((message) => message.info.id)).toEqual(before.map((message) => message.info.id))
+    expect(strings(hit?.body)).toContain("hello")
+    expect(strings(hit?.body)).toContain("hi there")
+    expect(strings(hit?.body)).toContain("What number did we establish?")
+    expect(hit?.body.tools).toBeUndefined()
+  }),
+)
+
 it.instance("bounds context-pressure manifests and appends them after cacheable history", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig(providerCfg)

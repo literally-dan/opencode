@@ -67,6 +67,7 @@ export const SummarizePayload = Schema.Struct({
   modelID: ModelV2.ID,
   auto: Schema.optional(Schema.Boolean),
 })
+export const AskPayload = Schema.Struct(Struct.omit(SessionPrompt.AskInput.fields, ["sessionID"]))
 export const PromptPayload = Schema.Struct(Struct.omit(SessionPrompt.PromptInput.fields, ["sessionID"]))
 export const CommandPayload = Schema.Struct(Struct.omit(SessionPrompt.CommandInput.fields, ["sessionID"]))
 export const ShellPayload = Schema.Struct(Struct.omit(SessionPrompt.ShellInput.fields, ["sessionID"]))
@@ -94,6 +95,7 @@ export const SessionPaths = {
   summarize: `${root}/:sessionID/summarize`,
   prompt: `${root}/:sessionID/message`,
   promptAsync: `${root}/:sessionID/prompt_async`,
+  ask: `${root}/:sessionID/ask`,
   command: `${root}/:sessionID/command`,
   shell: `${root}/:sessionID/shell`,
   revert: `${root}/:sessionID/revert`,
@@ -338,6 +340,19 @@ export const SessionApi = HttpApi.make("session")
             summary: "Send async message",
             description:
               "Create and send a new message to a session asynchronously, starting the session if needed and returning immediately.",
+          }),
+        ),
+        HttpApiEndpoint.post("ask", SessionPaths.ask, {
+          params: { sessionID: SessionID },
+          query: WorkspaceRoutingQuery,
+          payload: AskPayload,
+          success: described(SessionPrompt.AskOutput, "Contextual answer"),
+          error: [HttpApiError.BadRequest, ApiNotFoundError],
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "session.ask",
+            summary: "Ask without changing history",
+            description: "Ask a one-turn question using the current session context without persisting the question or answer.",
           }),
         ),
         HttpApiEndpoint.post("command", SessionPaths.command, {

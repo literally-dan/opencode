@@ -273,6 +273,7 @@ function compactionManifest(messages: SessionV1.WithParts[], currentMessageID: s
 export interface Interface {
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
   readonly checkpoint: (sessionID: SessionID) => Effect.Effect<number>
+  readonly ask: (input: AskInput) => Effect.Effect<AskOutput>
   readonly prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
   readonly notify: (input: PromptInput, checkpoint: number) => Effect.Effect<void, Image.Error>
   readonly loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts>
@@ -805,6 +806,67 @@ const layer = Layer.effect(
         .pipe(Effect.orDie)
       if (Option.isSome(match) && match.value.info.role === "user") return match.value.info.model
       return yield* provider.defaultModel().pipe(Effect.orDie)
+    })
+
+    const ask = Effect.fn("SessionPrompt.ask")(function* (input: AskInput) {
+      const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
+      const msgs = yield* MessageV2.filterCompactedEffect(input.sessionID).pipe(
+        Effect.provideService(Database.Service, database),
+      )
+      const previous = msgs.findLast((message) => message.info.role === "user")
+      const agentName = input.agent ?? previous?.info.agent ?? session.agent
+      const ag = agentName ? yield* agents.get(agentName) : yield* agents.defaultInfo()
+      if (!ag) throw new Error(`Agent not found: "${agentName}"`)
+
+      const selected = input.model ?? (yield* currentModel(input.sessionID))
+      const model = yield* getModel(selected.providerID, selected.modelID, input.sessionID)
+      const variant =
+        input.variant ?? ("variant" in selected && typeof selected.variant === "string" ? selected.variant : undefined)
+      const user: SessionV1.User = {
+        id: MessageID.ascending(),
+        role: "user",
+        sessionID: input.sessionID,
+        time: { created: Date.now() },
+        agent: ag.name,
+        model: {
+          providerID: selected.providerID,
+          modelID: selected.modelID,
+          variant,
+        },
+      }
+
+      yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
+      const [skills, env, instructions, mcpInstructions, modelMsgs] = yield* Effect.all([
+        sys.skills(ag),
+        sys.environment(model),
+        instruction.system().pipe(Effect.orDie),
+        sys.mcp(ag, session.permission),
+        MessageV2.toModelMessagesEffect(msgs, model, { stampUser: true }),
+      ])
+      const text = yield* llm
+        .stream({
+          agent: ag,
+          user,
+          system: [
+            ...env,
+            ...instructions,
+            ...(mcpInstructions ? [mcpInstructions] : []),
+            ...(skills ? [skills] : []),
+          ],
+          tools: {},
+          toolChoice: "none",
+          model,
+          sessionID: input.sessionID,
+          retries: 2,
+          messages: [...modelMsgs, { role: "user", content: input.question }],
+        })
+        .pipe(
+          Stream.filter(LLMEvent.is.textDelta),
+          Stream.map((event) => event.text),
+          Stream.mkString,
+          Effect.orDie,
+        )
+      return { text }
     })
 
     const prepareUserMessage = Effect.fn("SessionPrompt.prepareUserMessage")(function* (input: PromptInput) {
@@ -1850,6 +1912,7 @@ const layer = Layer.effect(
     return Service.of({
       cancel,
       checkpoint: state.checkpoint,
+      ask,
       prompt,
       notify,
       loop,
@@ -1864,6 +1927,20 @@ const ModelRef = Schema.Struct({
   providerID: ProviderV2.ID,
   modelID: ModelV2.ID,
 })
+
+export const AskInput = Schema.Struct({
+  sessionID: SessionID,
+  question: Schema.String.check(Schema.isMinLength(1)),
+  model: Schema.optional(ModelRef),
+  agent: Schema.optional(Schema.String),
+  variant: Schema.optional(Schema.String),
+})
+export type AskInput = Schema.Schema.Type<typeof AskInput>
+
+export const AskOutput = Schema.Struct({
+  text: Schema.String,
+})
+export type AskOutput = Schema.Schema.Type<typeof AskOutput>
 
 export const PromptInput = Schema.Struct({
   sessionID: SessionID,
