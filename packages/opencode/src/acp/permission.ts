@@ -13,6 +13,7 @@ import type { ACPSession } from "./session"
 import { pendingToolCall, toLocations, type ToolInput } from "./tool"
 import { SessionAncestry } from "@/session/ancestry"
 import { replyPermission } from "@/session/permission-reply"
+import { TaskProvenance } from "@/session/task-provenance"
 import { Effect } from "effect"
 
 type PermissionEvent = Extract<Event, { type: "permission.asked" }>
@@ -32,12 +33,6 @@ export class Handler {
   private readonly queues = new Map<string, Promise<void>>()
   private readonly pending = new Map<string, { sessionID: string; controller: AbortController }>()
   private stopped = false
-  // Memoise sessionID -> parentID lookups so events streaming from a
-  // deeply nested subagent don't re-fetch the whole chain per event.
-  // `parentID` is immutable per session row, so cache entries never go
-  // stale; we drop them on `session.deleted` to bound memory.
-  private readonly parentIDCache = new Map<string, string | undefined>()
-
   constructor(
     private readonly input: {
       sdk: OpencodeClient
@@ -46,10 +41,7 @@ export class Handler {
     },
   ) {}
 
-  // Invoked from the event subscription on `session.deleted` so the
-  // parentID cache tracks live sessions only.
   forgetSession(sessionID: string) {
-    this.parentIDCache.delete(sessionID)
     for (const pending of this.pending.values()) {
       if (pending.sessionID === sessionID) pending.controller.abort()
     }
@@ -160,36 +152,17 @@ export class Handler {
   private async resolveManagedAncestor(sessionID: string, signal: AbortSignal) {
     const direct = await Effect.runPromise(this.input.session.tryGet(sessionID))
     if (direct) return direct
-    let current: string | undefined = sessionID
+    let current = await TaskProvenance.getSession(this.input.sdk, sessionID, signal)
     const seen = new Set<string>()
-    while (current && !seen.has(current)) {
-      seen.add(current)
-      const parentID = await this.lookupParentID(current, signal)
-      if (!parentID) return undefined
-      const parent = await Effect.runPromise(this.input.session.tryGet(parentID))
-      if (parent) return parent
-      current = parentID
+    while (!seen.has(current.id)) {
+      seen.add(current.id)
+      const parent = await TaskProvenance.parent(this.input.sdk, current, signal)
+      if (!parent) return undefined
+      const managed = await Effect.runPromise(this.input.session.tryGet(parent.id))
+      if (managed) return managed
+      current = parent
     }
     throw new Error(`parent chain cycle detected for ${sessionID}: ${Array.from(seen).join(" -> ")}`)
-  }
-
-  private async lookupParentID(sessionID: string, signal: AbortSignal): Promise<string | undefined> {
-    if (this.parentIDCache.has(sessionID)) return this.parentIDCache.get(sessionID)
-    // Only cache successful lookups. Caching `undefined` on a transient
-    // SDK failure (network blip, server restart mid-flight) would poison
-    // the chain — a retained permission would re-use the false negative,
-    // fail to find an ancestor, and the tool call would hang forever. That
-    // is exactly the symptom this fix is meant to prevent, so each retry
-    // pays the SDK round-trip again. `throwOnError`
-    // is required so an HTTP-level failure (5xx during a server restart)
-    // rejects into the catch instead of resolving to an empty-data envelope
-    // whose `undefined` parentID would otherwise be cached as a false
-    // negative.
-    const res = await this.input.sdk.session.get({ sessionID }, { throwOnError: true, signal })
-    if (!res.data) throw new Error(`session lookup returned no data for ${sessionID}`)
-    const parentID = res.data.parentID
-    this.parentIDCache.set(sessionID, parentID)
-    return parentID
   }
 
   private async process(event: PermissionEvent, session: ACPSession.Info, signal: AbortSignal) {

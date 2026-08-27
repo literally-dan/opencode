@@ -175,6 +175,7 @@ export type Session = {
   directory: string
   path?: string
   parentID?: string
+  taskParentID?: string
   summary?: {
     additions: number
     deletions: number
@@ -2216,6 +2217,7 @@ export type GlobalSession = {
   directory: string
   path?: string
   parentID?: string
+  taskParentID?: string
   summary?: {
     additions: number
     deletions: number

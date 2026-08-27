@@ -3,11 +3,26 @@ import type { PermissionRequest, QuestionRequest, Session } from "@opencode-ai/s
 import { todoDockAtBoundary, todoState } from "./session-composer-state"
 import { sessionPermissionRequest, sessionQuestionRequest } from "./session-request-tree"
 
-const session = (input: { id: string; parentID?: string }) =>
+const session = (input: {
+  id: string
+  parentID?: string
+  taskParentID?: string
+  projectID?: string
+  workspaceID?: string
+  directory?: string
+  path?: string
+}) =>
   ({
+    projectID: "project",
+    workspaceID: "workspace",
+    directory: "/workspace",
+    path: "project",
+    ...input,
     id: input.id,
-    parentID: input.parentID,
   }) as Session
+
+const taskSession = (id: string, parentID: string, input: Partial<Session> = {}) =>
+  session({ id, parentID, taskParentID: parentID, ...input })
 
 const permission = (id: string, sessionID: string) =>
   ({
@@ -24,7 +39,7 @@ const question = (id: string, sessionID: string) =>
 
 describe("sessionPermissionRequest", () => {
   test("prefers the current session permission", () => {
-    const sessions = [session({ id: "root" }), session({ id: "child", parentID: "root" })]
+    const sessions = [session({ id: "root" }), taskSession("child", "root")]
     const permissions = {
       root: [permission("perm-root", "root")],
       child: [permission("perm-child", "child")],
@@ -36,8 +51,8 @@ describe("sessionPermissionRequest", () => {
   test("returns a nested child permission", () => {
     const sessions = [
       session({ id: "root" }),
-      session({ id: "child", parentID: "root" }),
-      session({ id: "grand", parentID: "child" }),
+      taskSession("child", "root"),
+      taskSession("grand", "child"),
       session({ id: "other" }),
     ]
     const permissions = {
@@ -48,8 +63,21 @@ describe("sessionPermissionRequest", () => {
     expect(sessionPermissionRequest(sessions, permissions, "root")?.id).toBe("perm-grand")
   })
 
-  test("returns undefined without a matching tree permission", () => {
+  test("does not route parent-only child requests through the root", () => {
     const sessions = [session({ id: "root" }), session({ id: "child", parentID: "root" })]
+
+    expect(sessionPermissionRequest(sessions, { child: [permission("perm-child", "child")] }, "root")).toBeUndefined()
+    expect(sessionQuestionRequest(sessions, { child: [question("q-child", "child")] }, "root")).toBeUndefined()
+  })
+
+  test("does not route cross-location Task requests through the root", () => {
+    const sessions = [session({ id: "root" }), taskSession("child", "root", { directory: "/foreign" })]
+
+    expect(sessionPermissionRequest(sessions, { child: [permission("perm-child", "child")] }, "root")).toBeUndefined()
+  })
+
+  test("returns undefined without a matching tree permission", () => {
+    const sessions = [session({ id: "root" }), taskSession("child", "root")]
     const permissions = {
       other: [permission("perm-other", "other")],
     }
@@ -58,7 +86,7 @@ describe("sessionPermissionRequest", () => {
   })
 
   test("skips filtered permissions in the current tree", () => {
-    const sessions = [session({ id: "root" }), session({ id: "child", parentID: "root" })]
+    const sessions = [session({ id: "root" }), taskSession("child", "root")]
     const permissions = {
       root: [permission("perm-root", "root")],
       child: [permission("perm-child", "child")],
@@ -70,7 +98,7 @@ describe("sessionPermissionRequest", () => {
   })
 
   test("returns undefined when all tree permissions are filtered out", () => {
-    const sessions = [session({ id: "root" }), session({ id: "child", parentID: "root" })]
+    const sessions = [session({ id: "root" }), taskSession("child", "root")]
     const permissions = {
       root: [permission("perm-root", "root")],
       child: [permission("perm-child", "child")],
@@ -82,7 +110,7 @@ describe("sessionPermissionRequest", () => {
 
 describe("sessionQuestionRequest", () => {
   test("prefers the current session question", () => {
-    const sessions = [session({ id: "root" }), session({ id: "child", parentID: "root" })]
+    const sessions = [session({ id: "root" }), taskSession("child", "root")]
     const questions = {
       root: [question("q-root", "root")],
       child: [question("q-child", "child")],
@@ -92,11 +120,7 @@ describe("sessionQuestionRequest", () => {
   })
 
   test("returns a nested child question", () => {
-    const sessions = [
-      session({ id: "root" }),
-      session({ id: "child", parentID: "root" }),
-      session({ id: "grand", parentID: "child" }),
-    ]
+    const sessions = [session({ id: "root" }), taskSession("child", "root"), taskSession("grand", "child")]
     const questions = {
       grand: [question("q-grand", "grand")],
     }

@@ -366,16 +366,9 @@ describe("opencode run (non-interactive subprocess)", () => {
         const sdk = createOpencodeClient({ baseUrl: server.url, directory: home })
         const root = yield* Effect.promise(() => sdk.session.create({ title: "root" }))
         if (!root.data) return yield* Effect.fail(new Error("failed to create root session"))
-        const child = yield* Effect.promise(() =>
-          sdk.session.create({
-            title: "child",
-            parentID: root.data.id,
-          }),
-        )
-        if (!child.data) return yield* Effect.fail(new Error("failed to create child session"))
         const admission = yield* Effect.promise(() =>
           sdk.session.promptAsync({
-            sessionID: child.data.id,
+            sessionID: root.data.id,
             agent: "build",
             model: { providerID: "test", modelID: "test-model" },
             parts: [{ type: "text", text: "create the marker" }],
@@ -385,9 +378,9 @@ describe("opencode run (non-interactive subprocess)", () => {
 
         yield* pollWithTimeout(
           Effect.promise(() => sdk.permission.list()).pipe(
-            Effect.map((response) => response.data?.find((permission) => permission.sessionID === child.data.id)),
+            Effect.map((response) => response.data?.find((permission) => permission.sessionID === root.data.id)),
           ),
-          "child permission never became pending",
+          "root permission never became pending",
           "15 seconds",
         )
 

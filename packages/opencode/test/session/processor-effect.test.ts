@@ -4,7 +4,7 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { expect } from "bun:test"
 import { tool } from "ai"
-import { Cause, Context, Deferred, Effect, Exit, Fiber, Layer, Schema, Stream } from "effect"
+import { Cause, Context, Deferred, Effect, Exit, Fiber, Layer, Option, Schema, Stream } from "effect"
 import path from "path"
 import z from "zod"
 import type { Agent } from "../../src/agent/agent"
@@ -188,7 +188,13 @@ const replacements = [
   [RuntimeFlags.node, RuntimeFlags.layer({ experimentalEventSystem: true })],
 ] as const
 const env = LayerNode.compile(
-  LayerNode.group([root, LayerNode.make({ service: TestLLMServer, layer: TestLLMServer.layer, deps: [] })]),
+  LayerNode.group([
+    root,
+    LayerNode.make({ service: TestLLMServer, layer: TestLLMServer.layer, deps: [] }),
+    Plugin.node,
+    Permission.node,
+    RuntimeFlags.node,
+  ]),
   replacements,
 )
 
@@ -461,6 +467,8 @@ const recoverySetup = Effect.fn("test.recoverySetup")(function* (root: string) {
     promptOps: {
       cancel: () => Effect.void,
       checkpoint: () => Effect.succeed(0),
+      retain: () => Effect.succeed(Option.some(Effect.void)),
+      admitIfCurrent: (effect) => effect.pipe(Effect.map(Option.some)),
       resolvePromptParts: () => Effect.die("unused"),
       prompt: () => Effect.die("unused"),
       notify: () => Effect.void,
@@ -1249,6 +1257,144 @@ it.live("session.processor effect tests complete AI SDK tool calls when native f
         expect(call.state.metadata).toEqual({ source: "test" })
         expect(call.state.time.start).toBeDefined()
         expect(call.state.time.end).toBeDefined()
+      }),
+    { config: (url) => providerCfg(url) },
+  ),
+)
+
+it.live("session.processor effect tests admit a duplicate provider tool call ID once per generation", () =>
+  provideTmpdirServer(
+    ({ dir, llm }) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+        let executions = 0
+        const parameters = Schema.Struct({ query: Schema.String })
+        const lookup: Tool.Def<typeof parameters> = {
+          id: "lookup",
+          description: "Look up information",
+          parameters,
+          jsonSchema: {
+            type: "object",
+            properties: { query: { type: "string" } },
+            required: ["query"],
+            additionalProperties: false,
+          },
+          execute: (args) =>
+            Effect.sync(() => {
+              executions += 1
+              return {
+                title: "Weather lookup",
+                output: `result:${args.query}`,
+                metadata: { source: "test" },
+              }
+            }),
+        }
+        const registry = ToolRegistry.Service.of({
+          ids: () => Effect.succeed([lookup.id]),
+          all: () => Effect.succeed([lookup]),
+          named: () => Effect.die("unused"),
+          tools: () => Effect.succeed([lookup]),
+        })
+        const toolChunk = (index: number) => ({
+          id: "chatcmpl-duplicate-tool",
+          object: "chat.completion.chunk",
+          choices: [
+            {
+              delta: {
+                tool_calls: [
+                  {
+                    index,
+                    id: "same-id",
+                    type: "function",
+                    function: { name: "lookup", arguments: '{"query":"weather"}' },
+                  },
+                ],
+              },
+            },
+          ],
+        })
+
+        yield* llm.push(
+          raw({
+            chunks: [
+              {
+                id: "chatcmpl-duplicate-tool",
+                object: "chat.completion.chunk",
+                choices: [{ delta: { role: "assistant" } }],
+              },
+              toolChunk(0),
+              toolChunk(1),
+              {
+                id: "chatcmpl-duplicate-tool",
+                object: "chat.completion.chunk",
+                choices: [{ delta: {}, finish_reason: "tool_calls" }],
+              },
+            ],
+          }),
+        )
+
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "duplicate tool")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({
+          assistantMessage: msg,
+          sessionID: chat.id,
+          model: mdl,
+        })
+        const tools = yield* SessionTools.resolve({
+          agent: agent(),
+          model: mdl,
+          session: chat,
+          processor: handle,
+          bypassAgentCheck: false,
+          messages: yield* session.messages({ sessionID: chat.id }),
+          promptOps: {
+            cancel: () => Effect.void,
+            checkpoint: () => Effect.succeed(0),
+            retain: () => Effect.succeed(Option.some(Effect.void)),
+            admitIfCurrent: (effect) => effect.pipe(Effect.map(Option.some)),
+            admitChild: (_sessionID, effect) => effect.pipe(Effect.map(Option.some)),
+            resolvePromptParts: () => Effect.die("unused"),
+            prompt: () => Effect.die("unused"),
+            admitNotification: () => Effect.die("unused"),
+            notify: () => Effect.void,
+          },
+        }).pipe(
+          Effect.provideService(ToolRegistry.Service, registry),
+          Effect.provideService(MCP.Service, emptyMcp),
+          Effect.provideService(Truncate.Service, passthroughTruncate),
+        )
+
+        const value = yield* handle.process({
+          user: {
+            id: parent.id,
+            sessionID: chat.id,
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies SessionV1.User,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "duplicate tool" }],
+          tools,
+        })
+
+        const calls = (yield* MessageV2.parts(msg.id)).filter(
+          (part): part is SessionV1.ToolPart => part.type === "tool",
+        )
+        expect(value).toBe("continue")
+        expect(yield* llm.calls).toBe(1)
+        expect(executions).toBe(1)
+        expect(calls).toHaveLength(1)
+        expect(calls[0]?.callID).toBe("same-id")
+        expect(calls[0]?.state.status).toBe("completed")
+        if (calls[0]?.state.status !== "completed") return
+        expect(calls[0].state.input).toEqual({ query: "weather" })
+        expect(calls[0].state.output).toBe("result:weather")
       }),
     { config: (url) => providerCfg(url) },
   ),

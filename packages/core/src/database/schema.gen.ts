@@ -184,6 +184,7 @@ export default {
           \`project_id\` text NOT NULL,
           \`workspace_id\` text,
           \`parent_id\` text,
+          \`task_parent_id\` text,
           \`slug\` text NOT NULL,
           \`directory\` text NOT NULL,
           \`path\` text,
@@ -268,6 +269,7 @@ export default {
       yield* tx.run(`CREATE INDEX \`session_project_idx\` ON \`session\` (\`project_id\`,\`time_updated\`);`)
       yield* tx.run(`CREATE INDEX \`session_workspace_idx\` ON \`session\` (\`workspace_id\`);`)
       yield* tx.run(`CREATE INDEX \`session_parent_idx\` ON \`session\` (\`parent_id\`,\`time_updated\`,\`id\`);`)
+      yield* tx.run(`CREATE INDEX \`session_task_parent_idx\` ON \`session\` (\`task_parent_id\`);`)
       yield* tx.run(`CREATE INDEX \`session_time_updated_idx\` ON \`session\` (\`time_updated\`,\`id\`);`)
       yield* tx.run(`CREATE INDEX \`todo_session_idx\` ON \`todo\` (\`session_id\`);`)
     })

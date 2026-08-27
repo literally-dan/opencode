@@ -10,6 +10,7 @@ import { DatabaseMigration } from "@opencode-ai/core/database/migration"
 import { migrations } from "@opencode-ai/core/database/migration.gen"
 import workspaceNameMigration from "@opencode-ai/core/database/migration/20260410174513_workspace-name"
 import sessionListIndexesMigration from "@opencode-ai/core/database/migration/20260724103001_session_list_indexes"
+import sessionTaskParentMigration from "@opencode-ai/core/database/migration/20260827164832_session_task_parent"
 import sessionUsageMigration from "@opencode-ai/core/database/migration/20260510033149_session_usage"
 import normalizeStoragePathsMigration from "@opencode-ai/core/database/migration/20260601010001_normalize_storage_paths"
 import sessionMessageProjectionOrderMigration from "@opencode-ai/core/database/migration/20260603040000_session_message_projection_order"
@@ -195,7 +196,7 @@ describe("DatabaseMigration", () => {
       Effect.gen(function* () {
         const db = yield* makeDb
         yield* legacySessionTable(db)
-        yield* DatabaseMigration.applyOnly(db, [sessionListIndexesMigration])
+        yield* DatabaseMigration.applyOnly(db, [sessionListIndexesMigration, sessionTaskParentMigration])
         return yield* sessionIndexes(db)
       }),
     )

@@ -19,6 +19,15 @@ import { ACPSession } from "@/acp/session"
 type PermissionEvent = Extract<Event, { type: "permission.asked" }>
 type PermissionReplyParams = Parameters<OpencodeClient["permission"]["reply"]>[0]
 type SessionUpdateParams = Parameters<AgentSideConnection["sessionUpdate"]>[0]
+type SessionInfo = {
+  id: string
+  parentID?: string
+  taskParentID?: string
+  projectID: string
+  workspaceID?: string
+  directory: string
+  path?: string
+}
 const cleanupDirs: string[] = []
 
 afterEach(async () => {
@@ -44,10 +53,33 @@ function makeSessionService() {
   )
 }
 
+function sessionInfo(id: string, input: Partial<Omit<SessionInfo, "id">> = {}): SessionInfo {
+  return {
+    id,
+    projectID: "project",
+    directory: "/workspace",
+    ...input,
+  }
+}
+
+function taskMessages(...sessionIDs: string[]) {
+  return [
+    {
+      info: { role: "assistant" },
+      parts: sessionIDs.map((sessionId) => ({
+        type: "tool",
+        tool: "task",
+        state: { metadata: { sessionId } },
+      })),
+    },
+  ]
+}
+
 function createHarness(
   input: {
     requestPermission?: (params: RequestPermissionRequest) => Promise<RequestPermissionResponse>
-    sessionGet?: (sessionID: string) => Promise<{ parentID?: string }>
+    sessionGet?: (sessionID: string) => Promise<Partial<Omit<SessionInfo, "id">>>
+    sessionMessages?: (sessionID: string) => Promise<ReturnType<typeof taskMessages>>
     permissionReply?: (params: PermissionReplyParams) => Promise<{ data?: boolean; error?: unknown }>
   } = {},
 ) {
@@ -68,7 +100,9 @@ function createHarness(
         (
           input.sessionGet?.(params.sessionID) ??
           Promise.reject(new Error(`unexpected session lookup: ${params.sessionID}`))
-        ).then((data) => ({ data })),
+        ).then((data) => ({ data: sessionInfo(params.sessionID, data) })),
+      messages: (params: { sessionID: string }) =>
+        (input.sessionMessages?.(params.sessionID) ?? Promise.resolve([])).then((data) => ({ data })),
     },
   } as unknown as OpencodeClient
   const connection = {
@@ -371,11 +405,17 @@ describe("acp permissions", () => {
     const parents = new Map<string, string | undefined>([
       ["ses_leaf", "ses_middle"],
       ["ses_middle", "ses_root"],
+      ["ses_root", undefined],
     ])
     const harness = createHarness({
       sessionGet: async (sessionID) => {
         if (!parents.has(sessionID)) throw new Error(`unexpected session lookup: ${sessionID}`)
-        return { parentID: parents.get(sessionID) }
+        return { parentID: parents.get(sessionID), taskParentID: parents.get(sessionID) }
+      },
+      sessionMessages: async (sessionID) => {
+        if (sessionID === "ses_middle") return taskMessages("ses_leaf")
+        if (sessionID === "ses_root") return taskMessages("ses_middle")
+        return []
       },
     })
     await createSession(harness.session, "ses_root")
@@ -388,13 +428,36 @@ describe("acp permissions", () => {
     expect(harness.replies[0]).toMatchObject({ requestID: "perm_nested", reply: "once" })
   })
 
+  it("does not route a claimed parent without a server-owned Task edge", async () => {
+    let lookups = 0
+    const harness = createHarness({
+      sessionGet: (sessionID) => {
+        lookups += 1
+        return Promise.resolve({ parentID: sessionID === "ses_leaf" ? "ses_root" : undefined })
+      },
+    })
+    await createSession(harness.session, "ses_root")
+
+    harness.subscription.handle(permissionAsked("ses_leaf", "perm_forged"))
+
+    await pollUntil(() => lookups === 1, "claimed ancestry was never checked")
+    await Bun.sleep(25)
+    expect(harness.requests).toHaveLength(0)
+    expect(harness.replies).toHaveLength(0)
+  })
+
   it("rejects a permission whose ancestry never resolves", async () => {
     // Permission.ask waits on a deferred with no timeout, so an ancestry that
     // can never resolve — a parent chain cycle, or a parentID pointing at a
     // deleted session — hangs the nested tool call forever unless the retry is
     // bounded and exhaustion answers the request.
     const harness = createHarness({
-      sessionGet: (sessionID) => Promise.resolve({ parentID: sessionID === "ses_leaf" ? "ses_mid" : "ses_leaf" }),
+      sessionGet: (sessionID) => {
+        const parentID = sessionID === "ses_leaf" ? "ses_mid" : "ses_leaf"
+        return Promise.resolve({ parentID, taskParentID: parentID })
+      },
+      sessionMessages: async (sessionID) =>
+        sessionID === "ses_mid" ? taskMessages("ses_leaf") : taskMessages("ses_mid"),
     })
     await createSession(harness.session, "ses_root")
 
@@ -512,11 +575,15 @@ describe("acp permissions", () => {
   it("eventually routes an owned permission after prolonged ancestry failures", async () => {
     let lookups = 0
     const harness = createHarness({
-      sessionGet: async () => {
+      sessionGet: async (sessionID) => {
         lookups += 1
         if (lookups < 4) throw new Error("session service unavailable")
-        return { parentID: "ses_root" }
+        return {
+          parentID: sessionID === "ses_leaf" ? "ses_root" : undefined,
+          taskParentID: sessionID === "ses_leaf" ? "ses_root" : undefined,
+        }
       },
+      sessionMessages: async () => taskMessages("ses_leaf"),
     })
     await createSession(harness.session, "ses_root")
 
@@ -525,7 +592,7 @@ describe("acp permissions", () => {
     await pollUntil(() => harness.replies.length === 1, "owned permission was not routed after ancestry retry", {
       timeoutMs: 3000,
     })
-    expect(lookups).toBe(4)
+    expect(lookups).toBe(5)
     expect(harness.requests[0]?.sessionId).toBe("ses_root")
     expect(harness.replies[0]).toMatchObject({ requestID: "perm_retry_owned", reply: "once" })
   })
@@ -618,11 +685,15 @@ describe("acp permissions", () => {
     })
     let lookups = 0
     const harness = createHarness({
-      sessionGet: async () => {
+      sessionGet: async (sessionID) => {
         lookups += 1
         if (lookups === 1) await firstLookup
-        return { parentID: "ses_root" }
+        return {
+          parentID: sessionID === "ses_leaf" ? "ses_root" : undefined,
+          taskParentID: sessionID === "ses_leaf" ? "ses_root" : undefined,
+        }
       },
+      sessionMessages: async () => taskMessages("ses_leaf"),
     })
     await createSession(harness.session, "ses_root")
 
@@ -689,11 +760,15 @@ describe("acp permissions", () => {
     let maxActive = 0
     const harness = createHarness({
       sessionGet: async (sessionID) => {
-        if (sessionID !== "ses_leaf_a" && sessionID !== "ses_leaf_b") {
+        if (sessionID !== "ses_leaf_a" && sessionID !== "ses_leaf_b" && sessionID !== "ses_root") {
           throw new Error(`unexpected session lookup: ${sessionID}`)
         }
-        return { parentID: "ses_root" }
+        return {
+          parentID: sessionID === "ses_root" ? undefined : "ses_root",
+          taskParentID: sessionID === "ses_root" ? undefined : "ses_root",
+        }
       },
+      sessionMessages: async () => taskMessages("ses_leaf_a", "ses_leaf_b"),
       requestPermission: async () => {
         active += 1
         maxActive = Math.max(maxActive, active)

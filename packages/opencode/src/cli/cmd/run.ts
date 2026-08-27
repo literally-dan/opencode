@@ -25,7 +25,7 @@ import { Filesystem } from "@/util/filesystem"
 import { createOpencodeClient, type OpencodeClient, type PermissionRequest, type ToolPart } from "@opencode-ai/sdk/v2"
 import { FormatError, FormatUnknownError } from "../error"
 import { INTERACTIVE_INPUT_ERROR, resolveInteractiveStdin } from "./run/runtime.stdin"
-import { DescendantFetchError, fetchDescendantIDs, resolveSessionTreeOwnership } from "./run/tree"
+import { resolveSessionTreeOwnership } from "./run/tree"
 import { replyPermission } from "@/session/permission-reply"
 
 type ModelInput = Parameters<OpencodeClient["session"]["prompt"]>[0]["model"]
@@ -702,35 +702,10 @@ export const RunCommand = effectCmd({
           const toggles = new Map<string, boolean>()
           let error: string | undefined
           let idle = false
-          // `tree` is the transitive set of sessions under this run. It is
-          // the membership oracle for "should this permission prompt count
-          // as ours" — a nested subagent's permission event carries the
-          // deepest session's id, and equality against the root id would
-          // miss it.
-          //
-          // Maintenance:
-          //   - seeded with the entire descendant chain so attach mode can
-          //     identify prompts pending from before the subscription;
-          //   - extended on `session.created`/`session.updated` whenever a
-          //     new session's parent is already in the tree;
-          //   - on out-of-order events (grandchild seen before parent),
-          //     `resolveSessionTreeOwnership` walks the chain via the SDK as a fallback.
+          // Keep only the run root. Every descendant permission revalidates its
+          // current immutable Task edges and location against this root.
           const ancestryAbort = new AbortController()
           const tree = new Set<string>([sessionID])
-          // Resolved in the background. Awaiting it here would delay the `/event`
-          // subscription below by a round trip, and that route has no replay, so
-          // anything published in the gap — including the `session.status: idle`
-          // this loop breaks on — would be lost.
-          const seeded = fetchDescendantIDs(client, sessionID, { signal: ancestryAbort.signal })
-            .catch((error) => {
-              UI.error(
-                `failed to seed complete session tree; permission ancestry will be checked on demand (${String(error)})`,
-              )
-              return new Set<string>(error instanceof DescendantFetchError ? error.partial.map((item) => item.id) : [])
-            })
-            .then((ids) => {
-              for (const id of ids) tree.add(id)
-            })
           const pendingPermissions = new Map<string, Promise<void>>()
           const seenPermissions = new Set<string>()
 
@@ -752,29 +727,22 @@ export const RunCommand = effectCmd({
             if (seenPermissions.has(permission.id)) return pendingPermissions.get(permission.id)
             seenPermissions.add(permission.id)
             const task = (async () => {
-              const ownership = tree.has(permission.sessionID)
-                ? ({ type: "owned" } as const)
-                : await (async () => {
-                    // The seed makes an already-pending prompt from before
-                    // the subscription ours, but known sessions should not
-                    // wait for unrelated descendant branches to finish.
-                    await seeded
-                    if (tree.has(permission.sessionID)) return { type: "owned" } as const
-                    return resolveSessionTreeOwnership(client, tree, permission.sessionID, {
-                      signal: ancestryAbort.signal,
-                      onUnknown: (retry) => {
-                        if (retry.attempt !== 1 && retry.attempt % 5 !== 0) return
-                        UI.error(
-                          `permission ownership unresolved; retrying ${permission.id} in ${retry.retryIn}ms (${String(retry.error)})`,
-                        )
-                      },
-                    })
-                  })()
+              const ownership = await resolveSessionTreeOwnership(client, tree, permission.sessionID, {
+                signal: ancestryAbort.signal,
+                onUnknown: (retry) => {
+                  if (retry.attempt !== 1 && retry.attempt % 5 !== 0) return
+                  UI.error(
+                    `permission ownership unresolved; retrying ${permission.id} in ${retry.retryIn}ms (${String(retry.error)})`,
+                  )
+                },
+              })
               if (ownership.type === "foreign" || ownership.type === "cancelled") return
               if (ownership.type === "exhausted") {
                 // A cycle or deleted parent never resolves, and the server
                 // waits on an untimed deferred, so reject rather than hang.
-                UI.error(`permission ancestry unresolvable for ${permission.id}; rejecting (${String(ownership.error)})`)
+                UI.error(
+                  `permission ancestry unresolvable for ${permission.id}; rejecting (${String(ownership.error)})`,
+                )
                 await answerPermission(permission.id, "reject")
                 return
               }
@@ -832,11 +800,6 @@ export const RunCommand = effectCmd({
 
           try {
             for await (const event of events.stream) {
-              if (event.type === "session.created" || event.type === "session.updated") {
-                const info = event.properties.info
-                if (info.parentID && tree.has(info.parentID)) tree.add(info.id)
-              }
-
               if (
                 event.type === "message.updated" &&
                 event.properties.sessionID === sessionID &&

@@ -1,6 +1,6 @@
 import { describe, expect } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { Deferred, Effect } from "effect"
+import { Deferred, Effect, Fiber } from "effect"
 import { BackgroundJob } from "@/background/job"
 import { testEffect } from "../lib/effect"
 
@@ -151,32 +151,50 @@ describe("background.job", () => {
     }),
   )
 
-  it.instance("ignores stale settlements after restarting a failed job", () =>
+  it.instance("preserves accepted work and waits for failed generation cleanup before restarting", () =>
     Effect.gen(function* () {
       const jobs = yield* BackgroundJob.Service
-      const fail = yield* Deferred.make<void>()
-      const interrupted = yield* Deferred.make<void>()
-      const release = yield* Deferred.make<void>()
+      const failFirst = yield* Deferred.make<void>()
+      const extensionStarted = yield* Deferred.make<void>()
+      const failExtension = yield* Deferred.make<void>()
+      const finalizing = yield* Deferred.make<void>()
+      const releaseFinalizer = yield* Deferred.make<void>()
+      const restarted = yield* Deferred.make<void>()
       const id = "job_test"
       yield* jobs.start({
         id,
         type: "test",
-        run: Deferred.await(fail).pipe(Effect.andThen(Effect.fail(new Error("boom")))),
+        onFinalize: Deferred.succeed(finalizing, undefined).pipe(Effect.andThen(Deferred.await(releaseFinalizer))),
+        run: Deferred.await(failFirst).pipe(Effect.andThen(Effect.fail(new Error("first failed")))),
       })
       yield* jobs.extend({
         id,
-        run: Effect.never.pipe(
-          Effect.ensuring(Deferred.succeed(interrupted, undefined).pipe(Effect.andThen(Deferred.await(release)))),
+        run: Deferred.succeed(extensionStarted, undefined).pipe(
+          Effect.andThen(Deferred.await(failExtension)),
+          Effect.andThen(Effect.fail(new Error("extension failed"))),
         ),
       })
 
-      yield* Deferred.succeed(fail, undefined)
-      expect((yield* jobs.wait({ id })).info?.status).toBe("error")
-      yield* Deferred.await(interrupted)
-      yield* jobs.start({ id, type: "test", run: Effect.never })
+      yield* Deferred.succeed(failFirst, undefined)
+      yield* Deferred.await(extensionStarted).pipe(Effect.timeout("1 second"))
+      expect(yield* jobs.wait({ id, timeout: 0 })).toMatchObject({ timedOut: true, info: { status: "running" } })
 
-      yield* Deferred.succeed(release, undefined)
+      yield* Deferred.succeed(failExtension, undefined)
+      yield* Deferred.await(finalizing)
+
+      const restart = yield* jobs
+        .start({
+          id,
+          type: "test",
+          run: Deferred.succeed(restarted, undefined).pipe(Effect.andThen(Effect.never)),
+        })
+        .pipe(Effect.forkChild)
       yield* Effect.yieldNow
+      expect(yield* Deferred.isDone(restarted)).toBe(false)
+
+      yield* Deferred.succeed(releaseFinalizer, undefined)
+      expect((yield* Fiber.join(restart)).status).toBe("running")
+      yield* Deferred.await(restarted).pipe(Effect.timeout("1 second"))
       expect((yield* jobs.get(id))?.status).toBe("running")
       yield* jobs.cancel(id)
     }),

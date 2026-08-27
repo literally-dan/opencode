@@ -1,21 +1,23 @@
 import type { Session } from "@opencode-ai/sdk/v2"
 
 // Walk the in-memory session list and return the root together with every
-// transitive subagent under it. Pure function over a session snapshot so callers
+// authenticated Task subagent under it. Pure function over a session snapshot so callers
 // can wrap it in `createMemo` and have it track only what changed.
 //
 // Returns `[]` when `rootID` is not in `sessions` so the caller can treat an
 // unknown root the same as an empty tree without a special case.
 export function sessionTree(sessions: readonly Session[], rootID: string): Session[] {
+  const byID = new Map(sessions.map((session) => [session.id, session]))
   const byParent = new Map<string, Session[]>()
-  let root: Session | undefined
   for (const s of sessions) {
-    if (s.id === rootID) root = s
     if (!s.parentID) continue
+    const parent = byID.get(s.parentID)
+    if (!parent || !isTaskChild(parent, s)) continue
     const bucket = byParent.get(s.parentID) ?? []
     bucket.push(s)
     byParent.set(s.parentID, bucket)
   }
+  const root = byID.get(rootID)
   if (!root) return []
   const out: Session[] = [root]
   const seen = new Set([rootID])
@@ -33,4 +35,15 @@ export function sessionTree(sessions: readonly Session[], rootID: string): Sessi
     }
   }
   return out
+}
+
+function isTaskChild(parent: Session, child: Session) {
+  return (
+    child.parentID === parent.id &&
+    child.taskParentID === child.parentID &&
+    child.projectID === parent.projectID &&
+    child.workspaceID === parent.workspaceID &&
+    child.directory === parent.directory &&
+    (child.path === undefined || parent.path === undefined || child.path === parent.path)
+  )
 }

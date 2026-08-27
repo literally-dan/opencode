@@ -177,6 +177,7 @@ const layer = Layer.effect(
       const pendingSettlements = new Map<string, ToolSettlement>()
       const settling = new Set<string>()
       const settled = new Set<string>()
+      const admittedToolCalls = new Set<string>()
       let generation = 0
       let activeGeneration: number | undefined
       let admissionClosed = false
@@ -474,6 +475,8 @@ const layer = Layer.effect(
             if (admissionClosed || requestedGeneration === undefined || requestedGeneration !== activeGeneration) {
               return false
             }
+            if (admittedToolCalls.has(toolCallID)) return false
+            admittedToolCalls.add(toolCallID)
             yield* startToolCallUnlocked({ id: toolCallID, name, args, admitted: true })
             return true
           }),
@@ -484,6 +487,7 @@ const layer = Layer.effect(
           if (admissionClosed) return yield* Effect.interrupt
           generation += 1
           activeGeneration = generation
+          admittedToolCalls.clear()
           return generation
         }),
       )

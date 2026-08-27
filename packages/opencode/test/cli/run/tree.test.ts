@@ -8,9 +8,50 @@ import {
 } from "@/cli/cmd/run/tree"
 import { replyPermission } from "@/session/permission-reply"
 
+type SessionInfo = {
+  id: string
+  title?: string
+  parentID?: string
+  taskParentID?: string
+  projectID: string
+  workspaceID?: string
+  directory: string
+  path?: string
+}
+
+function sessionInfo(id: string, input: Partial<Omit<SessionInfo, "id">> = {}): SessionInfo {
+  return {
+    id,
+    projectID: "project",
+    directory: "/workspace",
+    ...input,
+  }
+}
+
+function taskInfo(id: string, parentID: string, input: Partial<Omit<SessionInfo, "id" | "parentID">> = {}) {
+  return { id, parentID, taskParentID: parentID, ...input }
+}
+
+function taskMessages(...sessionIDs: string[]) {
+  return [
+    {
+      info: { role: "assistant" },
+      parts: sessionIDs.map((sessionId) => ({
+        type: "tool",
+        tool: "task",
+        state: { metadata: { sessionId } },
+      })),
+    },
+  ]
+}
+
 function client(input: {
-  children?: (sessionID: string, signal?: AbortSignal) => Promise<Array<{ id: string; title?: string }>>
-  get?: (sessionID: string) => Promise<{ parentID?: string }>
+  children?: (
+    sessionID: string,
+    signal?: AbortSignal,
+  ) => Promise<Array<Pick<SessionInfo, "id"> & Partial<Omit<SessionInfo, "id">>>>
+  get?: (sessionID: string) => Promise<Partial<Omit<SessionInfo, "id">>>
+  messages?: (sessionID: string) => Promise<ReturnType<typeof taskMessages>>
   reply?: (input: { requestID: string; reply: "once" | "always" | "reject" }) => Promise<{
     data?: boolean
     error?: unknown
@@ -22,8 +63,17 @@ function client(input: {
     },
     session: {
       children: (params: { sessionID: string }, options?: { signal?: AbortSignal }) =>
-        input.children?.(params.sessionID, options?.signal).then((data) => ({ data })),
-      get: (params: { sessionID: string }) => input.get?.(params.sessionID).then((data) => ({ data })),
+        input.children
+          ? input
+              .children(params.sessionID, options?.signal)
+              .then((data) => ({ data: data.map((item) => sessionInfo(item.id, item)) }))
+          : undefined,
+      get: (params: { sessionID: string }) =>
+        (input.get?.(params.sessionID) ?? Promise.resolve({})).then((data) => ({
+          data: sessionInfo(params.sessionID, data),
+        })),
+      messages: (params: { sessionID: string }) =>
+        (input.messages?.(params.sessionID) ?? Promise.resolve([])).then((data) => ({ data })),
     },
   } as unknown as OpencodeClient
 }
@@ -32,9 +82,9 @@ describe("run session tree", () => {
   test("surfaces descendant lookup failures with successfully traversed branches", async () => {
     const sdk = client({
       children: async (sessionID) => {
-        if (sessionID === "root") return [{ id: "child-a" }, { id: "child-b" }]
+        if (sessionID === "root") return [taskInfo("child-a", "root"), taskInfo("child-b", "root")]
         if (sessionID === "child-a") throw new Error("child-a unavailable")
-        if (sessionID === "child-b") return [{ id: "grandchild-b" }]
+        if (sessionID === "child-b") return [taskInfo("grandchild-b", "child-b")]
         return []
       },
     })
@@ -53,8 +103,8 @@ describe("run session tree", () => {
   test("does not revisit a cycle", async () => {
     const sdk = client({
       children: async (sessionID) => {
-        if (sessionID === "root") return [{ id: "child" }]
-        if (sessionID === "child") return [{ id: "root" }]
+        if (sessionID === "root") return [taskInfo("child", "root")]
+        if (sessionID === "child") return [taskInfo("root", "child")]
         return []
       },
     })
@@ -62,12 +112,47 @@ describe("run session tree", () => {
     expect(await fetchDescendants(sdk, "root")).toEqual([{ id: "child" }])
   })
 
+  test("returns genuine nested Task descendants", async () => {
+    const sdk = client({
+      children: async (sessionID) => {
+        if (sessionID === "root") return [taskInfo("child", "root", { title: "Child" })]
+        if (sessionID === "child") return [taskInfo("grandchild", "child")]
+        return []
+      },
+    })
+
+    expect(await fetchDescendants(sdk, "root")).toEqual([{ id: "child", title: "Child" }, { id: "grandchild" }])
+  })
+
+  test("excludes parent-only descendants", async () => {
+    const visited: string[] = []
+    const sdk = client({
+      children: async (sessionID) => {
+        visited.push(sessionID)
+        if (sessionID === "root") return [{ id: "history", parentID: "root" }]
+        return [taskInfo("unexpected", sessionID)]
+      },
+    })
+
+    expect(await fetchDescendants(sdk, "root")).toEqual([])
+    expect(visited).toEqual(["root"])
+  })
+
+  test("excludes Task descendants across a location boundary", async () => {
+    const sdk = client({
+      children: async (sessionID) =>
+        sessionID === "root" ? [taskInfo("foreign", "root", { directory: "/foreign" })] : [],
+    })
+
+    expect(await fetchDescendants(sdk, "root")).toEqual([])
+  })
+
   test("bounds concurrent descendant lookups", async () => {
     let active = 0
     let maxActive = 0
     const sdk = client({
       children: async (sessionID) => {
-        if (sessionID === "root") return Array.from({ length: 6 }, (_, index) => ({ id: `child-${index}` }))
+        if (sessionID === "root") return Array.from({ length: 6 }, (_, index) => taskInfo(`child-${index}`, "root"))
         active += 1
         maxActive = Math.max(maxActive, active)
         await Bun.sleep(20)
@@ -85,7 +170,7 @@ describe("run session tree", () => {
     let maxActive = 0
     const sdk = client({
       children: async (sessionID) => {
-        if (sessionID === "root") return Array.from({ length: 6 }, (_, index) => ({ id: `child-${index}` }))
+        if (sessionID === "root") return Array.from({ length: 6 }, (_, index) => taskInfo(`child-${index}`, "root"))
         active += 1
         maxActive = Math.max(maxActive, active)
         await Bun.sleep(20)
@@ -101,7 +186,9 @@ describe("run session tree", () => {
   test("returns partial data when the session limit is reached", async () => {
     const sdk = client({
       children: async (sessionID) =>
-        sessionID === "root" ? [{ id: "child-a" }, { id: "child-b" }, { id: "child-c" }] : [],
+        sessionID === "root"
+          ? [taskInfo("child-a", "root"), taskInfo("child-b", "root"), taskInfo("child-c", "root")]
+          : [],
     })
 
     try {
@@ -122,7 +209,7 @@ describe("run session tree", () => {
     })
     const sdk = client({
       children: async (sessionID, signal) => {
-        if (sessionID === "root") return [{ id: "child" }]
+        if (sessionID === "root") return [taskInfo("child", "root")]
         started?.()
         return new Promise((_, reject) => {
           signal?.addEventListener("abort", () => reject(signal.reason), { once: true })
@@ -140,7 +227,7 @@ describe("run session tree", () => {
   test("times out stalled descendant lookups", async () => {
     const sdk = client({
       children: async (sessionID, signal) => {
-        if (sessionID === "root") return [{ id: "child" }]
+        if (sessionID === "root") return [taskInfo("child", "root")]
         return new Promise((_, reject) => {
           signal?.addEventListener("abort", () => reject(signal.reason), { once: true })
         })
@@ -153,7 +240,7 @@ describe("run session tree", () => {
   test("bounds total traversal time", async () => {
     const sdk = client({
       children: async (sessionID, signal) => {
-        if (sessionID === "root") return [{ id: "child" }]
+        if (sessionID === "root") return [taskInfo("child", "root")]
         return new Promise((_, reject) => {
           signal?.addEventListener("abort", () => reject(signal.reason), { once: true })
         })
@@ -254,15 +341,21 @@ describe("run session tree", () => {
     expect(await lookupSessionTreeOwnership(sdk, new Set(["root"]), "foreign")).toEqual({ type: "foreign" })
   })
 
-  test("adds a resolved ancestry path to the known tree", async () => {
+  test("resolves an ancestry path without caching descendant trust", async () => {
     const parents = new Map<string, string | undefined>([
       ["leaf", "middle"],
       ["middle", "root"],
+      ["root", undefined],
     ])
+    let messageLookups = 0
     const sdk = client({
       get: async (sessionID) => {
         if (!parents.has(sessionID)) throw new Error(`unexpected lookup: ${sessionID}`)
-        return { parentID: parents.get(sessionID) }
+        return { parentID: parents.get(sessionID), taskParentID: parents.get(sessionID) }
+      },
+      messages: async () => {
+        messageLookups += 1
+        return []
       },
     })
     const tree = new Set(["root"])
@@ -271,7 +364,61 @@ describe("run session tree", () => {
       type: "owned",
       value: undefined,
     })
-    expect(tree).toEqual(new Set(["root", "leaf", "middle"]))
+    expect(tree).toEqual(new Set(["root"]))
+    expect(messageLookups).toBe(0)
+  })
+
+  test("rejects a claimed parent without a server-owned Task edge", async () => {
+    const sdk = client({
+      get: async (sessionID) => ({ parentID: sessionID === "leaf" ? "root" : undefined }),
+    })
+
+    expect(await lookupSessionTreeOwnership(sdk, new Set(["root"]), "leaf")).toEqual({ type: "foreign" })
+  })
+
+  test("rejects Task ancestry across a location boundary", async () => {
+    const sdk = client({
+      get: async (sessionID) => ({
+        parentID: sessionID === "leaf" ? "root" : undefined,
+        taskParentID: sessionID === "leaf" ? "root" : undefined,
+        directory: sessionID === "leaf" ? "/foreign" : "/workspace",
+      }),
+      messages: async () => taskMessages("leaf"),
+    })
+
+    expect(await lookupSessionTreeOwnership(sdk, new Set(["root"]), "leaf")).toEqual({ type: "foreign" })
+  })
+
+  test("revalidates a previously owned descendant after it moves locations", async () => {
+    let moved = false
+    const sdk = client({
+      get: async (sessionID) => ({
+        parentID: sessionID === "leaf" ? "root" : undefined,
+        taskParentID: sessionID === "leaf" ? "root" : undefined,
+        directory: sessionID === "leaf" && moved ? "/foreign" : "/workspace",
+      }),
+    })
+    const tree = new Set(["root"])
+
+    expect(await lookupSessionTreeOwnership(sdk, tree, "leaf")).toEqual({ type: "owned", value: undefined })
+    moved = true
+    expect(await lookupSessionTreeOwnership(sdk, tree, "leaf")).toEqual({ type: "foreign" })
+    expect(tree).toEqual(new Set(["root"]))
+  })
+
+  test("accepts a legacy parent without a persisted path", async () => {
+    const sdk = client({
+      get: async (sessionID) => ({
+        parentID: sessionID === "leaf" ? "root" : undefined,
+        taskParentID: sessionID === "leaf" ? "root" : undefined,
+        path: sessionID === "leaf" ? "/workspace/project" : undefined,
+      }),
+    })
+
+    expect(await lookupSessionTreeOwnership(sdk, new Set(["root"]), "leaf")).toEqual({
+      type: "owned",
+      value: undefined,
+    })
   })
 
   test("gives up on an unresolvable ancestry instead of retrying forever", async () => {
@@ -282,8 +429,10 @@ describe("run session tree", () => {
     const sdk = client({
       get: (sessionID) => {
         lookups += 1
-        return Promise.resolve({ parentID: sessionID === "leaf" ? "middle" : "leaf" })
+        const parentID = sessionID === "leaf" ? "middle" : "leaf"
+        return Promise.resolve({ parentID, taskParentID: parentID })
       },
+      messages: async (sessionID) => (sessionID === "middle" ? taskMessages("leaf") : taskMessages("middle")),
     })
 
     const resolution = await resolveSessionTreeOwnership(sdk, new Set(["root"]), "leaf", {
@@ -299,7 +448,7 @@ describe("run session tree", () => {
   test("gives up when a parent points at a missing session", async () => {
     const sdk = client({
       get: (sessionID) => {
-        if (sessionID === "leaf") return Promise.resolve({ parentID: "deleted" })
+        if (sessionID === "leaf") return Promise.resolve({ parentID: "deleted", taskParentID: "deleted" })
         return Promise.reject(new Error(`session not found: ${sessionID}`))
       },
     })

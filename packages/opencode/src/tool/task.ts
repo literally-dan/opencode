@@ -9,7 +9,7 @@ import { Agent } from "../agent/agent"
 import { deriveSubagentSessionPermission } from "../agent/subagent-permissions"
 import type { SessionPrompt } from "../session/prompt"
 import { Config } from "@/config/config"
-import { Effect, Exit, Schema, Scope } from "effect"
+import { Deferred, Effect, Exit, Option, Ref, Schema, Scope } from "effect"
 import { EffectBridge } from "@/effect/bridge"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Database } from "@opencode-ai/core/database/database"
@@ -18,9 +18,16 @@ import { Provider } from "@/provider/provider"
 export interface TaskPromptOps {
   cancel(sessionID: SessionID): Effect.Effect<void>
   checkpoint(sessionID: SessionID): Effect.Effect<number>
+  retain(sessionID: SessionID, checkpoint: number): Effect.Effect<Option.Option<Effect.Effect<void>>>
+  admitIfCurrent<A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<Option.Option<A>, E, R>
+  admitChild<A, E, R>(sessionID: SessionID, effect: Effect.Effect<A, E, R>): Effect.Effect<Option.Option<A>, E, R>
   resolvePromptParts(template: string): Effect.Effect<SessionPrompt.PromptInput["parts"]>
   prompt(input: SessionPrompt.PromptInput): Effect.Effect<SessionV1.WithParts>
-  notify(input: SessionPrompt.PromptInput, checkpoint: number): Effect.Effect<void>
+  admitNotification(
+    input: SessionPrompt.PromptInput,
+    checkpoint: number,
+  ): Effect.Effect<Option.Option<SessionPrompt.NotificationContinuation>>
+  notify(input: SessionPrompt.PromptInput, checkpoint: number): Effect.Effect<SessionV1.WithParts | void>
 }
 
 const id = "task"
@@ -123,8 +130,26 @@ export const TaskTool = Tool.define(
       let current = parent
       let depth = 0
       while (current.parentID) {
+        const parentID = current.parentID
+        const owner = yield* background.get(current.id)
+        if (
+          owner?.status !== "running" ||
+          owner.type !== id ||
+          current.taskParentID !== parentID ||
+          owner.metadata?.sessionId !== current.id ||
+          owner.metadata?.parentSessionId !== parentID
+        )
+          break
+        const next = yield* sessions.get(parentID)
+        if (
+          current.projectID !== next.projectID ||
+          current.workspaceID !== next.workspaceID ||
+          current.directory !== next.directory ||
+          (current.path !== undefined && next.path !== undefined && current.path !== next.path)
+        )
+          break
         depth++
-        current = yield* sessions.get(current.parentID)
+        current = next
         ancestors.push(current)
       }
       const maxDepth = cfg.subagent_depth ?? DEFAULT_SUBAGENT_DEPTH
@@ -163,7 +188,7 @@ export const TaskTool = Tool.define(
           session.projectID !== parent.projectID ||
           session.workspaceID !== parent.workspaceID ||
           session.directory !== parent.directory ||
-          session.path !== parent.path
+          (session.path !== undefined && parent.path !== undefined && session.path !== parent.path)
         )
           return yield* Effect.fail(
             new Error(`Cannot resume task_id ${taskID}: session belongs to a different project or location`),
@@ -205,23 +230,37 @@ export const TaskTool = Tool.define(
           action: "deny" as const,
         })) ?? []),
       ]
-      const nextSession =
-        session ??
-        (yield* sessions.create({
-          parentID: ctx.sessionID,
-          title: params.description + ` (@${next.name} subagent)`,
-          agent: next.name,
-          permission: [
-            ...childPermission,
-            ...childToolDenies.filter(
-              (deny) =>
-                !childPermission.some(
-                  (rule) =>
-                    rule.permission === deny.permission && rule.pattern === deny.pattern && rule.action === deny.action,
+      const ops = ctx.extra?.promptOps as TaskPromptOps
+      if (!ops) return yield* Effect.fail(new Error("TaskTool requires promptOps in ctx.extra"))
+      const child = session
+        ? Option.some(session)
+        : yield* ops.admitIfCurrent(
+            sessions.createTask({
+              parentID: ctx.sessionID,
+              title: params.description + ` (@${next.name} subagent)`,
+              agent: next.name,
+              permission: [
+                ...childPermission,
+                ...childToolDenies.filter(
+                  (deny) =>
+                    !childPermission.some(
+                      (rule) =>
+                        rule.permission === deny.permission &&
+                        rule.pattern === deny.pattern &&
+                        rule.action === deny.action,
+                    ),
                 ),
-            ),
-          ],
-        }))
+              ],
+            }),
+          )
+      if (Option.isNone(child)) return yield* Effect.interrupt
+      const nextSession = child.value
+      if (session) {
+        const claimed = yield* ops.admitIfCurrent(
+          sessions.claimTask({ sessionID: nextSession.id, parentID: ctx.sessionID }),
+        )
+        if (Option.isNone(claimed)) return yield* Effect.interrupt
+      }
 
       const msg = yield* MessageV2.get({ sessionID: ctx.sessionID, messageID: ctx.messageID }).pipe(
         Effect.provideService(Database.Service, database),
@@ -247,11 +286,32 @@ export const TaskTool = Tool.define(
         metadata,
       })
 
-      const ops = ctx.extra?.promptOps as TaskPromptOps
-      if (!ops) return yield* Effect.fail(new Error("TaskTool requires promptOps in ctx.extra"))
-      const notificationTargets = yield* Effect.forEach(ancestors, (session) =>
-        ops.checkpoint(session.id).pipe(Effect.map((checkpoint) => ({ session, checkpoint }))),
-      )
+      const notificationTargets: Array<{
+        session: (typeof ancestors)[number]
+        checkpoint: number
+        release: Effect.Effect<void>
+      }> = []
+      const releasedTargets = yield* Ref.make(false)
+      const releaseTargets = Effect.gen(function* () {
+        if (yield* Ref.getAndSet(releasedTargets, true)) return
+        yield* Effect.forEach(notificationTargets, (target) => target.release, { discard: true }).pipe(Effect.ignore)
+      }).pipe(Effect.uninterruptible)
+      const routeSnapshot = [nextSession, ...ancestors]
+      const validRoute = Effect.fn("TaskTool.validCompletionRoute")(function* () {
+        const matches = yield* Effect.forEach(routeSnapshot, (expected) =>
+          sessions.get(expected.id).pipe(
+            Effect.map(
+              (current) =>
+                current.projectID === expected.projectID &&
+                current.workspaceID === expected.workspaceID &&
+                current.directory === expected.directory &&
+                (current.path === undefined || expected.path === undefined || current.path === expected.path),
+            ),
+            Effect.catch(() => Effect.succeed(false)),
+          ),
+        )
+        return matches.every(Boolean)
+      })
       const resumableFailure = (message: string) =>
         message.includes(`task_id: ${nextSession.id}`)
           ? message
@@ -328,41 +388,56 @@ export const TaskTool = Tool.define(
         target: (typeof notificationTargets)[number],
         state: "completed" | "error",
         text: string,
+        admitted: Deferred.Deferred<void>,
       ) {
-        yield* ops.notify(notificationInput(target, state, text), target.checkpoint)
-        const latest = (yield* sessions.messages({ sessionID: target.session.id })).findLast(
-          (message) => message.info.role === "assistant",
-        )
-        const part = latest?.parts.findLast((item) => item.type === "text")
+        if (!(yield* validRoute())) return text
+        const continuation = yield* ops.admitNotification(notificationInput(target, state, text), target.checkpoint)
+        if (Option.isNone(continuation)) return text
+        yield* Deferred.succeed(admitted, undefined)
+        const result = yield* continuation.value
+        if (!result || result.info.role !== "assistant") return text
+        const part = result.parts.findLast((item) => item.type === "text")
         return part?.type === "text" ? part.text : text
       })
 
-      const route = Effect.fn("TaskTool.routeBackgroundResult")(function* (
-        state: "completed" | "error",
-        text: string,
-      ) {
+      const route = Effect.fn("TaskTool.routeBackgroundResult")(function* (state: "completed" | "error", text: string) {
+        if (!(yield* validRoute())) {
+          yield* releaseTargets
+          return
+        }
         for (const target of notificationTargets.slice(0, -1)) {
+          const admitted = yield* Deferred.make<void>()
+          if (!(yield* validRoute())) {
+            yield* releaseTargets
+            return
+          }
           if (
             yield* background.extend({
               id: target.session.id,
               expectedType: id,
-              run: forward(target, state, text),
+              onFinalize: Deferred.succeed(admitted, undefined).pipe(Effect.andThen(releaseTargets)),
+              run: forward(target, state, text, admitted),
             })
           )
-            return
+            return yield* Deferred.await(admitted)
         }
         const root = notificationTargets.at(-1)
-        if (!root) return
-        yield* ops
-          .notify(notificationInput(root, state, text), root.checkpoint)
-          .pipe(Effect.ignore, Effect.forkIn(scope, { startImmediately: true }))
+        if (!root) {
+          yield* releaseTargets
+          return
+        }
+        if (!(yield* validRoute())) return yield* releaseTargets
+        const continuation = yield* ops.admitNotification(notificationInput(root, state, text), root.checkpoint)
+        if (Option.isSome(continuation))
+          yield* continuation.value.pipe(Effect.ignore, Effect.forkIn(scope, { startImmediately: true }))
+        yield* releaseTargets
       })
 
       const complete = (info: BackgroundJob.Info) => {
         if (info.status === "completed") return route("completed", info.output ?? "")
         if (info.status === "error") return route("error", info.error ?? "")
         if (info.status === "cancelled") return route("error", "Task cancelled")
-        return Effect.void
+        return releaseTargets
       }
 
       function backgroundResult(summary: string, text: string) {
@@ -385,6 +460,7 @@ export const TaskTool = Tool.define(
       const waitForeground = Effect.fn("TaskTool.waitForeground")(function* (allowPromotion: boolean) {
         const runCancel = yield* EffectBridge.make()
         const cancel = ops.cancel(nextSession.id)
+        const promoted = { value: false }
 
         function onAbort() {
           runCancel.fork(cancel)
@@ -402,8 +478,10 @@ export const TaskTool = Tool.define(
                     background.waitForPromotion(nextSession.id),
                   )
                 : (yield* background.wait({ id: nextSession.id })).info
-              if (result?.status === "running" && result.metadata?.background === true)
+              if (result?.status === "running" && result.metadata?.background === true) {
+                promoted.value = true
                 return backgroundResult("Background task started", BACKGROUND_STARTED)
+              }
               if (!result) return yield* Effect.fail(new Error(resumableFailure("Task result unavailable")))
               if (result.status === "error")
                 return yield* Effect.fail(new Error(resumableFailure(result.error ?? "Task failed")))
@@ -421,8 +499,9 @@ export const TaskTool = Tool.define(
                 yield* Effect.all([cancel, background.cancel(nextSession.id)], { discard: true })
             }).pipe(
               Effect.ensuring(
-                Effect.sync(() => {
+                Effect.gen(function* () {
                   ctx.abort.removeEventListener("abort", onAbort)
+                  if (!promoted.value) yield* releaseTargets
                 }),
               ),
             ),
@@ -434,32 +513,67 @@ export const TaskTool = Tool.define(
         Effect.catchDefect((defect) => Effect.fail(resumableError(defect))),
         Effect.onInterrupt(() => ops.cancel(nextSession.id)),
       )
-      if (
-        yield* background.extend({
-          id: nextSession.id,
-          expectedType: id,
-          claimCompletion: !runInBackground,
-          run: taskRun,
-        })
-      ) {
+      // Defer interruption until every acquired lease is released or owned by BackgroundJob.
+      const handoff = { value: false }
+      const admitted = yield* Effect.uninterruptibleMask(() =>
+        Effect.gen(function* () {
+          const retainedTargets = yield* Effect.forEach(
+            ancestors,
+            Effect.fnUntraced(function* (session) {
+              const checkpoint = yield* ops.checkpoint(session.id)
+              const release = yield* ops.retain(session.id, checkpoint)
+              return Option.map(release, (release) => {
+                const target = { session, checkpoint, release }
+                notificationTargets.push(target)
+                return target
+              })
+            }),
+          )
+          if (retainedTargets.some(Option.isNone)) return Option.none()
+
+          const admitted = yield* ops.admitChild(
+            nextSession.id,
+            Effect.gen(function* () {
+              if (
+                yield* background.extend({
+                  id: nextSession.id,
+                  expectedType: id,
+                  claimCompletion: !runInBackground,
+                  onFinalize: releaseTargets,
+                  run: taskRun,
+                })
+              )
+                return "extended" as const
+
+              const started = yield* background.start({
+                id: nextSession.id,
+                type: id,
+                title: params.description,
+                metadata,
+                onPromote: ctx.metadata({
+                  title: params.description,
+                  metadata: { ...metadata, background: true, jobId: nextSession.id },
+                }),
+                onComplete: complete,
+                awaitOnComplete: true,
+                onFinalize: releaseTargets,
+                notifyOnComplete: runInBackground,
+                run: taskRun,
+              })
+              if (started.type !== id) return yield* Effect.interrupt
+              return "started" as const
+            }),
+          )
+          if (Option.isSome(admitted)) handoff.value = true
+          return admitted
+        }).pipe(Effect.ensuring(Effect.suspend(() => (handoff.value ? Effect.void : releaseTargets)))),
+      )
+      if (Option.isNone(admitted)) return yield* Effect.interrupt
+      if (admitted.value === "extended") {
         if (runInBackground) return backgroundResult("Background task updated", BACKGROUND_UPDATED)
         const active = yield* background.get(nextSession.id)
         return yield* waitForeground(active?.metadata?.background !== true)
       }
-
-      yield* background.start({
-        id: nextSession.id,
-        type: id,
-        title: params.description,
-        metadata,
-        onPromote: ctx.metadata({
-          title: params.description,
-          metadata: { ...metadata, background: true, jobId: nextSession.id },
-        }),
-        onComplete: complete,
-        notifyOnComplete: runInBackground,
-        run: taskRun,
-      })
 
       if (runInBackground) {
         return backgroundResult("Background task started", BACKGROUND_STARTED)

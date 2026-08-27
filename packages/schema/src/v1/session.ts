@@ -590,6 +590,7 @@ export const SessionInfo = Schema.Struct({
   directory: Schema.String,
   path: optional(Schema.String),
   parentID: optional(SessionID),
+  taskParentID: optional(SessionID),
   summary: optional(SessionSummary),
   cost: optional(Schema.Finite),
   tokens: optional(SessionTokens),

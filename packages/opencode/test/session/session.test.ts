@@ -206,6 +206,53 @@ describe("step-finish token propagation via event", () => {
 })
 
 describe("Session", () => {
+  it.instance("serializes Task claims with updates and emits immutable ownership", () =>
+    Effect.gen(function* () {
+      const session = yield* SessionNs.Service
+      const events = yield* EventV2Bridge.Service
+      const root = yield* Effect.acquireRelease(session.create({ title: "root" }), (info) =>
+        session.remove(info.id).pipe(Effect.ignore),
+      )
+      const other = yield* Effect.acquireRelease(session.create({ title: "other" }), (info) =>
+        session.remove(info.id).pipe(Effect.ignore),
+      )
+      const child = yield* session.create({ parentID: root.id, title: "history child" })
+      const updates: SessionNs.Info[] = []
+      const unsubscribe = yield* events.listen((event) => {
+        if (event.type !== SessionNs.Event.Updated.type) return Effect.void
+        const data = event.data as typeof SessionNs.Event.Updated.data.Type
+        if (data.sessionID === child.id) updates.push(data.info as SessionNs.Info)
+        return Effect.void
+      })
+      yield* Effect.addFinalizer(() => unsubscribe)
+
+      yield* Effect.all(
+        [
+          session.setTitle({ sessionID: child.id, title: "updated history child" }),
+          session.claimTask({ sessionID: child.id, parentID: root.id }),
+        ],
+        { concurrency: "unbounded", discard: true },
+      )
+
+      expect(yield* session.get(child.id)).toMatchObject({
+        parentID: root.id,
+        taskParentID: root.id,
+        title: "updated history child",
+      })
+      const claimedAt = updates.findIndex((info) => info.taskParentID === root.id)
+      expect(claimedAt).toBeGreaterThanOrEqual(0)
+      expect(updates.slice(claimedAt).every((info) => info.taskParentID === root.id)).toBe(true)
+
+      const count = updates.length
+      yield* session.claimTask({ sessionID: child.id, parentID: root.id })
+      expect(updates).toHaveLength(count)
+      expect(Exit.isFailure(yield* session.claimTask({ sessionID: child.id, parentID: other.id }).pipe(Effect.exit))).toBe(
+        true,
+      )
+      expect((yield* session.get(child.id)).taskParentID).toBe(root.id)
+    }),
+  )
+
   it.live("remove works without an instance", () =>
     Effect.gen(function* () {
       const session = yield* SessionNs.Service

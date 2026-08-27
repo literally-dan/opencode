@@ -91,6 +91,33 @@ export function transformShareData(shareData: ShareData[]): {
 
 type ExportData = { info: SDKSession; messages: Array<{ info: Message; parts: Part[] }> }
 
+export const upsertImportedSession = Effect.fn("Cli.import.session")(function* (input: {
+  info: SDKSession
+  projectID: InstanceContext["project"]["id"]
+  directory: string
+  worktree: string
+}) {
+  const { db } = yield* Database.Service
+  const { taskParentID: _, ...imported } = input.info
+  const info = Schema.decodeUnknownSync(Session.Info)({
+    ...imported,
+    projectID: input.projectID,
+    directory: input.directory,
+    path: path.relative(path.resolve(input.worktree), input.directory).replaceAll("\\", "/"),
+  }) as Session.Info
+  const row = Session.toRow(info)
+  yield* db
+    .insert(SessionTable)
+    .values(row)
+    .onConflictDoUpdate({
+      target: SessionTable.id,
+      set: { project_id: row.project_id, directory: row.directory, path: row.path },
+    })
+    .run()
+    .pipe(Effect.orDie)
+  return row
+})
+
 export const ImportCommand = effectCmd({
   command: "import <file>",
   describe: "import session data from JSON file or URL",
@@ -176,22 +203,12 @@ const runImport = Effect.fn("Cli.import.body")(function* (file: string, ctx: Ins
     return
   }
 
-  const info = Schema.decodeUnknownSync(Session.Info)({
-    ...exportData.info,
+  const row = yield* upsertImportedSession({
+    info: exportData.info,
     projectID: ctx.project.id,
     directory: ctx.directory,
-    path: path.relative(path.resolve(ctx.worktree), ctx.directory).replaceAll("\\", "/"),
-  }) as Session.Info
-  const row = Session.toRow(info)
-  yield* db
-    .insert(SessionTable)
-    .values(row)
-    .onConflictDoUpdate({
-      target: SessionTable.id,
-      set: { project_id: row.project_id, directory: row.directory, path: row.path },
-    })
-    .run()
-    .pipe(Effect.orDie)
+    worktree: ctx.worktree,
+  })
 
   for (const msg of exportData.messages) {
     const msgInfo = decodeMessageInfo(msg.info) as SessionV1.Info

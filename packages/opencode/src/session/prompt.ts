@@ -278,12 +278,21 @@ function compactionManifest(
   }
 }
 
+export type NotificationContinuation = Effect.Effect<SessionV1.WithParts | undefined, Image.Error>
+
 export interface Interface {
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
   readonly checkpoint: (sessionID: SessionID) => Effect.Effect<number>
   readonly ask: (input: AskInput) => Effect.Effect<AskOutput>
   readonly prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
-  readonly notify: (input: PromptInput, checkpoint: number) => Effect.Effect<void, Image.Error>
+  readonly admitNotification: (
+    input: PromptInput,
+    checkpoint: number,
+  ) => Effect.Effect<Option.Option<NotificationContinuation>, Image.Error>
+  readonly notify: (
+    input: PromptInput,
+    checkpoint: number,
+  ) => Effect.Effect<SessionV1.WithParts | undefined, Image.Error>
   readonly loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts>
   readonly shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError>
   readonly command: (input: CommandInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
@@ -338,12 +347,20 @@ const layer = Layer.effect(
       contextStates.set(sessionID, next)
       return next
     }
-    const ops = Effect.fn("SessionPrompt.ops")(function* () {
+    const ops = Effect.fn("SessionPrompt.ops")(function* (sessionID: SessionID) {
+      const checkpoint = yield* state.checkpoint(sessionID)
       return {
         cancel: (sessionID: SessionID) => cancel(sessionID),
         checkpoint: (sessionID: SessionID) => state.checkpoint(sessionID),
+        retain: (sessionID: SessionID, checkpoint: number) => state.retain(sessionID, checkpoint),
+        admitIfCurrent: <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+          state.admitIfCurrent(sessionID, checkpoint, effect),
+        admitChild: <A, E, R>(childID: SessionID, effect: Effect.Effect<A, E, R>) =>
+          state.admit([{ sessionID, checkpoint }, { sessionID: childID }], effect),
         resolvePromptParts: (template: string) => resolvePromptParts(template),
         prompt: (input: PromptInput) => prompt(input).pipe(Effect.catch(Effect.die)),
+        admitNotification: (input: PromptInput, checkpoint: number) =>
+          admitNotification(input, checkpoint).pipe(Effect.catch(Effect.die)),
         notify: (input: PromptInput, checkpoint: number) => notify(input, checkpoint).pipe(Effect.catch(Effect.die)),
       } satisfies TaskPromptOps
     })
@@ -461,7 +478,7 @@ const layer = Layer.effect(
     }) {
       const { task, model, lastUser, sessionID, session, msgs } = input
       const ctx = yield* InstanceState.context
-      const promptOps = yield* ops()
+      const promptOps = yield* ops(input.sessionID)
       const { task: taskTool } = yield* registry.named()
       const taskModel = task.model ? yield* getModel(task.model.providerID, task.model.modelID, sessionID) : model
       const assistantMessage: SessionV1.Assistant = yield* sessions.updateMessage({
@@ -1549,7 +1566,7 @@ const layer = Layer.effect(
           const outcome: "break" | "continue" = yield* Effect.gen(function* () {
             const lastUserMsg = msgs.findLast((m) => m.info.role === "user")
             const bypassAgentCheck = lastUserMsg?.parts.some((p) => p.type === "agent") ?? false
-            const promptOps = yield* ops()
+            const promptOps = yield* ops(sessionID)
 
             const tools = yield* SessionTools.resolve({
               agent,
@@ -1758,29 +1775,47 @@ const layer = Layer.effect(
       return result
     })
 
-    const notify: (input: PromptInput, checkpoint: number) => Effect.Effect<void, Image.Error> = Effect.fn(
-      "SessionPrompt.notify",
-    )(function* (input: PromptInput, checkpoint: number) {
-      if (!(yield* state.isCurrent(input.sessionID, checkpoint))) return
-      const message = yield* prepareUserMessage(input)
+    const admitNotification: Interface["admitNotification"] = Effect.fn("SessionPrompt.admitNotification")(function* (
+      input: PromptInput,
+      checkpoint: number,
+    ) {
+      if (!(yield* state.isCurrent(input.sessionID, checkpoint))) return Option.none()
+      const prepared = yield* prepareUserMessage(input)
       const admitted = yield* state.admitIfCurrent(
         input.sessionID,
         checkpoint,
         Effect.gen(function* () {
           if ((yield* sessions.get(input.sessionID).pipe(Effect.orDie)).revert) return false as const
-          return yield* persistPrompt(message, input)
+          return yield* persistPrompt(prepared, input)
         }),
       )
-      if (Option.isNone(admitted) || admitted.value === false || input.noReply === true) return
-
-      const result = yield* runNotification(admitted.value, checkpoint)
-      if (!result) return
-      if (result.info.role === "assistant" && result.info.parentID === admitted.value.info.id) return
-      const latest = MessageV2.latest(
-        yield* MessageV2.filterCompactedEffect(input.sessionID).pipe(Effect.provideService(Database.Service, database)),
+      if (Option.isNone(admitted)) return Option.none()
+      const message = admitted.value
+      if (message === false) return Option.none()
+      if (input.noReply === true) return Option.some(Effect.succeed(undefined))
+      return Option.some(
+        Effect.gen(function* () {
+          const result = yield* runNotification(message, checkpoint)
+          if (!result) return
+          if (result.info.role === "assistant" && result.info.parentID === message.info.id) return result
+          const latest = MessageV2.latest(
+            yield* MessageV2.filterCompactedEffect(input.sessionID).pipe(
+              Effect.provideService(Database.Service, database),
+            ),
+          )
+          if (latest.user?.id !== message.info.id) return
+          return yield* runNotification(message, checkpoint)
+        }),
       )
-      if (latest.user?.id !== admitted.value.info.id) return
-      yield* runNotification(admitted.value, checkpoint).pipe(Effect.asVoid)
+    })
+
+    const notify: Interface["notify"] = Effect.fn("SessionPrompt.notify")(function* (
+      input: PromptInput,
+      checkpoint: number,
+    ) {
+      const continuation = yield* admitNotification(input, checkpoint)
+      if (Option.isNone(continuation)) return
+      return yield* continuation.value
     })
 
     const shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError> = Effect.fn(
@@ -1923,6 +1958,7 @@ const layer = Layer.effect(
       checkpoint: state.checkpoint,
       ask,
       prompt,
+      admitNotification,
       notify,
       loop,
       shell,

@@ -15894,6 +15894,10 @@
             "type": "string",
             "pattern": "^ses"
           },
+          "taskParentID": {
+            "type": "string",
+            "pattern": "^ses"
+          },
           "summary": {
             "type": "object",
             "properties": {
@@ -22223,6 +22227,10 @@
             "type": "string"
           },
           "parentID": {
+            "type": "string",
+            "pattern": "^ses"
+          },
+          "taskParentID": {
             "type": "string",
             "pattern": "^ses"
           },
