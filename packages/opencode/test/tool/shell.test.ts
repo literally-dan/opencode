@@ -1025,8 +1025,8 @@ describe("tool.shell abort", () => {
               metadata: (input) =>
                 Effect.sync(() => {
                   const output = (input.metadata as { output?: string })?.output
+                  if (typeof output === "string") collected.push(output)
                   if (output && output.includes("before") && !controller.signal.aborted) {
-                    collected.push(output)
                     controller.abort()
                   }
                 }),
@@ -1035,6 +1035,10 @@ describe("tool.shell abort", () => {
           expect(res.output).toContain("before")
           expect(res.output).toContain("User aborted the command")
           expect(collected.length).toBeGreaterThan(0)
+          expect(collected.at(-1)).toBe(res.metadata.output)
+          const count = collected.length
+          yield* Effect.sleep("100 millis")
+          expect(collected).toHaveLength(count)
         }),
       ),
     15_000,
@@ -1112,7 +1116,7 @@ describe("tool.shell abort", () => {
         const updates: string[] = []
         const result = yield* run(
           {
-            command: `echo first && sleep 0.1 && echo second`,
+            command: `echo first && sleep 0.5 && echo second`,
           },
           {
             ...ctx,
@@ -1128,6 +1132,44 @@ describe("tool.shell abort", () => {
         expect(updates.length).toBeGreaterThan(1)
       }),
     ),
+  )
+
+  it.live(
+    "coalesces metadata writes and flushes the final preview",
+    () =>
+      runIn(
+        projectRoot,
+        Effect.gen(function* () {
+          const updates: string[] = []
+          let active = 0
+          let maxActive = 0
+          const script = "for(let i=0;i<20;i++){console.log(i);await Bun.sleep(10)}"
+          const command = `${PS.has(sh()) ? "& " : ""}${bin} -e ${evalarg(script)}`
+          const result = yield* run(
+            { command },
+            {
+              ...ctx,
+              metadata: (input) =>
+                Effect.acquireUseRelease(
+                  Effect.sync(() => {
+                    active += 1
+                    maxActive = Math.max(maxActive, active)
+                    return (input.metadata as { output?: string }).output ?? ""
+                  }),
+                  (output) =>
+                    Effect.sleep("20 millis").pipe(Effect.andThen(Effect.sync(() => void updates.push(output)))),
+                  () => Effect.sync(() => void (active -= 1)),
+                ),
+            },
+          )
+
+          expect(result.output).toContain("19")
+          expect(updates.at(-1)).toBe(result.metadata.output)
+          expect(updates.length).toBeLessThan(12)
+          expect(maxActive).toBe(1)
+        }),
+      ),
+    15_000,
   )
 })
 
