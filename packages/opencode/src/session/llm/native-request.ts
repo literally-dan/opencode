@@ -24,6 +24,7 @@ export type RequestInput = {
   readonly baseURL?: string
   readonly system?: readonly string[]
   readonly messages: readonly ModelMessage[]
+  readonly cachePrefixLimit?: number
   readonly tools?: Record<string, ToolInput>
   readonly toolChoice?: "auto" | "required" | "none"
   readonly temperature?: number
@@ -102,14 +103,17 @@ const contentPart = (part: unknown) => {
 const content = (value: ModelMessage["content"]) =>
   typeof value === "string" ? [{ type: "text" as const, text: value }] : value.map(contentPart)
 
-const messages = (input: readonly ModelMessage[]) => {
+const messages = (input: readonly ModelMessage[], cachePrefixLimit?: number) => {
+  const prefixEnd =
+    cachePrefixLimit === undefined ? input.length : Math.max(0, Math.min(Math.trunc(cachePrefixLimit), input.length))
   const system = input.flatMap((message) => (message.role === "system" ? [SystemPart.make(message.content)] : []))
-  const messages = input.flatMap((message) => {
+  const messages = input.flatMap((message, index) => {
     if (message.role === "system") return []
     return [
       Message.make({
         role: message.role,
         content: content(message.content),
+        cacheable: index < prefixEnd ? undefined : false,
         native: isRecord(message.providerOptions) ? { providerOptions: message.providerOptions } : undefined,
       }),
     ]
@@ -179,7 +183,7 @@ export const model = (input: Provider.Model | RequestInput, headers?: Record<str
 }
 
 export const request = (input: RequestInput) => {
-  const converted = messages(input.messages)
+  const converted = messages(input.messages, input.cachePrefixLimit)
   // This is the only native adapter boundary that should construct canonical
   // @opencode-ai/llm request objects from opencode's session/AI SDK-shaped data.
   return LLM.request({

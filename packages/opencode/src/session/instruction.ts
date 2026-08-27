@@ -11,6 +11,7 @@ import { Flag } from "@opencode-ai/core/flag/flag"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { withTransientReadRetry } from "@/util/effect-http-client"
 import { Global } from "@opencode-ai/core/global"
+import { isCompacted } from "./compaction-pruning"
 import type { MessageV2 } from "./message-v2"
 import type { MessageID } from "./schema"
 
@@ -19,7 +20,11 @@ function extract(messages: SessionV1.WithParts[]) {
   for (const msg of messages) {
     for (const part of msg.parts) {
       if (part.type === "tool" && part.tool === "read" && part.state.status === "completed") {
-        if (part.state.time.compacted) continue
+        // A compacted read no longer renders its instruction payload, so it can
+        // no longer count as delivered — otherwise the file is never re-sent and
+        // the model silently loses it. Covers native pruning and model
+        // compaction alike, which record the fact in different fields.
+        if (isCompacted(part)) continue
         const loaded = part.state.metadata?.loaded
         if (!loaded || !Array.isArray(loaded)) continue
         for (const p of loaded) {

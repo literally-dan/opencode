@@ -2,6 +2,7 @@ import * as Tool from "./tool"
 import DESCRIPTION from "./compact_results.txt"
 import { Session } from "@/session/session"
 import {
+  COMPACTION_MAX_PARTS,
   COMPACTION_SUMMARY_MAX_CHARS,
   compactionRenderedChars,
   compactionOf,
@@ -17,10 +18,10 @@ import {
   withCompactionLock,
 } from "@/session/compaction-pruning"
 import type { Located } from "@/session/compaction-pruning"
+import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Cause, Effect, Exit, Schema } from "effect"
 
 const id = "compact_results"
-const MAX_SELECTED_PARTS = 200
 const MAX_TOOL_FILTERS = 100
 const MAX_TOOL_NAME_CHARS = 128
 
@@ -49,7 +50,7 @@ const Selector = Schema.Struct({
 
 export const Parameters = Schema.Struct({
   part_ids: Schema.optional(Schema.mutable(Schema.Array(Schema.String))).annotate({
-    description: `One or more canonical \`prt_…\` ids to compact (maximum ${MAX_SELECTED_PARTS} unique ids after duplicate removal). Duplicates are ignored. An empty list selects nothing. Unioned with \`select\`.`,
+    description: `One or more canonical \`prt_…\` ids to compact (maximum ${COMPACTION_MAX_PARTS} unique ids after duplicate removal). Duplicates are ignored. An empty list selects nothing. Unioned with \`select\`.`,
   }),
   select: Schema.optional(Selector).annotate({
     description:
@@ -90,11 +91,11 @@ export const CompactResultsTool = Tool.define(
               const located = new Map([...durable.located].filter(([partID]) => visible.has(partID)))
               const ambiguous = durable.ambiguous
               const roles = new Map(messages.map((message) => [message.info.id, message.info.role]))
-              const selected = params.select ? resolveSelection(params.select, located) : []
+              const selected = params.select ? resolveSelection(params.select, messages, located, ambiguous, roles) : []
               const ids = [...new Set([...(params.part_ids ?? []), ...selected])]
-              if (ids.length > MAX_SELECTED_PARTS)
+              if (ids.length > COMPACTION_MAX_PARTS)
                 return invalidResult(
-                  `Selection resolved to ${ids.length} parts after duplicate removal; refine it to at most ${MAX_SELECTED_PARTS} parts per call.`,
+                  `Selection resolved to ${ids.length} parts after duplicate removal; refine it to at most ${COMPACTION_MAX_PARTS} parts per call.`,
                 )
               if (ids.length === 0)
                 return {
@@ -271,7 +272,13 @@ export const CompactResultsTool = Tool.define(
 
 // Resolve a `select` filter into a chronological list of part ids. Part ids are
 // ascending, so a plain string sort/compare is chronological order.
-function resolveSelection(sel: Schema.Schema.Type<typeof Selector>, located: Map<string, Located>) {
+function resolveSelection(
+  sel: Schema.Schema.Type<typeof Selector>,
+  messages: SessionV1.WithParts[],
+  located: Map<string, Located>,
+  ambiguous: ReadonlySet<string>,
+  roles: ReadonlyMap<string, SessionV1.Info["role"]>,
+) {
   const matched = [...located.values()]
     .flatMap(({ part, context }) => {
       const e = eligibility(part, context)
@@ -284,9 +291,23 @@ function resolveSelection(sel: Schema.Schema.Type<typeof Selector>, located: Map
       return [part.id]
     })
     .sort()
+  const selected = new Set(matched)
+  const unsafe = unsafeCompactionGroups(
+    messages.flatMap((message) => message.parts),
+    selected,
+    ambiguous,
+    roles,
+  )
+  const actionable = matched.filter((partID) => {
+    const found = located.get(partID)
+    if (!found) return false
+    const group = compactionOf(found.part)?.group
+    if (!group) return true
+    return !unsafe.has(projectionChannelKey(group, projectionChannel(found.part, found.context.role)))
+  })
   if (sel.keep_last !== undefined && sel.keep_last > 0)
-    return matched.slice(0, Math.max(0, matched.length - sel.keep_last))
-  return matched
+    return actionable.slice(0, Math.max(0, actionable.length - sel.keep_last))
+  return actionable
 }
 
 function validateInput(params: Schema.Schema.Type<typeof Parameters>) {

@@ -37,14 +37,59 @@ export type MessageContext = {
   live?: boolean
 }
 
+export type ContextManagementReceiptKind = "list_context" | "compact_results" | "compact_bulk"
+export type ContextManagementReceiptPart = SessionV1.ToolPart & { state: SessionV1.ToolStateCompleted }
+
 const PART_ID = /^prt_[0-9a-f]{12}[0-9A-Za-z]{14}$/
 export const COMPACTION_SUMMARY_MAX_CHARS = 4_000
+export const COMPACTION_MAX_PARTS = 200
+export const COMPACTION_PLANNING_SUMMARY = "x".repeat(COMPACTION_SUMMARY_MAX_CHARS)
 const COMPACTED_FALLBACK = "No summary was recorded. Use read_part to recover this content verbatim."
 export const NATIVE_FALLBACK =
   "Older tool output, pruned automatically to reclaim context. Use read_part to recover it verbatim."
-const COMPACTION_REFERENCE = "The full summary is carried by this group's later compaction-summary for the same role."
+const COMPACTION_REFERENCE =
+  "The full summary is carried by this group's later compaction-summary for the same channel."
 const ESTIMATED_GROUP = "00000000-0000-0000-0000-000000000000"
 const compactionLocks = new Map<string, { semaphore: Semaphore.Semaphore; references: number }>()
+
+export function contextManagementReceiptKind(part: SessionV1.Part): ContextManagementReceiptKind | undefined {
+  if (part.type !== "tool" || part.state.status !== "completed" || part.metadata?.providerExecuted) return
+  if (part.tool === "list_context" || part.tool === "compact_results" || part.tool === "compact_bulk") return part.tool
+}
+
+export function isContextManagementReceipt(part: SessionV1.Part): part is ContextManagementReceiptPart {
+  return contextManagementReceiptKind(part) !== undefined
+}
+
+export function isFullContextManagementReceipt(part: SessionV1.Part): part is ContextManagementReceiptPart {
+  return isContextManagementReceipt(part) && !isManualToolCompaction(part) && part.state.time.compacted === undefined
+}
+
+export function isCollapsedContextManagementReceipt(part: SessionV1.Part): part is ContextManagementReceiptPart {
+  return isContextManagementReceipt(part) && !isManualToolCompaction(part) && part.state.time.compacted !== undefined
+}
+
+export function hasDurableProviderCompletion(message: SessionV1.WithParts) {
+  return message.info.role === "assistant" && message.parts.some((part) => part.type === "step-finish")
+}
+
+export function contextManagementReceiptSummary(part: SessionV1.Part) {
+  if (!isContextManagementReceipt(part)) return
+  const kind = contextManagementReceiptKind(part)
+  if (!kind) return
+  const metadata = part.state.metadata
+  const metric = (key: string) => {
+    const value: unknown = metadata[key]
+    return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? String(value) : "unknown"
+  }
+  const details =
+    kind === "list_context"
+      ? `total parts=${metric("total")}; compactable parts=${metric("compactable")}; estimated reclaimable characters=${metric("charsCompactable")}`
+      : kind === "compact_results"
+        ? `compacted parts=${metric("compacted")}; skipped parts=${metric("skipped")}; net characters freed=${metric("charsFreed")}`
+        : `compacted parts=${metric("compacted")}; skipped parts=${metric("skipped")}; net characters freed=${metric("charsFreed")}; summarizer calls=${metric("summarizerCalls")}`
+  return `Context-management receipt ${part.id} (${kind}): ${details}. Use read_part with part_id="${part.id}" to recover the original full result.`
+}
 
 function acquireCompactionLock(sessionID: string) {
   const hit = compactionLocks.get(sessionID)
@@ -138,19 +183,66 @@ export function indexParts(messages: SessionV1.WithParts[], currentMessageID: st
   return { located, ambiguous }
 }
 
+export function compactionInventory(
+  messages: SessionV1.WithParts[],
+  currentMessageID: string,
+  durableMessages: SessionV1.WithParts[] = messages,
+) {
+  const visible = new Set<string>(messages.flatMap((message) => message.parts.map((part) => part.id)))
+  const { located, ambiguous } = indexParts(durableMessages, currentMessageID)
+  const roles = new Map(durableMessages.map((message) => [message.info.id, message.info.role]))
+  const eligible = new Map(
+    [...located.entries()].flatMap(([partID, found]) => {
+      if (!visible.has(partID)) return []
+      const allowed = eligibility(found.part, found.context)
+      return allowed.ok ? [[partID, { ...found, allowed }] as const] : []
+    }),
+  )
+  const selected = new Set(eligible.keys())
+  const unsafe = unsafeCompactionGroups(
+    durableMessages.flatMap((message) => message.parts),
+    selected,
+    ambiguous,
+    roles,
+  )
+  const blocked = new Map<string, string>()
+  const safe = [...eligible.entries()].flatMap(([partID, found]) => {
+    const group = compactionOf(found.part)?.group
+    const reason = group
+      ? unsafe.get(projectionChannelKey(group, projectionChannel(found.part, found.context.role)))
+      : undefined
+    if (!reason)
+      return [
+        [partID, { ...found, savings: compactionSavings([found.part], COMPACTION_PLANNING_SUMMARY, roles) }] as const,
+      ]
+    blocked.set(partID, reason)
+    return []
+  })
+  const ranked = safe.toSorted((a, b) => b[1].savings - a[1].savings || a[0].localeCompare(b[0]))
+  const planned = ranked.slice(0, COMPACTION_MAX_PARTS)
+  for (const [partID] of ranked.slice(COMPACTION_MAX_PARTS)) {
+    blocked.set(partID, `is outside this inventory's ${COMPACTION_MAX_PARTS}-part actionable limit`)
+  }
+  const actionable = new Map(planned)
+  return { located, ambiguous, roles, actionable, blocked }
+}
+
 // The compaction record, read uniformly across the three shapes that carry it
 // (tool state, text/reasoning, file). Returns undefined for a live part.
 export function compactionOf(part: SessionV1.Part) {
   if (part.type === "tool") {
     if (part.state.status !== "completed") return undefined
     if (part.state.compactionGroup === undefined && part.state.time.compacted === undefined) return undefined
+    const manual = isManualToolCompaction(part)
+    const administrative = isCollapsedContextManagementReceipt(part)
     return {
       group: part.state.compactionGroup,
-      summary: part.state.compactionSummary,
+      summary: manual ? part.state.compactionSummary : contextManagementReceiptSummary(part),
       generation: Math.max(part.state.compactionGeneration ?? 1, 1),
-      // Native age-based pruning sets only `time.compacted`; it carries no
-      // group, so it renders as its own single-part run.
-      native: part.state.compactionGroup === undefined,
+      // `false` remains the manual-compaction signal used by overflow handling.
+      // Administrative receipts keep a distinct undefined state while their
+      // structured metadata supplies the projected summary.
+      native: administrative ? undefined : !manual,
     }
   }
   if (part.type === "text" || part.type === "reasoning" || part.type === "file") {
@@ -230,7 +322,7 @@ export function renderedChars(
       continue
     }
     if (!existing.group) {
-      total += compactedRenderedChars([part], existing.summary, existing.native)
+      total += compactedRenderedChars([part], existing.summary, existing.native === true)
       continue
     }
     const role = roleByMessage?.get(part.messageID) ?? inferredRole(part)
@@ -297,12 +389,12 @@ function compactedRenderedChars(
   summary: string | undefined,
   native: boolean,
   group?: string,
-  role = "assistant",
+  channel = "assistant",
   conservativeReferences = false,
 ) {
   const ids = parts.map((part) => part.id)
   const fixed = parts.reduce((sum, part) => sum + compactedMemberChars(part, group), 0)
-  const groupAttr = group ? ` group="${escapeAttribute(group)}" role="${role}"` : ""
+  const groupAttr = group ? ` group="${escapeAttribute(group)}" channel="${channel}"` : ""
   const attr = ids.length ? ` parts="${ids.join(" ")}"` : ""
   const trimmed = summary?.trim()
   const body = trimmed
@@ -319,7 +411,7 @@ function compactedRenderedChars(
           (total, part) =>
             total +
             insertedTextChars(
-              `<compaction-ref group="${escapeAttribute(group!)}" role="${role}" parts="${part.id}">\n${COMPACTION_REFERENCE}\n</compaction-ref>`,
+              `<compaction-ref group="${escapeAttribute(group!)}" channel="${channel}" parts="${part.id}">\n${COMPACTION_REFERENCE}\n</compaction-ref>`,
             ),
           0,
         )
@@ -344,7 +436,7 @@ function compactedSpanChars(
   parts: readonly SessionV1.Part[],
   summary: string | undefined,
   group: string,
-  role: string,
+  channel: string,
 ) {
   const trimmed = summary?.trim()
   const body = trimmed
@@ -353,7 +445,7 @@ function compactedSpanChars(
       : trimmed
     : "No summary was recorded. Use list_context and read_part to recover this stretch."
   return insertedTextChars(
-    `<compacted-span group="${escapeAttribute(group)}" role="${role}" from="${parts[0]!.id}" to="${parts.at(-1)!.id}" parts="${parts.length}" messages="1">\n${body}\n</compacted-span>`,
+    `<compacted-span group="${escapeAttribute(group)}" channel="${channel}" from="${parts[0]!.id}" to="${parts.at(-1)!.id}" parts="${parts.length}" messages="1">\n${body}\n</compacted-span>`,
   )
 }
 
@@ -444,6 +536,8 @@ export function unsafeCompactionGroups(
 // or still in active use (the live request and the tail turns).
 export function eligibility(part: SessionV1.Part, context: MessageContext): Eligible | Ineligible {
   if (!isCanonicalPartID(part.id)) return { ok: false, reason: "has a malformed part id" }
+  if (isContextManagementReceipt(part))
+    return { ok: false, reason: "is a context-management receipt that collapses automatically after one request" }
   if (context.current) return { ok: false, reason: "belongs to the current assistant message" }
   if (context.live) return { ok: false, reason: "belongs to the live request or a tail turn still in use" }
   const existing = compactionOf(part)

@@ -1,19 +1,21 @@
 import * as Tool from "./tool"
 import DESCRIPTION from "./list_context.txt"
+import { Session } from "@/session/session"
 import {
+  COMPACTION_MAX_PARTS,
   compactionOf,
+  compactionInventory,
+  compactionSavings,
   effectiveChars,
   eligibility,
-  indexParts,
   isCompacted,
-  renderedChars,
 } from "@/session/compaction-pruning"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Effect, Schema } from "effect"
 
 const id = "list_context"
 const DEFAULT_LIMIT = 80
-const MAX_LIMIT = 200
+const MAX_LIMIT = COMPACTION_MAX_PARTS
 
 export const Parameters = Schema.Struct({
   compactable_only: Schema.optional(Schema.Boolean).annotate({
@@ -30,6 +32,7 @@ export const Parameters = Schema.Struct({
 export const ListContextTool = Tool.define(
   id,
   Effect.gen(function* () {
+    const sessions = yield* Session.Service
     return {
       description: DESCRIPTION,
       parameters: Parameters,
@@ -56,24 +59,31 @@ export const ListContextTool = Tool.define(
             [...new Set(ctx.messages.map((m) => m.info.id))].sort().map((mid, i) => [mid, i + 1]),
           )
 
-          const { located } = indexParts(ctx.messages, ctx.messageID)
+          const durable = yield* sessions.messages({ sessionID: ctx.sessionID })
+          const inventory = compactionInventory(ctx.messages, ctx.messageID, durable)
           const rows = ctx.messages.flatMap((msg) =>
             msg.parts.flatMap((part) => {
-              const chars = effectiveChars(part)
+              const found = inventory.located.get(part.id)
+              const current = found?.part ?? part
+              const chars = effectiveChars(current)
               if (chars < minChars) return []
-              const found = located.get(part.id)
-              const e = found
-                ? eligibility(part, found.context)
-                : ({ ok: false, reason: "ambiguous duplicate id in current context" } as const)
+              const blocked = inventory.blocked.get(part.id)
+              const e = blocked
+                ? ({ ok: false, reason: blocked } as const)
+                : found
+                  ? eligibility(current, found.context)
+                  : ({ ok: false, reason: "ambiguous duplicate id in current context" } as const)
               if (params.compactable_only && !e.ok) return []
-              const generation = compactionOf(part)?.generation
-              const status = e.ok
-                ? generation
-                  ? `compactable (already folded ${generation}x)`
-                  : "compactable"
-                : isCompacted(part)
-                  ? "already compacted"
-                  : `keep (${e.reason})`
+              const generation = compactionOf(current)?.generation
+              const status = blocked
+                ? `keep (${blocked})`
+                : e.ok
+                  ? generation
+                    ? `compactable (already folded ${generation}x)`
+                    : "compactable"
+                  : isCompacted(current)
+                    ? "already compacted"
+                    : `keep (${e.reason})`
               return [
                 {
                   id: part.id.slice(0, 80),
@@ -81,23 +91,27 @@ export const ListContextTool = Tool.define(
                   role: msg.info.role,
                   label: part.type === "tool" ? `tool:${part.tool.slice(0, 80).replace(/\s+/g, " ")}` : part.type,
                   chars,
-                  part,
-                  compactable: e.ok,
+                  part: current,
+                  compactable: inventory.actionable.has(part.id),
                   status,
-                  preview: preview(part),
+                  preview: preview(current),
                 },
               ]
             }),
           )
 
           const compactable = rows.filter((r) => r.compactable)
-          const charsCompactable = renderedChars(
-            compactable.map((row) => row.part),
-            new Map(ctx.messages.map((message) => [message.info.id, message.info.role])),
+          const charsCompactable = Math.max(
+            0,
+            compactionSavings(
+              compactable.map((row) => row.part),
+              "x",
+              inventory.roles,
+            ),
           )
           const shown = rows.toSorted((a, b) => b.chars - a.chars).slice(0, limit)
 
-          const header = `Context inventory for ${ctx.sessionID} — ${rows.length} part(s) listed, ${compactable.length} compactable (~${charsCompactable.toLocaleString()} chars). Pass ids to compact_results, or use its \`select\` filters. Largest first:`
+          const header = `Context inventory for ${ctx.sessionID} — ${rows.length} part(s) listed, ${compactable.length} compactable (~${charsCompactable.toLocaleString()} net reclaimable chars with a minimal covering summary). Pass at most ${COMPACTION_MAX_PARTS} listed compactable ids to compact_results. Largest first:`
           const lines = shown.map(
             (r) =>
               `- ${r.id} · turn ${r.turn} · ${r.role} ${r.label} · ${r.chars.toLocaleString()} chars · ${r.status} · ${JSON.stringify(r.preview)}`,

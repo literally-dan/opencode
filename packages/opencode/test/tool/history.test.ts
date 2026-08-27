@@ -904,6 +904,85 @@ describe("tool.compact_results", () => {
     }),
   )
 
+  it.instance("does not overstate cross-message reference savings", () =>
+    Effect.gen(function* () {
+      const { chat, textPart } = yield* seed()
+      const session = yield* Session.Service
+      if (textPart.type !== "text") throw new Error("seed shape changed")
+      textPart.text = "first assistant result ".repeat(600)
+      yield* session.updatePart(textPart)
+      const nextUser = yield* session.updateMessage({
+        id: MessageID.ascending(),
+        role: "user",
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        time: { created: Date.now() + 1 },
+      } satisfies SessionV1.User)
+      yield* session.updatePart({
+        id: PartID.ascending(),
+        messageID: nextUser.id,
+        sessionID: chat.id,
+        type: "text",
+        text: "next turn",
+      })
+      const nextAssistant = yield* session.updateMessage({
+        id: MessageID.ascending(),
+        role: "assistant",
+        parentID: nextUser.id,
+        sessionID: chat.id,
+        mode: "build",
+        agent: "build",
+        cost: 0,
+        path: { cwd: "/tmp", root: "/tmp" },
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        modelID: ref.modelID,
+        providerID: ref.providerID,
+        time: { created: Date.now() + 2 },
+      } satisfies SessionV1.Assistant)
+      const second = yield* session.updatePart({
+        id: PartID.ascending(),
+        messageID: nextAssistant.id,
+        sessionID: chat.id,
+        type: "text",
+        text: "second assistant result ".repeat(600),
+      })
+      const live = yield* session.updateMessage({
+        id: MessageID.ascending(),
+        role: "user",
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        time: { created: Date.now() + 3 },
+      } satisfies SessionV1.User)
+      yield* session.updatePart({
+        id: PartID.ascending(),
+        messageID: live.id,
+        sessionID: chat.id,
+        type: "text",
+        text: "live request",
+      })
+      const before = yield* session.messages({ sessionID: chat.id })
+      const beforeProjection = yield* projectionChars(before)
+      const summary = "cross-message assistant summary"
+      const compact = yield* (yield* CompactResultsTool).init()
+
+      const result = yield* compact.execute(
+        { part_ids: [textPart.id, second.id], summary },
+        withMessages(chat.id, before),
+      )
+      const after = yield* session.messages({ sessionID: chat.id })
+      const actual = beforeProjection - (yield* projectionChars(after))
+      const rendered = JSON.stringify(yield* MessageV2.toModelMessagesEffect(after, projectionModel))
+
+      expect(result.metadata).toMatchObject({ compacted: 2 })
+      expect(result.metadata.charsFreed).toBeGreaterThan(0)
+      expect(result.metadata.charsFreed).toBeLessThanOrEqual(actual)
+      expect(rendered).toContain('compaction-ref group=\\"')
+      expect(rendered).toContain('channel=\\"assistant\\"')
+    }),
+  )
+
   it.instance("protects native summary text but compacts signed reasoning", () =>
     Effect.gen(function* () {
       const { chat, textPart, reasoningPart } = yield* seed()
@@ -1008,7 +1087,7 @@ describe("tool.compact_results", () => {
     }),
   )
 
-  it.instance("accepts 200 selector matches and rejects 201 before mutation", () =>
+  it.instance("enforces the 200-part limit after filtering unsafe selector matches", () =>
     Effect.gen(function* () {
       const { chat } = yield* seed()
       const sessions = yield* Session.Service
@@ -1054,15 +1133,28 @@ describe("tool.compact_results", () => {
         { summary: "test summary", select: { types: ["tool"] } },
         context(currentParts),
       )
+      currentParts = parts(202)
+      const group = crypto.randomUUID()
+      for (const part of currentParts.slice(-2)) {
+        if (part.type !== "tool" || part.state.status !== "completed") throw new Error("part shape changed")
+        part.state.compactionGroup = group
+        part.state.compactionSummary = "prior shared summary"
+        part.state.compactionGeneration = 1
+      }
+      const filtered = yield* def.execute(
+        { summary: "test summary", select: { types: ["tool"] } },
+        context(currentParts),
+      )
       currentParts = parts(201)
       const rejected = yield* def.execute(
         { summary: "test summary", select: { types: ["tool"] } },
         context(currentParts),
       )
       expect(accepted.metadata).toMatchObject({ compacted: 200 })
+      expect(filtered.metadata).toMatchObject({ compacted: 200, skipped: 0 })
       expect(rejected.metadata).toMatchObject({ compacted: 0 })
       expect(rejected.output).toContain("at most 200")
-      expect(writes).toBe(200)
+      expect(writes).toBe(400)
     }),
   )
 
@@ -1284,6 +1376,57 @@ describe("tool.compact_results", () => {
       const read = yield* session.findPart({ sessionID: chat.id, partID: readPart.id })
       expect(bash && isCompacted(bash)).toBe(true)
       expect(read && isCompacted(read)).toBe(false)
+    }),
+  )
+
+  it.instance("select keep_last counts only actionable matches", () =>
+    Effect.gen(function* () {
+      const { chat, bashPart, readPart } = yield* seed()
+      const session = yield* Session.Service
+      const messages = structuredClone(yield* session.messages({ sessionID: chat.id }))
+      const assistant = messages.find((message) => message.info.role === "assistant")
+      if (!assistant) throw new Error("seed shape changed")
+      const group = crypto.randomUUID()
+      const grouped = Array.from({ length: 2 }, () => {
+        const part = structuredClone(readPart)
+        if (part.type !== "tool" || part.state.status !== "completed") throw new Error("seed shape changed")
+        part.id = PartID.ascending()
+        part.callID = crypto.randomUUID()
+        part.state.compactionGroup = group
+        part.state.compactionSummary = "prior shared summary"
+        part.state.compactionGeneration = 1
+        return part
+      })
+      assistant.parts.push(...grouped)
+      const writes: string[] = []
+      const def = yield* CompactResultsTool.pipe(
+        Effect.provide(
+          Layer.mock(Session.Service, {
+            messages: () => Effect.succeed(messages),
+            updatePart: (part) =>
+              Effect.sync(() => {
+                writes.push(part.id)
+                return part
+              }),
+          }),
+        ),
+        Effect.flatMap(Tool.init),
+      )
+
+      const selected = yield* def.execute(
+        { summary: "test summary", select: { types: ["tool"], keep_last: 1 } },
+        withMessages(chat.id, messages),
+      )
+      const explicit = yield* def.execute(
+        { summary: "test summary", part_ids: [grouped[0].id] },
+        withMessages(chat.id, messages),
+      )
+
+      expect(selected.metadata).toMatchObject({ compacted: 1, skipped: 0 })
+      expect(writes).toEqual([bashPart.id])
+      expect(explicit.metadata).toMatchObject({ compacted: 0, skipped: 1 })
+      expect(explicit.output).toContain(grouped[0].id)
+      expect(explicit.output).toContain("select every physical member")
     }),
   )
 
@@ -2710,7 +2853,28 @@ describe("tool.list_context", () => {
     messages,
   })
 
-  it.instance("charges a shared summary once rather than once per part", () =>
+  it.instance("omits classifier-rejected parts from the context inventory", () =>
+    Effect.gen(function* () {
+      const { chat, assistantID, bashPart } = yield* seed()
+      const session = yield* Session.Service
+      const messages = yield* session.messages({ sessionID: chat.id })
+      const assistant = messages.find((message) => message.info.id === assistantID)
+      if (!assistant || assistant.info.role !== "assistant") throw new Error("seed shape changed")
+      yield* session.updateMessage({
+        ...assistant.info,
+        error: new SessionV1.ContentFilterError({ message: "blocked by classifier" }).toObject(),
+      })
+      const visible = MessageV2.filterCompacted(yield* session.messages({ sessionID: chat.id }))
+      const list = yield* (yield* ListContextTool).init()
+
+      const inventory = yield* list.execute({}, withMessages(chat.id, visible))
+
+      expect(inventory.output).not.toContain(bashPart.id)
+      expect(inventory.output).not.toContain("prod.local")
+    }),
+  )
+
+  it.instance("rejects a visible member when its compaction group is split by hidden history", () =>
     Effect.gen(function* () {
       const { chat, bashPart, readPart } = yield* seed()
       const session = yield* Session.Service
@@ -2718,9 +2882,9 @@ describe("tool.list_context", () => {
       if (readPart.type !== "tool" || readPart.state.status !== "completed") throw new Error("seed shape changed")
       const compact = yield* (yield* CompactResultsTool).init()
       const summary = "shared summary"
-      // One call, one group, one covering note in the rendered request. The
-      // reclaim figure and the inventory both have to reflect that, or the model
-      // triages against a total inflated by the size of the group.
+      // One call creates one multi-member group and covering note. Refolding it
+      // cannot be persisted atomically yet, so the inventory must not advertise
+      // those physical parts as actionable compactable content.
       const first = yield* compact.execute(
         { part_ids: [bashPart.id, readPart.id], summary },
         withMessages(chat.id, yield* session.messages({ sessionID: chat.id })),
@@ -2730,14 +2894,54 @@ describe("tool.list_context", () => {
 
       const list = yield* (yield* ListContextTool).init()
       const reloaded = yield* session.messages({ sessionID: chat.id })
-      const inventory = yield* list.execute({}, withMessages(chat.id, reloaded))
-      expect(inventory.metadata.charsCompactable).toBe(
-        renderedChars(
-          reloaded.filter((message) => message.info.role === "assistant").flatMap((message) => message.parts),
-        ),
+      const visible = reloaded.map((message) => ({
+        ...message,
+        parts: message.parts.filter((part) => part.id !== readPart.id),
+      }))
+      const inventory = yield* list.execute({}, withMessages(chat.id, visible))
+      const attempted = yield* compact.execute(
+        { part_ids: [bashPart.id], summary: "shorter" },
+        withMessages(chat.id, visible),
       )
       expect(inventory.output).toContain(summary)
+      expect(inventory.output).toContain("select every physical member")
       expect(inventory.output).not.toContain("prod.local")
+      expect(attempted.metadata).toMatchObject({ compacted: 0, skipped: 1, charsFreed: 0 })
+      expect(attempted.output).toContain("select every physical member")
+    }),
+  )
+
+  it.instance("caps advertised candidates at 200 and emits an accepted net-saving selection", () =>
+    Effect.gen(function* () {
+      const { chat, assistantID } = yield* seed()
+      const session = yield* Session.Service
+      yield* Effect.forEach(
+        Array.from({ length: 201 }),
+        (_, index) =>
+          session.updatePart({
+            id: PartID.ascending(),
+            messageID: assistantID,
+            sessionID: chat.id,
+            type: "text",
+            text: `${index.toString().padStart(3, "0")}:${"x".repeat(6_000)}`,
+          }),
+        { discard: true },
+      )
+      const messages = yield* session.messages({ sessionID: chat.id })
+      const list = yield* (yield* ListContextTool).init()
+      const inventory = yield* list.execute({ compactable_only: true, limit: 200 }, withMessages(chat.id, messages))
+      const ids = [...inventory.output.matchAll(/^- (prt_[^ ]+) ·/gm)].map((match) => match[1]!)
+      const compact = yield* (yield* CompactResultsTool).init()
+      const result = yield* compact.execute(
+        { part_ids: ids, summary: "x".repeat(4_000) },
+        withMessages(chat.id, messages),
+      )
+
+      expect(inventory.metadata).toMatchObject({ compactable: 200 })
+      expect(ids).toHaveLength(200)
+      expect(new Set(ids).size).toBe(200)
+      expect(result.metadata.compacted).toBe(200)
+      expect(result.metadata.charsFreed).toBeGreaterThan(0)
     }),
   )
 

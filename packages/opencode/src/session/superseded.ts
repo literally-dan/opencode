@@ -3,7 +3,7 @@ import { Effect } from "effect"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { SessionID } from "./schema"
 import { Session } from "./session"
-import { compactionOf, setCompaction } from "./compaction-pruning"
+import { compactionOf, setCompaction, withCompactionLock } from "./compaction-pruning"
 
 // Tools whose output is a snapshot of file contents. Only these are collapsed:
 // an edit or write result is a diff or a confirmation, which is a record of
@@ -44,61 +44,67 @@ export const collapse = Effect.fn("session.superseded.collapse")(function* (inpu
   sessions: Session.Interface
   directory: string
 }) {
-  const messages = yield* input.sessions.messages({ sessionID: input.sessionID })
+  return yield* withCompactionLock(
+    input.sessionID,
+    undefined,
+    Effect.gen(function* () {
+      const messages = yield* input.sessions.messages({ sessionID: input.sessionID })
 
-  const entries: Entry[] = []
-  for (const msg of messages) {
-    // Relative paths resolve against the directory the turn actually ran in, so
-    // a session whose cwd moved cannot conflate two different files that happen
-    // to share a relative path.
-    const directory = (msg.info.role === "assistant" ? msg.info.path?.cwd : undefined) ?? input.directory
-    for (const part of msg.parts) {
-      if (part.type !== "tool" || part.state.status !== "completed") continue
-      if (MUTATING_TOOLS.has(part.tool)) {
-        const files = mutatedFiles(part.state, directory)
-        if (files.size) entries.push({ kind: "mutation", part, files })
-        continue
+      const entries: Entry[] = []
+      for (const msg of messages) {
+        // Relative paths resolve against the directory the turn actually ran in, so
+        // a session whose cwd moved cannot conflate two different files that happen
+        // to share a relative path.
+        const directory = (msg.info.role === "assistant" ? msg.info.path?.cwd : undefined) ?? input.directory
+        for (const part of msg.parts) {
+          if (part.type !== "tool" || part.state.status !== "completed") continue
+          if (MUTATING_TOOLS.has(part.tool)) {
+            const files = mutatedFiles(part.state, directory)
+            if (files.size) entries.push({ kind: "mutation", part, files })
+            continue
+          }
+          if (!SNAPSHOT_TOOLS.has(part.tool)) continue
+          const window = readWindow(part.state, directory)
+          if (window) entries.push({ kind: "snapshot", part, ...window })
+        }
       }
-      if (!SNAPSHOT_TOOLS.has(part.tool)) continue
-      const window = readWindow(part.state, directory)
-      if (window) entries.push({ kind: "snapshot", part, ...window })
-    }
-  }
 
-  const collapsed: SessionV1.ToolPart[] = []
-  for (const [position, entry] of entries.entries()) {
-    if (entry.kind !== "snapshot") continue
-    if (compactionOf(entry.part)) continue
-    if (entry.part.state.status !== "completed" || entry.part.state.output.length < MIN_CHARS) continue
-    const supersededBy = entries.find((later, laterPosition) => {
-      if (laterPosition <= position) return false
-      if (later.kind === "mutation") return later.files.has(entry.file)
-      // A later read only retires an earlier one when it demonstrably returned a
-      // superset of those lines. An untruncated read reaches the end of the
-      // file, so starting at or before the earlier window is enough.
-      if (later.file !== entry.file || later.start > entry.start) return false
-      return later.complete || later.end >= entry.end
-    })
-    if (!supersededBy) continue
-    collapsed.push(entry.part)
-    setCompaction(entry.part, {
-      at: Date.now(),
-      // One group per collapse: each note names a different newer touch, and a
-      // shared group would render only the first of them.
-      group: `superseded:${entry.part.id}`,
-      generation: 1,
-      summary: [
-        `Stale snapshot of ${entry.file}.`,
-        supersededBy.kind === "mutation"
-          ? `The file was modified afterwards by \`${supersededBy.part.tool}\` (${supersededBy.part.id}), so this copy no longer matches disk.`
-          : `A later read (${supersededBy.part.id}) returned these lines again, so this copy is redundant.`,
-        `Use read_part to recover it verbatim, or read the file again for current content.`,
-      ].join(" "),
-    })
-    yield* input.sessions.updatePart(entry.part)
-  }
+      const collapsed: SessionV1.ToolPart[] = []
+      for (const [position, entry] of entries.entries()) {
+        if (entry.kind !== "snapshot") continue
+        if (compactionOf(entry.part)) continue
+        if (entry.part.state.status !== "completed" || entry.part.state.output.length < MIN_CHARS) continue
+        const supersededBy = entries.find((later, laterPosition) => {
+          if (laterPosition <= position) return false
+          if (later.kind === "mutation") return later.files.has(entry.file)
+          // A later read only retires an earlier one when it demonstrably returned a
+          // superset of those lines. An untruncated read reaches the end of the
+          // file, so starting at or before the earlier window is enough.
+          if (later.file !== entry.file || later.start > entry.start) return false
+          return later.complete || later.end >= entry.end
+        })
+        if (!supersededBy) continue
+        collapsed.push(entry.part)
+        setCompaction(entry.part, {
+          at: Date.now(),
+          // One group per collapse: each note names a different newer touch, and a
+          // shared group would render only the first of them.
+          group: `superseded:${entry.part.id}`,
+          generation: 1,
+          summary: [
+            `Stale snapshot of ${entry.file}.`,
+            supersededBy.kind === "mutation"
+              ? `The file was modified afterwards by \`${supersededBy.part.tool}\` (${supersededBy.part.id}), so this copy no longer matches disk.`
+              : `A later read (${supersededBy.part.id}) returned these lines again, so this copy is redundant.`,
+            `Use read_part to recover it verbatim, or read the file again for current content.`,
+          ].join(" "),
+        })
+        yield* input.sessions.updatePart(entry.part)
+      }
 
-  return collapsed.length
+      return collapsed.length
+    }),
+  )
 })
 
 // Paths reach the tools either absolute or relative to the run directory, and

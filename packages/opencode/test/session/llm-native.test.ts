@@ -332,6 +332,26 @@ describe("session.llm-native.request", () => {
     ])
   })
 
+  test("marks native messages at and after the exclusive cache prefix limit", () => {
+    const request = LLMNative.request({
+      model: baseModel,
+      messages: [
+        { role: "system", content: "System" },
+        { role: "user", content: "Stable user" },
+        { role: "assistant", content: "Full context receipt" },
+        { role: "user", content: "Pressure reminder" },
+      ],
+      cachePrefixLimit: 2,
+    })
+
+    expect(request.messages.map((message) => message.cacheable)).toEqual([undefined, false, false])
+    expect(request.messages.map((message) => message.content[0])).toMatchObject([
+      { type: "text", text: "Stable user" },
+      { type: "text", text: "Full context receipt" },
+      { type: "text", text: "Pressure reminder" },
+    ])
+  })
+
   test("selects native request routes for provider packages", () => {
     const openai = LLMNative.model({
       model: { ...baseModel, api: { ...baseModel.api, url: "", npm: "@ai-sdk/openai" } },

@@ -418,6 +418,89 @@ it.live("session.processor effect tests stop after token overflow requests compa
   ),
 )
 
+it.live("session.processor effect tests re-estimate overflow without history hidden by native compaction", () =>
+  provideTmpdirServer(
+    ({ dir, llm }) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+
+        yield* llm.text("after", { usage: { input: 2_500, output: 0 } })
+
+        const chat = yield* session.create({})
+        yield* user(chat.id, `hidden history ${"x".repeat(40_000)}`)
+        const boundary = yield* session.updateMessage({
+          id: MessageID.ascending(),
+          role: "user",
+          sessionID: chat.id,
+          agent: "build",
+          model: ref,
+          time: { created: Date.now() },
+        })
+        yield* session.updatePart({
+          id: PartID.ascending(),
+          messageID: boundary.id,
+          sessionID: chat.id,
+          type: "compaction",
+          auto: true,
+        })
+        const summarized = yield* session.updateMessage({
+          ...(yield* assistant(chat.id, boundary.id, path.resolve(dir))),
+          mode: "compaction",
+          agent: "compaction",
+          summary: true,
+        })
+        yield* session.updatePart({
+          id: PartID.ascending(),
+          messageID: summarized.id,
+          sessionID: chat.id,
+          type: "text",
+          text: "summary of the hidden history",
+        })
+        const parent = yield* session.updateMessage({
+          id: MessageID.ascending(),
+          role: "user",
+          sessionID: chat.id,
+          agent: "build",
+          model: ref,
+          time: { created: Date.now() },
+        })
+        // A manual compaction selects the precise re-estimate instead of the
+        // provider-reported usage.
+        yield* session.updatePart({
+          id: PartID.ascending(),
+          messageID: parent.id,
+          sessionID: chat.id,
+          type: "text",
+          text: "large settled request",
+          compacted: Date.now(),
+          compactionGroup: "manual-group",
+          compactionSummary: "manual note",
+        })
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const base = yield* provider.getModel(ref.providerID, ref.modelID)
+        const mdl = { ...base, limit: { context: 3_000, output: 1_000 } }
+        const handle = yield* processors.create({
+          assistantMessage: msg,
+          sessionID: chat.id,
+          model: mdl,
+        })
+
+        const value = yield* handle.process({
+          user: parent,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "large settled request" }],
+          tools: {},
+        })
+
+        expect(value).toBe("continue")
+      }),
+    { config: (url) => providerCfg(url) },
+  ),
+)
+
 it.live("session.processor effect tests capture reasoning from http mock", () =>
   provideTmpdirServer(
     ({ dir, llm }) =>

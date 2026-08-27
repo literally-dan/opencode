@@ -5,8 +5,9 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { eq } from "drizzle-orm"
 import { EventV2Bridge } from "@/event-v2-bridge"
-import { expect } from "bun:test"
-import { Cause, Deferred, Duration, Effect, Exit, Fiber, Layer } from "effect"
+import { expect, test } from "bun:test"
+import { Cause, Deferred, Duration, Effect, Exit, Fiber, Layer, Option, Schema, Scope, Stream } from "effect"
+import { LLMEvent, Usage } from "@opencode-ai/llm"
 import path from "path"
 import { fileURLToPath } from "url"
 import { NamedError } from "@opencode-ai/core/util/error"
@@ -208,7 +209,11 @@ const promptRoot = LayerNode.group([
   RuntimeFlags.node,
 ])
 
-function makePrompt(input?: { mcpInstructions?: MCP.ServerInstructions[]; processor?: "blocking" }) {
+function makePrompt(input?: {
+  mcpInstructions?: MCP.ServerInstructions[]
+  processor?: "blocking"
+  llm?: Layer.Layer<LLM.Service>
+}) {
   const replacements = [
     [SessionSummary.node, summary],
     [LSP.node, lsp],
@@ -218,6 +223,7 @@ function makePrompt(input?: { mcpInstructions?: MCP.ServerInstructions[]; proces
   if (input?.processor === "blocking") {
     return LayerNode.compile(promptRoot, [...replacements, [SessionProcessor.node, blockingProcessor]])
   }
+  if (input?.llm) return LayerNode.compile(promptRoot, [...replacements, [LLM.node, input.llm]])
   return LayerNode.compile(promptRoot, replacements)
 }
 
@@ -240,6 +246,39 @@ function makeHttpNoLLMServer(input?: { mcpInstructions?: MCP.ServerInstructions[
 }
 
 const it = testEffect(makeHttp())
+const finishOnlyCalls = { value: 0 }
+const cachePrefixRequests: LLM.StreamInput[] = []
+const finishOnly = testEffect(
+  makePrompt({
+    llm: Layer.succeed(
+      LLM.Service,
+      LLM.Service.of({
+        stream: () => {
+          finishOnlyCalls.value++
+          return Stream.make(
+            LLMEvent.finish({
+              reason: "stop",
+              usage: new Usage({ inputTokens: 1, outputTokens: 0, totalTokens: 1 }),
+            }),
+          )
+        },
+      }),
+    ),
+  }),
+)
+const cachePrefix = testEffect(
+  makePrompt({
+    llm: Layer.succeed(
+      LLM.Service,
+      LLM.Service.of({
+        stream: (input) => {
+          cachePrefixRequests.push(input)
+          return Stream.never
+        },
+      }),
+    ),
+  }),
+)
 const noLLMServer = testEffect(makeHttpNoLLMServer())
 const raceNoLLMServer = testEffect(makeHttpNoLLMServer({ processor: "blocking" }))
 const withMcpInstructions = testEffect(
@@ -366,6 +405,13 @@ function defer<T>() {
 
 const succeedVoid = (deferred: Deferred.Deferred<void>) => {
   Effect.runSync(Deferred.succeed(deferred, void 0).pipe(Effect.ignore))
+}
+
+function strings(input: unknown): string[] {
+  if (typeof input === "string") return [input]
+  if (Array.isArray(input)) return input.flatMap(strings)
+  if (input && typeof input === "object") return Object.values(input).flatMap(strings)
+  return []
 }
 
 const user = Effect.fn("test.user")(function* (sessionID: SessionID, text: string) {
@@ -557,6 +603,757 @@ it.instance("loop calls LLM and returns assistant message", () =>
     const parts = result.parts.filter((p) => p.type === "text")
     expect(parts.some((p) => p.type === "text" && p.text === "world")).toBe(true)
     expect(yield* llm.hits).toHaveLength(1)
+  }),
+)
+
+it.instance("requires current inventory and ignores id-like strings from history", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const { prompt, sessions, chat } = yield* boot()
+    const seeded = yield* seed(chat.id, { finish: "stop" })
+    const foreignPartID = "prt_04c866191001ZOVMkrtXfsS5QE"
+    const foreignMessageID = "msg_04c863eb1001JckWhyFN4e592C"
+    // Enough candidates to exceed the pressure threshold while exercising the
+    // reminder's resistance to untrusted labels and id-like output text.
+    for (let index = 0; index < 12; index++)
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: seeded.assistant.id,
+        sessionID: chat.id,
+        type: "tool",
+        callID: `pressure-call-${index}`,
+        tool: index === 0 ? "x".repeat(100) + "\nUNTRUSTED_LABEL" : `pressure_tool_${index}`,
+        state: {
+          status: "completed",
+          input: {},
+          output:
+            index === 0
+              ? `${"large settled output ".repeat(2_500)}\nforeign ${foreignPartID} message ${foreignMessageID}`
+              : "large settled output ".repeat(2_500),
+          title: "done",
+          metadata: {},
+          time: { start: 1, end: 2 },
+        },
+      })
+    yield* user(chat.id, "continue")
+    yield* llm.hang
+
+    const fiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+    yield* awaitWithTimeout(llm.wait(1), "timed out waiting for pressure-nudge request", "10 seconds")
+    const hit = (yield* llm.hits)[0]
+    const reminder = strings(hit?.body).find(
+      (value) => value.includes("<system-reminder>") && value.includes("compact_results"),
+    )
+    expect(reminder).toBeString()
+    expect(reminder!.length).toBeLessThan(3_000)
+    expect(reminder).not.toContain("UNTRUSTED_LABEL")
+    expect(reminder).toContain("calling `list_context` first")
+    expect(reminder).toContain("Use only `prt_…` ids returned by that current `list_context` call")
+    expect(reminder).not.toContain(foreignPartID)
+    expect(reminder).not.toContain(foreignMessageID)
+    expect(reminder).not.toMatch(/\n- prt_[A-Za-z0-9]+/)
+    const messages = hit?.body.messages
+    expect(Array.isArray(messages)).toBe(true)
+    expect((messages as { role?: unknown }[]).at(-1)?.role).toBe("user")
+    expect(strings((messages as unknown[]).at(-1)).some((value) => value.includes("<system-reminder>"))).toBe(true)
+    yield* Fiber.interrupt(fiber)
+  }),
+  { timeout: 15_000 },
+)
+
+cachePrefix.instance("limits caching before grouped receipts and a final-step instruction", () =>
+  Effect.gen(function* () {
+    cachePrefixRequests.splice(0)
+    const test = yield* TestInstance
+    yield* writeConfig(test.directory, {
+      ...cfg,
+      agent: { build: { steps: 1 } },
+    })
+    const { prompt, sessions, chat } = yield* boot()
+    const seeded = yield* seed(chat.id, { finish: "stop" })
+    yield* Effect.forEach(
+      ["context-call-1", "context-call-2"],
+      (callID) =>
+        sessions.updatePart({
+          id: PartID.ascending(),
+          messageID: seeded.assistant.id,
+          sessionID: chat.id,
+          type: "tool",
+          callID,
+          tool: "list_context",
+          state: {
+            status: "completed",
+            input: {},
+            output: `Context inventory from ${callID}`,
+            title: "Context inventory",
+            metadata: { total: 1, compactable: 1, charsCompactable: 1_000 },
+            time: { start: 1, end: 2 },
+          },
+        }),
+      { discard: true },
+    )
+    yield* user(chat.id, "inspect context")
+
+    const fiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+    yield* pollWithTimeout(
+      Effect.sync(() => (cachePrefixRequests.length >= 1 ? true : undefined)),
+      "cache-prefix request was not prepared",
+    )
+
+    expect(cachePrefixRequests).toHaveLength(1)
+    const receipts = (yield* sessions.messages({ sessionID: chat.id }))
+      .flatMap((message) => message.parts)
+      .filter((part): part is SessionV1.ToolPart => part.type === "tool" && part.tool === "list_context")
+    expect(receipts).toHaveLength(2)
+    expect(receipts.map((part) => part.state.status)).toEqual(["completed", "completed"])
+    expect(
+      receipts.map((part) => (part.state.status === "completed" ? part.state.time.compacted : undefined)),
+    ).toEqual([undefined, undefined])
+    const request = cachePrefixRequests[0]!
+    expect(request.cachePrefixLimit).toBeNumber()
+    const limit = request.cachePrefixLimit ?? -1
+    expect(limit).toBeLessThan(request.messages.length - 1)
+    const boundary = request.messages[limit]
+    expect(boundary?.role).toBe("assistant")
+    const callIDs =
+      boundary?.role === "assistant" && Array.isArray(boundary.content)
+        ? boundary.content.flatMap((part) => (part.type === "tool-call" ? [part.toolCallId] : []))
+        : []
+    expect(callIDs).toEqual(["context-call-1", "context-call-2"])
+    expect(request.messages.at(-1)?.role).toBe("assistant")
+    yield* Fiber.interrupt(fiber)
+  }),
+)
+
+cachePrefix.instance("limits caching before an unconsumed receipt and pressure reminder", () =>
+  Effect.gen(function* () {
+    cachePrefixRequests.splice(0)
+    const test = yield* TestInstance
+    yield* writeConfig(test.directory, cfg)
+    const { prompt, sessions, chat } = yield* boot()
+    const seeded = yield* seed(chat.id, { finish: "stop" })
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: seeded.assistant.id,
+      sessionID: chat.id,
+      type: "tool",
+      callID: "pressure-source",
+      tool: "read",
+      state: {
+        status: "completed",
+        input: {},
+        output: "settled output ".repeat(18_000),
+        title: "done",
+        metadata: {},
+        time: { start: 1, end: 2 },
+      },
+    })
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: seeded.assistant.id,
+      sessionID: chat.id,
+      type: "tool",
+      callID: "unconsumed-context",
+      tool: "list_context",
+      state: {
+        status: "completed",
+        input: {},
+        output: "Context inventory for interrupted request",
+        title: "Context inventory",
+        metadata: { total: 1, compactable: 1, charsCompactable: 100_000 },
+        time: { start: 1, end: 2 },
+      },
+    })
+    yield* user(chat.id, "continue")
+    const fiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+    yield* pollWithTimeout(
+      Effect.sync(() => (cachePrefixRequests.length >= 1 ? true : undefined)),
+      "cache-prefix request was not prepared",
+    )
+
+    expect(cachePrefixRequests).toHaveLength(1)
+    const request = cachePrefixRequests[0]!
+    expect(request.cachePrefixLimit).toBeNumber()
+    const limit = request.cachePrefixLimit ?? -1
+    expect(limit).toBeLessThan(request.messages.length - 1)
+    expect(request.messages.at(-1)?.role).toBe("user")
+    const boundary = request.messages[limit]
+    const callIDs =
+      boundary?.role === "assistant" && Array.isArray(boundary.content)
+        ? boundary.content.flatMap((part) => (part.type === "tool-call" ? [part.toolCallId] : []))
+        : []
+    expect(callIDs).toContain("unconsumed-context")
+    yield* Fiber.interrupt(fiber)
+  }),
+)
+
+it.instance("does not renudge from stale usage after only bounded compaction markers remain", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const { prompt, sessions, chat } = yield* boot()
+    const seeded = yield* seed(chat.id, { finish: "stop" })
+    seeded.assistant.tokens.input = 65_000
+    yield* sessions.updateMessage(seeded.assistant)
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: seeded.assistant.id,
+      sessionID: chat.id,
+      type: "tool",
+      callID: "compacted-pressure-call",
+      tool: "bash",
+      state: {
+        status: "completed",
+        input: {},
+        output: "large settled output ".repeat(500),
+        title: "done",
+        metadata: {},
+        time: { start: 1, end: 2 },
+        compactionGroup: crypto.randomUUID(),
+        compactionSummary: "s".repeat(10_000),
+      },
+    })
+    yield* user(chat.id, "continue")
+    yield* llm.hang
+
+    const fiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+    yield* awaitWithTimeout(llm.wait(1), "timed out waiting for compacted-history request", "10 seconds")
+    const values = strings((yield* llm.hits)[0]?.body)
+    expect(values.some((value) => value.includes("Context is ~"))).toBe(false)
+    const marker = values.find((value) => value.includes("<compacted prt="))
+    expect(marker).toContain("[summary truncated]")
+    expect(marker!.length).toBeLessThan(4_500)
+    yield* Fiber.interrupt(fiber)
+  }),
+)
+
+it.instance("does not schedule native compaction from stale usage after manual reclamation", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const { prompt, sessions, chat } = yield* boot()
+    const seeded = yield* seed(chat.id, { finish: "stop" })
+    seeded.assistant.tokens.total = 195_000
+    seeded.assistant.tokens.input = 195_000
+    yield* sessions.updateMessage(seeded.assistant)
+    const stored = (yield* sessions.messages({ sessionID: chat.id })).find(
+      (message) => message.info.id === seeded.assistant.id,
+    )!
+    const text = stored.parts.find((part): part is SessionV1.TextPart => part.type === "text")!
+    yield* sessions.updatePart({
+      ...text,
+      compacted: Date.now(),
+      compactionGroup: "manual-reclamation",
+      compactionSummary: "the old response is settled",
+    })
+    yield* user(chat.id, "continue after reclaiming context")
+    yield* llm.text("done")
+    yield* llm.text("unexpected second request")
+
+    const result = yield* prompt.loop({ sessionID: chat.id })
+    const messages = yield* sessions.messages({ sessionID: chat.id })
+
+    expect(yield* llm.calls).toBe(1)
+    expect(result.parts.some((part) => part.type === "text" && part.text === "done")).toBe(true)
+    expect(messages.flatMap((message) => message.parts).some((part) => part.type === "compaction")).toBe(false)
+  }),
+)
+
+it.instance("keeps a failed compaction retry attached to its owning message", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const { prompt, sessions, chat } = yield* boot()
+    yield* user(chat.id, "ORIGINAL_COMPACTION_OWNER")
+    yield* SessionCompaction.use.create({
+      sessionID: chat.id,
+      agent: "build",
+      model: ref,
+      auto: false,
+    })
+    const marker = (yield* sessions.messages({ sessionID: chat.id })).find((message) =>
+      message.parts.some((part) => part.type === "compaction"),
+    )!
+    const next = yield* user(chat.id, "NEXT_USER_PROMPT_MUST_NOT_BE_CONSUMED")
+    yield* llm.push(reply().stop())
+
+    yield* prompt.loop({ sessionID: chat.id })
+
+    const messages = yield* sessions.messages({ sessionID: chat.id })
+    const summary = messages.find((message) => message.info.role === "assistant" && message.info.summary)
+    const request = JSON.stringify((yield* llm.hits)[0]?.body)
+    expect(summary?.info.role === "assistant" ? summary.info.parentID : undefined).toBe(marker.info.id)
+    expect(summary?.info.role === "assistant" ? summary.info.parentID : undefined).not.toBe(next.id)
+    expect(summary?.info.role === "assistant" ? summary.info.error?.name : undefined).toBe("ContextOverflowError")
+    expect(request).toContain("ORIGINAL_COMPACTION_OWNER")
+    expect(request).not.toContain("NEXT_USER_PROMPT_MUST_NOT_BE_CONSUMED")
+  }),
+)
+
+finishOnly.instance("terminalizes a finish-only manual compaction without retrying", () =>
+  Effect.gen(function* () {
+    finishOnlyCalls.value = 0
+    const test = yield* TestInstance
+    yield* writeConfig(test.directory, cfg)
+    const { prompt, sessions, chat } = yield* boot()
+    yield* user(chat.id, "compact this")
+    yield* SessionCompaction.use.create({
+      sessionID: chat.id,
+      agent: "build",
+      model: ref,
+      auto: false,
+    })
+
+    const result = yield* prompt.loop({ sessionID: chat.id })
+    const summaries = (yield* sessions.messages({ sessionID: chat.id })).filter(
+      (message) => message.info.role === "assistant" && message.info.summary,
+    )
+
+    expect(finishOnlyCalls.value).toBe(1)
+    expect(summaries).toHaveLength(1)
+    expect(result.info.role).toBe("assistant")
+    if (result.info.role !== "assistant") return
+    expect(result.info.finish).toBe("error")
+    expect(result.info.error?.name).toBe("ContextOverflowError")
+  }),
+)
+
+it.instance("attaches impossible-budget preflight errors to the current user request", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig((url) => ({
+      ...providerCfg(url),
+      compaction: { reserved: 100_000 },
+    }))
+    const { prompt, sessions, chat } = yield* boot()
+    const seeded = yield* seed(chat.id, { finish: "tool-calls" })
+    const current = yield* user(chat.id, "CURRENT_USER_REQUEST")
+
+    const result = yield* prompt.loop({ sessionID: chat.id })
+    const previous = (yield* sessions.messages({ sessionID: chat.id })).find(
+      (message) => message.info.id === seeded.assistant.id,
+    )
+
+    expect(yield* llm.calls).toBe(0)
+    expect(result.info.role).toBe("assistant")
+    if (result.info.role !== "assistant") return
+    expect(result.info.parentID).toBe(current.id)
+    expect(result.info.error?.name).toBe("ContextOverflowError")
+    expect(previous?.info.role === "assistant" ? previous.info.error : undefined).toBeUndefined()
+    expect(previous?.info.role === "assistant" ? previous.info.finish : undefined).toBe("tool-calls")
+  }),
+)
+
+it.instance("nudges from the live request size, not the previous response's usage", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const { prompt, sessions, chat } = yield* boot()
+    const seeded = yield* seed(chat.id, { finish: "stop" })
+    // Zero recorded provider usage: steering off the last response would see an
+    // empty context and stay silent, however much is actually about to be sent.
+    seeded.assistant.tokens.input = 0
+    seeded.assistant.tokens.output = 0
+    yield* sessions.updateMessage(seeded.assistant)
+    // Usable budget is context 200k - output 10k = 190k, and the heuristic is
+    // 4 chars per token, so ~600k chars sits well past the 65% soft threshold.
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: seeded.assistant.id,
+      sessionID: chat.id,
+      type: "tool",
+      callID: "live-pressure-call",
+      tool: "bash",
+      state: {
+        status: "completed",
+        input: {},
+        output: "large live output ".repeat(34_000),
+        title: "done",
+        metadata: {},
+        time: { start: 1, end: 2 },
+      },
+    })
+    yield* user(chat.id, "continue")
+    yield* llm.hang
+
+    const fiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+    yield* awaitWithTimeout(llm.wait(1), "timed out waiting for live-pressure request", "10 seconds")
+    const reminder = strings((yield* llm.hits)[0]?.body).find((value) => value.includes("Context is ~"))
+    expect(reminder).toContain("compact_results")
+    // The ask states the gap down to the target band, not just enough to clear
+    // the threshold it tripped.
+    expect(reminder).toContain("Aim to reclaim roughly")
+    expect(reminder).toContain("down to about 45%")
+    yield* Fiber.interrupt(fiber)
+  }),
+)
+
+it.instance("does not repeat a reminder when no actionable compaction candidate changed", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const { prompt, sessions, chat } = yield* boot()
+    const seeded = yield* seed(chat.id, { finish: "stop" })
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: seeded.assistant.id,
+      sessionID: chat.id,
+      type: "tool",
+      callID: "soft-pressure-candidate",
+      tool: "read",
+      state: {
+        status: "completed",
+        input: {},
+        output: "settled output ".repeat(3_000),
+        title: "done",
+        metadata: {},
+        time: { start: 1, end: 2 },
+      },
+    })
+    yield* user(chat.id, "x".repeat(200_000))
+    yield* llm.push(reply().tool("glob", { pattern: "missing-one" }).stop())
+    yield* llm.push(reply().tool("glob", { pattern: "missing-two" }).stop())
+    yield* llm.push(reply().tool("glob", { pattern: "missing-three" }).stop())
+    yield* llm.text("done")
+
+    yield* prompt.loop({ sessionID: chat.id })
+
+    const hits = yield* llm.hits
+    const first = strings(hits[0]?.body).find((value) => value.includes("Context is ~"))
+    const repeated = strings(hits[3]?.body).find((value) => value.includes("Context is ~"))
+    expect(hits).toHaveLength(4)
+    expect(first).toContain("Before it gets critical")
+    expect(repeated).toBeUndefined()
+  }),
+)
+
+it.instance("does not feed context-management receipts back into pressure reminders", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const { prompt, sessions, chat } = yield* boot()
+    const seeded = yield* seed(chat.id, { finish: "stop" })
+    const selected = yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: seeded.assistant.id,
+      sessionID: chat.id,
+      type: "tool",
+      callID: "feedback-selected",
+      tool: "read",
+      state: {
+        status: "completed",
+        input: {},
+        output: "selected output ".repeat(5_000),
+        title: "done",
+        metadata: {},
+        time: { start: 1, end: 2 },
+      },
+    })
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: seeded.assistant.id,
+      sessionID: chat.id,
+      type: "tool",
+      callID: "feedback-retained",
+      tool: "read",
+      state: {
+        status: "completed",
+        input: {},
+        output: "retained output ".repeat(12_000),
+        title: "done",
+        metadata: {},
+        time: { start: 1, end: 2 },
+      },
+    })
+    yield* user(chat.id, "x".repeat(50_000))
+    yield* llm.push(reply().tool("list_context", { compactable_only: true }).stop())
+    yield* llm.push(
+      reply()
+        .tool("compact_results", {
+          part_ids: [selected.id],
+          summary: "The selected output is no longer needed.",
+        })
+        .stop(),
+    )
+    yield* llm.push(reply().tool("glob", { pattern: "missing-feedback-loop-*" }).stop())
+    yield* llm.text("done")
+
+    const first = yield* prompt.loop({ sessionID: chat.id })
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: first.info.id,
+      sessionID: chat.id,
+      type: "tool",
+      callID: "feedback-new-candidate",
+      tool: "read",
+      state: {
+        status: "completed",
+        input: {},
+        output: "new settled output ".repeat(5_000),
+        title: "done",
+        metadata: {},
+        time: { start: 1, end: 2 },
+      },
+    })
+    yield* user(chat.id, "continue with new evidence")
+    yield* llm.text("done again")
+    yield* prompt.loop({ sessionID: chat.id })
+
+    const hits = yield* llm.hits
+    expect(hits).toHaveLength(5)
+    const requests = hits.map((hit) => strings(hit.body))
+    const reminders = requests.map((values) => values.find((value) => value.includes("Context is ~")))
+    expect(reminders[0]).toContain("compact_results")
+    expect(reminders.slice(1, 4)).toEqual([undefined, undefined, undefined])
+    expect(reminders[4]).toContain("compact_results")
+
+    const fullInventory = requests[1]!.find((value) => value.includes("Context inventory for"))
+    expect(fullInventory).toBeString()
+    if (!fullInventory) return
+    expect(fullInventory).toContain(selected.id)
+    const inventorySummary = requests[2]!.find(
+      (value) => value.includes("Context-management receipt") && value.includes("(list_context)"),
+    )
+    expect(inventorySummary).toBeString()
+    if (!inventorySummary) return
+    expect(requests[2]).not.toContain(fullInventory)
+    expect(requests[2]!.some((value) => value.includes("Compacted 1 of 1 parts"))).toBe(true)
+    expect(requests[3]).toContain(inventorySummary)
+    expect(
+      requests[3]!.some(
+        (value) => value.includes("Context-management receipt") && value.includes("(compact_results)"),
+      ),
+    ).toBe(true)
+    expect(requests[3]!.some((value) => value.includes("Compacted 1 of 1 parts"))).toBe(false)
+
+    const stored = (yield* sessions.messages({ sessionID: chat.id })).flatMap((message) => message.parts)
+    const inventoryReceipt = stored.find(
+      (part): part is SessionV1.ToolPart => part.type === "tool" && part.tool === "list_context",
+    )
+    const compactionReceipt = stored.find(
+      (part): part is SessionV1.ToolPart => part.type === "tool" && part.tool === "compact_results",
+    )
+    expect(inventoryReceipt?.state.status === "completed" ? inventoryReceipt.state.output : undefined).toContain(
+      "Context inventory for",
+    )
+    expect(compactionReceipt?.state.status === "completed" ? compactionReceipt.state.output : undefined).toContain(
+      "Compacted 1 of 1 parts",
+    )
+  }),
+)
+
+it.instance("remembers reminders across runs and renudges only for new actionable content", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const { prompt, sessions, chat } = yield* boot()
+    const seeded = yield* seed(chat.id, { finish: "stop" })
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: seeded.assistant.id,
+      sessionID: chat.id,
+      type: "tool",
+      callID: "persistent-pressure-candidate",
+      tool: "read",
+      state: {
+        status: "completed",
+        input: {},
+        output: "settled output ".repeat(40_000),
+        title: "done",
+        metadata: {},
+        time: { start: 1, end: 2 },
+      },
+    })
+
+    yield* user(chat.id, "first request")
+    yield* llm.text("first response")
+    const first = yield* prompt.loop({ sessionID: chat.id })
+    yield* user(chat.id, "second request")
+    yield* llm.text("second response")
+    yield* prompt.loop({ sessionID: chat.id })
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: first.info.id,
+      sessionID: chat.id,
+      type: "tool",
+      callID: "new-pressure-candidate",
+      tool: "read",
+      state: {
+        status: "completed",
+        input: {},
+        output: "new settled output ".repeat(500),
+        title: "done",
+        metadata: {},
+        time: { start: 1, end: 2 },
+      },
+    })
+    yield* user(chat.id, "third request")
+    yield* llm.text("third response")
+    yield* prompt.loop({ sessionID: chat.id })
+
+    const hits = yield* llm.hits
+    const reminders = hits.map((hit) => strings(hit.body).find((value) => value.includes("Context is ~")))
+    expect(reminders[0]).toContain("compact_results")
+    expect(reminders[1]).toBeUndefined()
+    expect(reminders[2]).toContain("compact_results")
+  }),
+)
+
+it.instance("reserves reminder headroom at the soft pressure boundary", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const { prompt, sessions, chat } = yield* boot()
+    const seeded = yield* seed(chat.id, { finish: "stop" })
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: seeded.assistant.id,
+      sessionID: chat.id,
+      type: "tool",
+      callID: "boundary-candidate",
+      tool: "read",
+      state: {
+        status: "completed",
+        input: {},
+        output: "settled output ".repeat(1_000),
+        title: "done",
+        metadata: {},
+        time: { start: 1, end: 2 },
+      },
+    })
+    yield* user(chat.id, "x".repeat(178_500))
+    yield* llm.hang
+
+    const fiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+    yield* awaitWithTimeout(llm.wait(1), "timed out waiting for boundary request", "10 seconds")
+    const reminder = strings((yield* llm.hits)[0]?.body).find((value) => value.includes("Context is ~"))
+    expect(reminder).toContain("compact_results")
+    expect(reminder).toContain("Context is ~65%")
+    yield* Fiber.interrupt(fiber)
+  }),
+)
+
+// Builds a session whose only reclaimable content is notes that were already
+// folded once, with the live request sized to land at a chosen pressure level.
+function alreadyFolded(request: number) {
+  return Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const { prompt, sessions, chat } = yield* boot()
+    const seeded = yield* seed(chat.id, { finish: "stop" })
+    for (let index = 0; index < 3; index++)
+      yield* sessions.updatePart({
+        id: PartID.ascending(),
+        messageID: seeded.assistant.id,
+        sessionID: chat.id,
+        type: "tool",
+        callID: `folded-call-${index}`,
+        tool: `folded_tool_${index}`,
+        state: {
+          status: "completed",
+          input: {},
+          output: "original output ".repeat(1_000),
+          title: "done",
+          metadata: {},
+          time: { start: 1, end: 2 },
+          compactionGroup: `folded-${index}`,
+          compactionGeneration: 1,
+          compactionSummary: "settled note ".repeat(300),
+        },
+      })
+    // Pressure comes from the live request itself, which is never a compaction
+    // candidate, so the only reclaimable content left is the notes.
+    yield* user(chat.id, "x".repeat(request))
+    yield* llm.hang
+    const fiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+    yield* awaitWithTimeout(llm.wait(1), "timed out waiting for fold request", "10 seconds")
+    return { fiber, reminder: strings((yield* llm.hits)[0]?.body).find((value) => value.includes("Context is ~")) }
+  })
+}
+
+it.instance("does not advertise already-folded notes that cannot guarantee savings", () =>
+  Effect.gen(function* () {
+    // Sized past the hard threshold, where native compaction is imminent.
+    const { fiber, reminder } = yield* alreadyFolded(680_000)
+    expect(reminder).toBeUndefined()
+    yield* Fiber.interrupt(fiber)
+  }),
+)
+
+it.instance("does not offer to refold notes below critical pressure", () =>
+  Effect.gen(function* () {
+    // Refolding erodes detail permanently in exchange for very little space,
+    // so it is offered only when native whole-history compaction is the
+    // alternative — not merely because the context is getting full.
+    // Sized into the soft band: pressure is real, but not yet critical.
+    const { fiber, reminder } = yield* alreadyFolded(240_000)
+    expect(reminder).toBeUndefined()
+    yield* Fiber.interrupt(fiber)
+  }),
+)
+
+it.instance("suppresses context-pressure nudges on the agent's last step", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig((url) => ({
+      ...providerCfg(url),
+      agent: { build: { steps: 1 } },
+    }))
+    const { prompt, sessions, chat } = yield* boot()
+    const seeded = yield* seed(chat.id, { finish: "stop" })
+    seeded.assistant.tokens.input = 65_000
+    yield* sessions.updateMessage(seeded.assistant)
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: seeded.assistant.id,
+      sessionID: chat.id,
+      type: "tool",
+      callID: "last-step-pressure-call",
+      tool: "bash",
+      state: {
+        status: "completed",
+        input: {},
+        output: "large settled output ".repeat(500),
+        title: "done",
+        metadata: {},
+        time: { start: 1, end: 2 },
+      },
+    })
+    yield* user(chat.id, "continue")
+    yield* llm.hang
+
+    const fiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+    yield* awaitWithTimeout(llm.wait(1), "timed out waiting for last-step request", "10 seconds")
+    expect(strings((yield* llm.hits)[0]?.body).some((value) => value.includes("Context is ~"))).toBe(false)
+    yield* Fiber.interrupt(fiber)
+  }),
+)
+
+it.instance("suppresses context-pressure nudges when compact_results is denied", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const { prompt, sessions, chat } = yield* boot()
+    const seeded = yield* seed(chat.id, { finish: "stop" })
+    seeded.assistant.tokens.input = 65_000
+    yield* sessions.updateMessage(seeded.assistant)
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: seeded.assistant.id,
+      sessionID: chat.id,
+      type: "tool",
+      callID: "denied-pressure-call",
+      tool: "bash",
+      state: {
+        status: "completed",
+        input: {},
+        output: "large settled output ".repeat(500),
+        title: "done",
+        metadata: {},
+        time: { start: 1, end: 2 },
+      },
+    })
+    yield* sessions.setPermission({
+      sessionID: chat.id,
+      permission: [{ permission: "compact_results", pattern: "*", action: "deny" }],
+    })
+    yield* user(chat.id, "continue")
+    yield* llm.hang
+
+    const fiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+    yield* awaitWithTimeout(llm.wait(1), "timed out waiting for denied-pressure request", "10 seconds")
+    const values = strings((yield* llm.hits)[0]?.body)
+    expect(values.some((value) => value.includes("Context is ~"))).toBe(false)
+    expect(values.some((value) => value.includes("large settled output"))).toBe(true)
+    yield* Fiber.interrupt(fiber)
   }),
 )
 

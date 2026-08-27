@@ -9,6 +9,17 @@ import { SessionRevert } from "./revert"
 import { Session } from "./session"
 import { Agent } from "../agent/agent"
 import { Provider } from "@/provider/provider"
+import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
+import { estimateRequest, REQUEST_REMINDER_HEADROOM, usable } from "./overflow"
+import {
+  COMPACTION_PLANNING_SUMMARY,
+  compactionInventory,
+  compactionOf,
+  compactionSavings,
+  contextManagementReceiptKind,
+  isFullContextManagementReceipt,
+} from "./compaction-pruning"
+import { Superseded } from "./superseded"
 
 import { type ModelMessage, type Tool as AITool, tool, jsonSchema } from "ai"
 import type { JSONSchema7 } from "@ai-sdk/provider"
@@ -99,6 +110,183 @@ function isOrphanedInterruptedTool(part: SessionV1.ToolPart) {
   return part.state.status === "error" && part.state.metadata?.interrupted === true
 }
 
+function successfulContextCompaction(message: SessionV1.WithParts | undefined) {
+  return (
+    message?.parts.some((part) => {
+      if (!isFullContextManagementReceipt(part)) return false
+      const kind = contextManagementReceiptKind(part)
+      if (kind !== "compact_results" && kind !== "compact_bulk") return false
+      const charsFreed: unknown = part.state.metadata.charsFreed
+      return typeof charsFreed === "number" && charsFreed > 0
+    }) ?? false
+  )
+}
+
+function stableCachePrefixLimit(input: {
+  messages: SessionV1.WithParts[]
+  modelMessages: ModelMessage[]
+  ephemeralSuffix: boolean
+}) {
+  const receipt = input.messages.findLast(
+    (message) => message.info.role === "assistant" && message.parts.some(isFullContextManagementReceipt),
+  )
+  if (!receipt) return input.ephemeralSuffix ? input.modelMessages.length : undefined
+  const callIDs = new Set(receipt.parts.filter(isFullContextManagementReceipt).map((part) => part.callID))
+  const limit = input.modelMessages.findIndex(
+    (message) =>
+      message.role === "assistant" &&
+      Array.isArray(message.content) &&
+      message.content.some((part) => part.type === "tool-call" && callIDs.has(part.toolCallId)),
+  )
+  // Missing tool-call history is malformed, but caching no message history is
+  // safer than writing a one-use prefix through the volatile receipt.
+  return limit < 0 ? 0 : limit
+}
+
+// Two-stage context-pressure nudge. Native overflow compaction (whole-history
+// summarization) takes over at 100% of the usable budget and discards detail
+// wholesale, so we want the model to run a cheaper, surgical `compact_results`
+// pass with runway to spare before that cutover. A single large step can grow
+// context by well over 15%, so nudging only in the final stretch risks the
+// native pass preempting the model entirely. Start a gentle reminder at SOFT
+// (the loop dedupes it, so an ignored nudge stays cheap) and escalate to a
+// first-action imperative past HARD — where the model empirically starts acting
+// — while both stay below the 100% native cutover.
+const CONTEXT_PRESSURE_SOFT = 0.65
+const CONTEXT_PRESSURE_HARD = 0.85
+// Once nudging starts, aim below the trigger rather than at it. Without a gap
+// the model reclaims just enough to fall under SOFT, the next tool result puts
+// it straight back over, and the nudge fires every turn for the rest of the
+// session.
+const CONTEXT_PRESSURE_TARGET = 0.45
+const COMPACTION_MIN_RECLAIM_CHARS = 8_000
+
+// Context-pressure nudge: once usage crosses CONTEXT_PRESSURE_SOFT of the usable
+  // window, remind the model to inspect a fresh inventory before compacting. Returns a
+// candidate fingerprint alongside the text so the caller can dedupe across
+// completed runs. Suppressed when compaction is disabled.
+// What the request about to be sent actually costs, rather than what the last
+// one cost. Provider usage arrives a round trip late, so steering off it means
+// a compaction is invisible until after the next response — the model gets
+// nudged again for pressure it already relieved, and growth from the tool
+// results in this very step is not counted at all.
+//
+// The char heuristic is calibrated against the last observed provider count for
+// a request we also estimated, which folds in tokenizer and per-message
+// overhead the heuristic cannot see.
+function liveContextTokens(input: {
+  system: string[]
+  messages: unknown[]
+  tools?: Record<string, AITool>
+  observed?: { estimated: number; actual: number }
+}) {
+  // Serialising the whole message array is the expensive part, so the raw
+  // estimate is returned alongside the calibrated one: the caller needs it to
+  // calibrate the next step and must not pay for a second pass to get it.
+  const estimated = estimateRequest(input)
+  const observed = input.observed
+  if (!observed || observed.estimated <= 0 || observed.actual <= 0) return { estimated, used: estimated }
+  // Clamped: a wild ratio means the previous request was not comparable (a
+  // native compaction landed between them, say), and scaling by it would be
+  // worse than not calibrating at all.
+  const ratio = Math.min(4, Math.max(0.25, observed.actual / observed.estimated))
+  return { estimated, used: Math.round(estimated * ratio) }
+}
+
+function contextPressureReminder(input: {
+  cfg: ConfigV1.Info
+  model: Provider.Model
+  used: number
+  messages: SessionV1.WithParts[]
+  durableMessages: SessionV1.WithParts[]
+  currentMessageID: string
+  // Steps spent above the soft threshold without the model reclaiming anything.
+  ignored: number
+}) {
+  if (input.cfg.compaction?.auto === false) return undefined
+  const budget = usable({ cfg: input.cfg, model: input.model })
+  if (budget <= 0) return undefined
+  const pct = input.used / budget
+  if (pct < CONTEXT_PRESSURE_SOFT) return undefined
+  const candidates = compactionCandidates(input.messages, input.durableMessages, input.currentMessageID)
+  const urgent = pct >= CONTEXT_PRESSURE_HARD
+  // Nothing fresh worth reclaiming. Normally that means going quiet rather than
+  // nagging about content that would cost more to re-fold than it frees — but
+  // when pressure is critical and the context is now mostly notes, folding
+  // those notes into a span is the last move left before native compaction
+  // discards the lot wholesale.
+  if (candidates.chars < COMPACTION_MIN_RECLAIM_CHARS) {
+    if (!urgent || candidates.folded.chars < COMPACTION_MIN_RECLAIM_CHARS) return undefined
+    return {
+      pct,
+      fingerprint: `hard:${candidates.fingerprint}`,
+      text: [
+        "<system-reminder>",
+        `Context is ~${Math.round(pct * 100)}% of its usable budget and automatic whole-history compaction is imminent. Everything readily compactable has already been compacted once: ${candidates.folded.parts.toLocaleString()} parts can still reclaim at least ${candidates.folded.chars.toLocaleString()} rendered characters. Call \`list_context\` for safe \`prt_…\` ids, then use \`compact_results\` with one shorter, coarser summary. Non-tool contiguous runs may collapse to a range marker; tool inputs remain intact for provider-valid replay. Prefer the oldest, most settled stretch and keep recent work at full detail.`,
+        "</system-reminder>",
+      ].join("\n"),
+    }
+  }
+  // Ask for the whole gap down to the target, not just enough to clear the
+  // threshold, so one compaction buys many turns instead of one.
+  const deficit = Math.max(0, Math.round(input.used - budget * CONTEXT_PRESSURE_TARGET))
+  const goal = `Aim to reclaim roughly ${deficit.toLocaleString()} tokens (down to about ${Math.round(CONTEXT_PRESSURE_TARGET * 100)}%), not just enough to clear the threshold.`
+  // Escalate only when the model has been told and has not acted. A model busy
+  // with the user's request gets a reminder; one that has ignored several gets
+  // told to stop and do it first.
+  const lead = urgent
+    ? `Context is ~${Math.round(pct * 100)}% of its usable budget — very high, and automatic whole-history compaction (which discards detail wholesale) is imminent. As your FIRST action this turn,`
+    : input.ignored >= 2
+      ? `Context is ~${Math.round(pct * 100)}% of its usable budget and you have passed on ${input.ignored} previous reminders. Before doing anything else,`
+      : `Context is ~${Math.round(pct * 100)}% of its usable budget and climbing. Before it gets critical,`
+  return {
+    pct,
+    fingerprint: `${urgent ? "hard" : "soft"}:${candidates.fingerprint}`,
+    text: [
+      "<system-reminder>",
+      `${lead} reclaim space by calling \`list_context\` first, then \`compact_results\`. Use only \`prt_…\` ids returned by that current \`list_context\` call; never copy id-like strings from prior messages or tool output. Content is dropped but stays recoverable via \`read_part\`. ${goal} Then continue with and complete the user's current request as normal — this reminder is housekeeping, not a replacement for the task.`,
+      "</system-reminder>",
+    ].join("\n"),
+  }
+}
+
+// Reuse the tool's eligibility and accounting for pressure and reminder
+// deduplication, but never expose part ids without a current `list_context`.
+function compactionCandidates(
+  messages: SessionV1.WithParts[],
+  durableMessages: SessionV1.WithParts[],
+  currentMessageID: string,
+) {
+  const inventory = compactionInventory(messages, currentMessageID, durableMessages)
+  const fresh: { id: string; chars: number; part: SessionV1.Part }[] = []
+  const folded: { id: string; chars: number; part: SessionV1.Part }[] = []
+  for (const [id, { part, allowed, savings }] of inventory.actionable) {
+    if (savings <= 0) continue
+    ;(allowed.generation > 0 ? folded : fresh).push({ id, chars: savings, part })
+  }
+  const reclaimable = (parts: typeof fresh) =>
+    parts.length
+      ? Math.max(
+          0,
+          compactionSavings(
+            parts.map((candidate) => candidate.part),
+            COMPACTION_PLANNING_SUMMARY,
+            inventory.roles,
+          ),
+        )
+      : 0
+  const chars = reclaimable(fresh)
+  const foldedChars = reclaimable(folded)
+  return {
+    chars,
+    folded: { parts: folded.length, chars: foldedChars },
+    fingerprint: [...fresh, ...folded]
+      .toSorted((a, b) => a.id.localeCompare(b.id))
+      .map((entry) => `${entry.id}:${entry.chars}`)
+      .join("|"),
+  }
+}
+
 export interface Interface {
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
   readonly prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
@@ -141,6 +329,21 @@ const layer = Layer.effect(
     const flags = yield* RuntimeFlags.Service
     const database = yield* Database.Service
     const { db } = database
+    type ContextState = {
+      calibration?: { estimated: number; actual: number }
+      estimate?: number
+      requestOverhead: number
+      reminder?: string
+    }
+    const contextStates = new Map<SessionID, ContextState>()
+    const contextState = (sessionID: SessionID) => {
+      const hit = contextStates.get(sessionID)
+      if (hit) return hit
+      if (contextStates.size >= 1_000) contextStates.delete(contextStates.keys().next().value!)
+      const next: ContextState = { requestOverhead: REQUEST_REMINDER_HEADROOM }
+      contextStates.set(sessionID, next)
+      return next
+    }
     const ops = Effect.fn("SessionPrompt.ops")(function* () {
       return {
         cancel: (sessionID: SessionID) => cancel(sessionID),
@@ -1085,17 +1288,33 @@ const layer = Layer.effect(
         const ctx = yield* InstanceState.context
         let structured: unknown
         let step = 0
+        const remembered = contextState(sessionID)
+        // Ratio between the last request's estimated and actual input tokens,
+        // used to correct the char heuristic for tokenizer and per-message
+        // overhead it cannot see.
+        let contextCalibration = remembered.calibration
+        let lastEstimate = remembered.estimate
+        let lastRequestOverhead = remembered.requestOverhead
+        let autoCompactionAttempts = 0
         const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
 
         while (true) {
           yield* status.set(sessionID, { type: "busy" })
           yield* Effect.logInfo("loop", { "session.id": sessionID, step })
 
-          let msgs = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
-            Effect.provideService(Database.Service, database),
-          )
+          let msgs = yield* compaction.collapseReceipts({ sessionID })
 
           const { user: lastUser, assistant: lastAssistant, finished: lastFinished, tasks } = MessageV2.latest(msgs)
+          // Calibrate the char heuristic against what the provider actually
+          // charged for the request we estimated last step. Cache reads and
+          // writes count: they are input the model still had to be sent.
+          if (lastEstimate !== undefined && lastFinished) {
+            const actual = lastFinished.tokens.input + lastFinished.tokens.cache.read + lastFinished.tokens.cache.write
+            if (actual > 0) {
+              contextCalibration = { estimated: lastEstimate, actual }
+              remembered.calibration = contextCalibration
+            }
+          }
 
           if (!lastUser) throw new Error("No user message found in stream. This should never happen.")
 
@@ -1149,24 +1368,63 @@ const layer = Layer.effect(
           }
 
           if (task?.type === "compaction") {
+            const owner = msgs.find((message) => message.info.id === task.messageID)
+            if (!owner || owner.info.role !== "user") {
+              throw new Error(`Compaction owner must be a user message: ${task.messageID}`)
+            }
+            autoCompactionAttempts++
             const result = yield* compaction.process({
               messages: msgs,
-              parentID: lastUser.id,
+              parentID: owner.info.id,
               sessionID,
               auto: task.auto,
               overflow: task.overflow,
+              attempt: autoCompactionAttempts,
+              requestOverhead: lastRequestOverhead,
             })
             if (result === "stop") break
             continue
           }
 
-          if (
-            lastFinished &&
-            lastFinished.summary !== true &&
-            (yield* compaction.isOverflow({ tokens: lastFinished.tokens, model }))
-          ) {
-            yield* compaction.create({ sessionID, agent: lastUser.agent, model: lastUser.model, auto: true })
-            continue
+          const recorded = yield* compaction.checkOverflow({
+            tokens: lastFinished?.tokens ?? {
+              input: 0,
+              output: 0,
+              reasoning: 0,
+              cache: { read: 0, write: 0 },
+            },
+            model,
+          })
+          if (recorded.status === "impossible") {
+            const error = new SessionV1.ContextOverflowError({ message: recorded.budget.message }).toObject()
+            const failed = yield* sessions.updateMessage({
+              id: MessageID.ascending(),
+              parentID: lastUser.id,
+              role: "assistant",
+              mode: lastUser.agent,
+              agent: lastUser.agent,
+              variant: lastUser.model.variant,
+              path: { cwd: ctx.directory, root: ctx.worktree },
+              cost: 0,
+              tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+              modelID: model.id,
+              providerID: model.providerID,
+              time: { created: Date.now(), completed: Date.now() },
+              sessionID,
+              finish: "error",
+              error,
+            })
+            yield* events.publish(Session.Event.Error, { sessionID, error: failed.error! })
+            break
+          }
+          if (lastFinished && lastFinished.summary !== true && recorded.overflow) {
+            const manuallyCompacted = msgs.some((message) =>
+              message.parts.some((part) => compactionOf(part)?.native === false),
+            )
+            if (!manuallyCompacted) {
+              yield* compaction.create({ sessionID, agent: lastUser.agent, model: lastUser.model, auto: true })
+              continue
+            }
           }
 
           const agent = yield* agents.get(lastUser.agent)
@@ -1271,6 +1529,77 @@ const layer = Layer.effect(
             ]
             const format = lastUser.format ?? { type: "text" as const }
             if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
+            // The reminder text is volatile (percentage and reclaim target change
+            // as usage climbs) so it must NOT go in the cached `system` prefix —
+            // that would bust the whole prompt cache on the most expensive
+            // (high-context) turns. Deliver it as an ephemeral trailing user
+            // message instead, keeping system + history cacheable.
+            // Suppress on the last step: MAX_STEPS disables tools and demands a
+            // text-only reply, and compaction only takes effect next turn — so a
+            // "call compact_results now" nudge would be both contradictory and
+            // useless there.
+            // Measure the request we are about to send, not the one we sent last
+            // time. Anything the model reclaimed this turn is already reflected,
+            // and so is everything this turn's tool results just added.
+            const suppressed =
+              isLastStep ||
+              flags.disableContextCompaction ||
+              Permission.evaluate("compact_results", "*", agent.permission, session.permission ?? []).action === "deny"
+            // Measuring serialises the whole history, so only pay for it when the
+            // answer can actually be used. Leaving `lastEstimate` unset also keeps
+            // the next step from calibrating a fresh usage figure against a stale
+            // estimate from several steps ago.
+            const live = suppressed
+              ? undefined
+              : liveContextTokens({ system, messages: modelMsgs, tools, observed: contextCalibration })
+            const pressureConfig = live ? yield* config.get() : undefined
+            const pressureUsed = live ? live.used + REQUEST_REMINDER_HEADROOM : 0
+            const pressureBudget = pressureConfig ? usable({ cfg: pressureConfig, model }) : 0
+            const pressure =
+              live &&
+              pressureConfig &&
+              pressureConfig.compaction?.auto !== false &&
+              pressureBudget > 0 &&
+              pressureUsed / pressureBudget >= CONTEXT_PRESSURE_SOFT
+                ? contextPressureReminder({
+                    cfg: pressureConfig,
+                    model,
+                    used: pressureUsed,
+                    messages: msgs,
+                    durableMessages: yield* sessions.messages({ sessionID }).pipe(Effect.orDie),
+                    currentMessageID: msg.id,
+                    ignored: 0,
+                  })
+                : undefined
+            // Candidate identity, generation, and conservative savings are the
+            // reminder clock. Unchanged high-pressure context stays quiet across
+            // both provider steps and completed user-message runs.
+            const progressed =
+              lastAssistant?.parentID === lastUser.id && successfulContextCompaction(lastAssistantMsg)
+            const pressureText =
+              pressure && !progressed && pressure.fingerprint !== remembered.reminder ? pressure.text : undefined
+            if (pressure && (pressureText || progressed)) remembered.reminder = pressure.fingerprint
+            const cachePrefixLimit = stableCachePrefixLimit({
+              messages: msgs,
+              modelMessages: modelMsgs,
+              ephemeralSuffix: isLastStep || pressureText !== undefined,
+            })
+            const requestMessages = [
+              ...modelMsgs,
+              ...(isLastStep ? [{ role: "assistant" as const, content: MAX_STEPS_PROMPT }] : []),
+              ...(pressureText ? [{ role: "user" as const, content: pressureText }] : []),
+            ]
+            lastEstimate = suppressed
+              ? undefined
+              : liveContextTokens({ system, messages: requestMessages, tools, observed: contextCalibration }).estimated
+            remembered.estimate = lastEstimate
+            lastRequestOverhead = estimateRequest({
+              system,
+              messages: [],
+              tools,
+              reminderHeadroom: REQUEST_REMINDER_HEADROOM,
+            })
+            remembered.requestOverhead = lastRequestOverhead
             const result = yield* handle.process({
               user: lastUser,
               agent,
@@ -1278,10 +1607,8 @@ const layer = Layer.effect(
               sessionID,
               parentSessionID: session.parentID,
               system,
-              messages: [
-                ...modelMsgs,
-                ...(isLastStep ? [{ role: "assistant" as const, content: MAX_STEPS_PROMPT }] : []),
-              ],
+              messages: requestMessages,
+              cachePrefixLimit,
               tools,
               model,
               toolChoice: format.type === "json_schema" ? "required" : undefined,
@@ -1295,6 +1622,7 @@ const layer = Layer.effect(
             }
 
             const finished = handle.message.finish && !["tool-calls", "unknown"].includes(handle.message.finish)
+            if (result !== "compact") autoCompactionAttempts = 0
             if (finished && !handle.message.error) {
               // Surface any content-filter finish (e.g. Anthropic stop_reason:
               // refusal) as an error. These turns may have produced no visible
@@ -1337,6 +1665,12 @@ const layer = Layer.effect(
           continue
         }
 
+        // Stale file snapshots are collapsed unconditionally rather than only
+        // under pressure: a read the model has since invalidated is wrong, not
+        // merely expensive, and leaving it in context invites edits against
+        // content that no longer matches disk.
+        if (!flags.disableContextCompaction && (yield* config.get()).compaction?.auto !== false)
+          yield* Superseded.collapse({ sessionID, sessions, directory: ctx.directory }).pipe(Effect.ignore)
         yield* compaction.prune({ sessionID }).pipe(Effect.ignore, Effect.forkIn(scope))
         return yield* lastAssistant(sessionID)
       },

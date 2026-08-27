@@ -418,6 +418,20 @@ function providerMeta(metadata: Record<string, any> | undefined) {
   return Object.keys(rest).length > 0 ? rest : undefined
 }
 
+// A compacted run no longer replays the reasoning items that a stored Responses
+// item ID refers to, so drop item IDs. Keep the other call metadata: Gemini
+// validates the thought signature of every function call in the current turn.
+function withoutItemIDs(metadata: Record<string, any> | undefined) {
+  if (!metadata) return undefined
+  return Object.fromEntries(
+    Object.entries(metadata).map(([key, value]) => {
+      if (!value || typeof value !== "object" || !("itemId" in value)) return [key, value]
+      const { itemId: _, ...rest } = value
+      return [key, rest]
+    }),
+  )
+}
+
 export const toModelMessagesEffect = Effect.fnUntraced(function* (
   input: WithParts[],
   model: Provider.Model,
@@ -721,7 +735,12 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
               input: part.state.input,
               output,
               ...(part.metadata?.providerExecuted ? { providerExecuted: true } : {}),
-              ...(differentModel || (run && !run.native) ? {} : { callProviderMetadata: providerMeta(part.metadata) }),
+              ...(differentModel
+                ? {}
+                : {
+                    callProviderMetadata:
+                      run && !run.native ? withoutItemIDs(providerMeta(part.metadata)) : providerMeta(part.metadata),
+                  }),
             })
           }
           if (part.state.status === "error") {
