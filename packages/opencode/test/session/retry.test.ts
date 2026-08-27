@@ -4,7 +4,8 @@ import { SessionV1 } from "@opencode-ai/core/v1/session"
 import type { NamedError } from "@opencode-ai/core/util/error"
 import { APICallError } from "ai"
 import { setTimeout as sleep } from "node:timers/promises"
-import { Effect, Schedule, Schema } from "effect"
+import { Clock, Duration, Effect, Fiber, Schedule, Schema } from "effect"
+import * as TestClock from "effect/testing/TestClock"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { SessionRetry } from "../../src/session/retry"
 import { MessageV2 } from "../../src/session/message-v2"
@@ -242,6 +243,27 @@ describe("session.retry.retryable", () => {
       }).toObject(),
     )
     expect(SessionRetry.retryable(error, retryProvider)).toEqual({ message: "Request failed" })
+  })
+
+  test("does not retry a classifier rejection whose body also matches a transient pattern", () => {
+    const error = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
+      new SessionV1.APIError({
+        message: "Provider request failed with HTTP 400",
+        isRetryable: false,
+        statusCode: 400,
+        responseBody: JSON.stringify({
+          error: { message: "Output blocked by content filtering policy", request_id: "req_500" },
+        }),
+      }).toObject(),
+    )
+    expect(SessionRetry.retryable(error, retryProvider)).toBeUndefined()
+  })
+
+  test("does not retry a content filter verdict", () => {
+    const error = Schema.decodeUnknownSync(SessionV1.ContentFilterError.Schema)(
+      new SessionV1.ContentFilterError({ message: "Response was blocked by the content filter" }).toObject(),
+    )
+    expect(SessionRetry.retryable(error, retryProvider)).toBeUndefined()
   })
 
   test("retries transport timeout errors", () => {
