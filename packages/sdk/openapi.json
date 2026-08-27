@@ -16435,6 +16435,20 @@
           },
           "metadata": {
             "type": "object"
+          },
+          "compacted": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "compactionGroup": {
+            "type": "string"
+          },
+          "compactionSummary": {
+            "type": "string"
+          },
+          "compactionGeneration": {
+            "type": "integer",
+            "minimum": 0
           }
         },
         "required": ["id", "sessionID", "messageID", "type", "text"],
@@ -16527,6 +16541,20 @@
             },
             "required": ["start"],
             "additionalProperties": false
+          },
+          "compacted": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "compactionGroup": {
+            "type": "string"
+          },
+          "compactionSummary": {
+            "type": "string"
+          },
+          "compactionGeneration": {
+            "type": "integer",
+            "minimum": 0
           }
         },
         "required": ["id", "sessionID", "messageID", "type", "text", "time"],
@@ -16692,6 +16720,20 @@
           },
           "source": {
             "$ref": "#/components/schemas/FilePartSource"
+          },
+          "compacted": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "compactionGroup": {
+            "type": "string"
+          },
+          "compactionSummary": {
+            "type": "string"
+          },
+          "compactionGeneration": {
+            "type": "integer",
+            "minimum": 0
           }
         },
         "required": ["id", "sessionID", "messageID", "type", "mime", "url"],
@@ -16788,6 +16830,16 @@
             "items": {
               "$ref": "#/components/schemas/FilePart"
             }
+          },
+          "compactionGroup": {
+            "type": "string"
+          },
+          "compactionSummary": {
+            "type": "string"
+          },
+          "compactionGeneration": {
+            "type": "integer",
+            "minimum": 0
           }
         },
         "required": ["status", "input", "output", "title", "metadata", "time"],

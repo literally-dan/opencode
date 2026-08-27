@@ -93,6 +93,12 @@ const withEmptyCodeMode = testEffect(
     ],
   ]),
 )
+const withCompactionDisabled = testEffect(
+  LayerNode.compile(root, [
+    [Config.node, configLayer],
+    [RuntimeFlags.node, RuntimeFlags.layer({ disableContextCompaction: true })],
+  ]),
+)
 const withBrokenPlugin = testEffect(LayerNode.compile(root, [...replacements, [Plugin.node, brokenPluginLayer]]))
 
 afterEach(async () => {
@@ -100,6 +106,22 @@ afterEach(async () => {
 })
 
 describe("tool.registry", () => {
+  // One switch for the whole feature. The recovery tools exist only to read back
+  // what compaction replaced, so with compaction off they would cost description
+  // tokens for nothing and still hand every subagent read access to its parent's
+  // transcript.
+  withCompactionDisabled.instance("withholds every history tool when compaction is disabled", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const ids = yield* registry.ids()
+
+      expect(ids).not.toContain("compact_results")
+      expect(ids).not.toContain("compact_bulk")
+      expect(ids).not.toContain("read_part")
+      expect(ids).not.toContain("search_session_history")
+      expect(ids).not.toContain("list_context")
+    }),
+  )
   it.instance("does not expose task_status", () =>
     Effect.gen(function* () {
       const registry = yield* ToolRegistry.Service

@@ -112,6 +112,16 @@ export const TextPart = Schema.Struct({
     }),
   ),
   metadata: Schema.optional(Schema.Record(Schema.String, Schema.Any)),
+  // Model-driven context compaction via the history-compaction tools. Parts
+  // sharing a group are rendered as one run covered by a single summary.
+  // Generation counts how many times the content has been folded: 1 keeps a
+  // per-part marker so the id stays addressable, 2+ is elided into a range
+  // block. `text` is never overwritten, so compaction stays a view over
+  // durable history and un-compacting is just clearing these fields.
+  compacted: Schema.optional(NonNegativeInt),
+  compactionGroup: Schema.optional(Schema.String),
+  compactionSummary: Schema.optional(Schema.String),
+  compactionGeneration: Schema.optional(NonNegativeInt),
 }).annotate({ identifier: "TextPart" })
 export type TextPart = Types.DeepMutable<Schema.Schema.Type<typeof TextPart>>
 
@@ -124,6 +134,16 @@ export const ReasoningPart = Schema.Struct({
     start: NonNegativeInt,
     end: Schema.optional(NonNegativeInt),
   }),
+  // Model-driven context compaction. When set, future turns drop the (signed)
+  // reasoning block entirely and emit a short text breadcrumb in its place —
+  // see message-v2 toModelMessages. Reusing the provider-safe reasoning->text
+  // path means no mismatched-signature block is ever sent, and because `text`
+  // and `metadata` are left intact, un-compacting restores a block whose
+  // signature still matches. Only assistant reasoning is ever marked.
+  compacted: Schema.optional(NonNegativeInt),
+  compactionGroup: Schema.optional(Schema.String),
+  compactionSummary: Schema.optional(Schema.String),
+  compactionGeneration: Schema.optional(NonNegativeInt),
 }).annotate({ identifier: "ReasoningPart" })
 export type ReasoningPart = Types.DeepMutable<Schema.Schema.Type<typeof ReasoningPart>>
 
@@ -175,6 +195,15 @@ export const FilePart = Schema.Struct({
   filename: Schema.optional(Schema.String),
   url: Schema.String,
   source: Schema.optional(FilePartSource),
+  // Media attachments are the single heaviest thing in a context window, so
+  // they are compactable like any other content. Recovery is not lossy: the
+  // url is untouched here, and `read_part` hands the file back as a tool-result
+  // attachment, so the model can see the image again rather than a description
+  // of it.
+  compacted: Schema.optional(NonNegativeInt),
+  compactionGroup: Schema.optional(Schema.String),
+  compactionSummary: Schema.optional(Schema.String),
+  compactionGeneration: Schema.optional(NonNegativeInt),
 }).annotate({ identifier: "FilePart" })
 export type FilePart = Types.DeepMutable<Schema.Schema.Type<typeof FilePart>>
 
@@ -283,9 +312,20 @@ export const ToolStateCompleted = Schema.Struct({
   time: Schema.Struct({
     start: NonNegativeInt,
     end: NonNegativeInt,
+    // Reserved for native age-based tool-output pruning. Manual compaction is
+    // identified by compactionGroup/compactionSummary so sparse selections do
+    // not terminate the native pruning scan.
     compacted: Schema.optional(NonNegativeInt),
   }),
   attachments: Schema.optional(Schema.Array(FilePart)),
+  // Model-authored summary shown in place of this tool output once compacted.
+  // Parts sharing a group render as one run under a single summary; generation
+  // 1 keeps an addressable per-part marker, 2+ is elided into a range block.
+  // `output` and `attachments` are never overwritten, so `read_part` can return
+  // the original bytes and media verbatim.
+  compactionGroup: Schema.optional(Schema.String),
+  compactionSummary: Schema.optional(Schema.String),
+  compactionGeneration: Schema.optional(NonNegativeInt),
 }).annotate({ identifier: "ToolStateCompleted" })
 export type ToolStateCompleted = Types.DeepMutable<Schema.Schema.Type<typeof ToolStateCompleted>>
 

@@ -848,6 +848,7 @@ describe("tool.task", () => {
       expect((yield* jobs.get(started.metadata.sessionId))?.status).toBe("running")
       expect((yield* Effect.promise(() => updated.promise)).parts).toEqual([
         { type: "text", text: "also inspect cancellation" },
+        { type: "text", text: `\n<subagent-context parent-session-id="${context.sessionID}" />` },
       ])
 
       second.resolve()

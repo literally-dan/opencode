@@ -4,6 +4,11 @@ import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { PlanExitTool } from "./plan"
 import { Session } from "@/session/session"
 import { QuestionTool } from "./question"
+import { CompactResultsTool } from "./compact_results"
+import { ReadPartTool } from "./read_part"
+import { SearchSessionHistoryTool } from "./search_session_history"
+import { ListContextTool } from "./list_context"
+import { CompactBulkTool } from "./compact_bulk"
 import { ShellTool } from "./shell"
 import { EditTool } from "./edit"
 import { GlobTool } from "./glob"
@@ -117,6 +122,11 @@ const layer = Layer.effect(
     const agent = yield* Agent.Service
     const codeMode = flags.experimentalCodeMode ? yield* Effect.promise(() => import("./code-mode")) : undefined
     const codeModeTool = codeMode ? yield* codeMode.CodeModeTool : undefined
+    const compactResults = yield* CompactResultsTool
+    const readPart = yield* ReadPartTool
+    const searchSessionHistory = yield* SearchSessionHistoryTool
+    const listContext = yield* ListContextTool
+    const compactBulk = yield* CompactBulkTool
 
     const state = yield* InstanceState.make<State>(
       Effect.fn("ToolRegistry.state")(function* (ctx) {
@@ -224,6 +234,11 @@ const layer = Layer.effect(
           lsp: Tool.init(lsptool),
           plan: Tool.init(plan),
           ...(codeModeTool ? { execute: Tool.init(codeModeTool) } : {}),
+          compact_results: Tool.init(compactResults),
+          read_part: Tool.init(readPart),
+          search_session_history: Tool.init(searchSessionHistory),
+          list_context: Tool.init(listContext),
+          compact_bulk: Tool.init(compactBulk),
         })
 
         return {
@@ -246,6 +261,20 @@ const layer = Layer.effect(
             ...(tool.execute ? [tool.execute] : []),
             ...(flags.experimentalLspTool ? [tool.lsp] : []),
             ...(flags.experimentalPlanMode && flags.client === "cli" ? [tool.plan] : []),
+            // One switch for the whole feature. The recovery tools only exist to
+            // read back what compaction replaced, so shipping them with
+            // compaction off costs description tokens for nothing and hands every
+            // subagent read access to its parent's transcript with nothing to
+            // recover.
+            ...(flags.disableContextCompaction
+              ? []
+              : [
+                  tool.compact_results,
+                  tool.compact_bulk,
+                  tool.read_part,
+                  tool.search_session_history,
+                  tool.list_context,
+                ]),
           ],
           task: tool.task,
           read: tool.read,

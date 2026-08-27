@@ -1,0 +1,21 @@
+Reclaim context by compacting older parts you no longer need in full — completed tool outputs, your own earlier notes (text), or provider-independent reasoning. YOU write a short `summary` that REPLACES the selected group; each part stays recoverable via `read_part`. Put the load-bearing facts (paths, decisions, values, errors, conclusions) in the summary before dropping a part.
+
+compact_results vs compact_bulk: here YOU write the summary inline — best for a few items, or where you want to control the exact wording. Use compact_bulk when a SECONDARY model should summarize a large batch for you.
+
+WHEN TO USE
+
+- Proactively across a long session as work settles: big reads/greps/command dumps you've acted on, settled reasoning, finished sub-tasks.
+- If the conclusion is already in your visible notes, write that conclusion as a short `summary` instead of copying the original content.
+
+WHEN NOT TO USE
+
+- Content you still need verbatim (errors you're debugging, files about to edit, the active plan), the current turn, or anything not yet acted on.
+- A subset of a prior shared compaction group. Multi-member prior groups cannot be safely refolded without atomic grouped persistence and are rejected.
+
+PARAMETERS
+
+- `part_ids`: canonical `prt_…` ids to compact, with at most 200 unique selected parts. Duplicates are ignored; an empty list selects nothing.
+- `select`: compact every eligible part matching all supplied filters. Fields: `types` (["tool","text","reasoning"]), `tools` (e.g. ["read","grep"]), `min_chars`, `before`/`after` (canonical `prt_…` ids), `keep_last` (exclude the most recent N). An empty selector is rejected; empty `types`/`tools` arrays match nothing. Unioned with `part_ids`.
+- summary: one required shared note of at most 4,000 characters. It is rendered once for the visible group, not repeated for every marker.
+
+Get ids from `list_context`, a compacted placeholder, or `search_session_history`. Current/in-flight parts, native session summaries, provider-executed tool results, ambiguous duplicate ids, and unsafe prior groups are protected. A single-member prior group may be refolded when the new note is shorter. The verbatim content stays on disk and recovers via `read_part`. Takes effect next step, not this one.
