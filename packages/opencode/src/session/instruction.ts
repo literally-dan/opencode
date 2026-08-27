@@ -72,6 +72,13 @@ const layer: Layer.Layer<
         Effect.succeed({
           // Track which instruction files have already been attached for a given assistant message.
           claims: new Map<MessageID, Set<string>>(),
+          // Reuse directory lookups within one provider turn without sharing
+          // hits or misses across concurrent turns in the same project.
+          dirFindCache: new Map<MessageID, Map<string, string | undefined>>(),
+          // systemPaths is the heavier of the two lookups — findUp across every
+          // ancestor plus a glob per configured instruction entry — and resolve()
+          // calls it on every read tool call.
+          sysPathsCache: new Map<MessageID, Set<string>>(),
         }),
       ),
     )
@@ -105,6 +112,8 @@ const layer: Layer.Layer<
     const clear = Effect.fn("Instruction.clear")(function* (messageID: MessageID) {
       const s = yield* InstanceState.get(state)
       s.claims.delete(messageID)
+      s.dirFindCache.delete(messageID)
+      s.sysPathsCache.delete(messageID)
     })
 
     const systemPaths = Effect.fn("Instruction.systemPaths")(function* () {
@@ -176,12 +185,33 @@ const layer: Layer.Layer<
       return undefined
     })
 
+    const findForMessage = Effect.fnUntraced(function* (dir: string, messageID: MessageID) {
+      const key = path.resolve(dir)
+      const s = yield* InstanceState.get(state)
+      const existing = s.dirFindCache.get(messageID)
+      const cache = existing ?? new Map<string, string | undefined>()
+      if (!existing) s.dirFindCache.set(messageID, cache)
+      if (cache.has(key)) return cache.get(key)
+      const filepath = yield* find(key)
+      cache.set(key, filepath)
+      return filepath
+    })
+
+    const systemPathsForMessage = Effect.fnUntraced(function* (messageID: MessageID) {
+      const s = yield* InstanceState.get(state)
+      const cached = s.sysPathsCache.get(messageID)
+      if (cached) return cached
+      const paths = yield* systemPaths()
+      s.sysPathsCache.set(messageID, paths)
+      return paths
+    })
+
     const resolve = Effect.fn("Instruction.resolve")(function* (
       messages: SessionV1.WithParts[],
       filepath: string,
       messageID: MessageID,
     ) {
-      const sys = yield* systemPaths()
+      const sys = yield* systemPathsForMessage(messageID)
       const already = extract(messages)
       const results: { filepath: string; content: string }[] = []
       const s = yield* InstanceState.get(state)
@@ -192,7 +222,7 @@ const layer: Layer.Layer<
 
       // Walk upward from the file being read and attach nearby instruction files once per message.
       while (current.startsWith(root) && current !== root) {
-        const found = yield* find(current)
+        const found = yield* findForMessage(current, messageID)
         if (!found || found === target || sys.has(found) || already.has(found)) {
           current = path.dirname(current)
           continue
