@@ -4,9 +4,9 @@ import {
   DescendantFetchError,
   fetchDescendants,
   lookupSessionTreeOwnership,
-  replyPermission,
   resolveSessionTreeOwnership,
 } from "@/cli/cmd/run/tree"
+import { replyPermission } from "@/session/permission-reply"
 
 function client(input: {
   children?: (sessionID: string, signal?: AbortSignal) => Promise<Array<{ id: string; title?: string }>>
@@ -208,6 +208,44 @@ describe("run session tree", () => {
     expect(lookups).toBe(stoppedAt)
   })
 
+  test("cancels a stalled ancestry lookup that ignores abort", async () => {
+    let started: (() => void) | undefined
+    const ready = new Promise<void>((resolve) => {
+      started = resolve
+    })
+    const sdk = client({
+      get: () => {
+        started?.()
+        return new Promise(() => {})
+      },
+    })
+    const controller = new AbortController()
+    const resolving = resolveSessionTreeOwnership(sdk, new Set(["root"]), "leaf", {
+      signal: controller.signal,
+      attempts: 1,
+      timeoutMs: 1_000,
+    })
+
+    await ready
+    controller.abort()
+
+    expect(await resolving).toEqual({ type: "cancelled" })
+  })
+
+  test("times out a stalled ancestry lookup", async () => {
+    const sdk = client({ get: () => new Promise(() => {}) })
+    const started = Date.now()
+    const resolution = await resolveSessionTreeOwnership(sdk, new Set(["root"]), "leaf", {
+      signal: new AbortController().signal,
+      attempts: 1,
+      timeoutMs: 20,
+    })
+
+    expect(resolution.type).toBe("exhausted")
+    if (resolution.type === "exhausted") expect(String(resolution.error)).toContain("timed out after 20ms")
+    expect(Date.now() - started).toBeLessThan(500)
+  })
+
   test("returns foreign only after reaching a known root", async () => {
     const sdk = client({
       get: () => Promise.resolve({ parentID: undefined }),
@@ -279,17 +317,61 @@ describe("run session tree", () => {
     // The server drops pending requests when a session aborts and rejects the
     // cascade itself, so a reply that lost that race must not fail the run.
     const sdk = client({
-      reply: () => Promise.reject({ _tag: "PermissionNotFoundError", requestID: "perm-1", message: "gone" }),
+      reply: () =>
+        Promise.reject(
+          new Error("gone", {
+            cause: {
+              body: { _tag: "PermissionNotFoundError", requestID: "perm-1", message: "gone" },
+              status: 404,
+            },
+          }),
+        ),
     })
 
-    await expect(replyPermission(sdk, { requestID: "perm-1", reply: "once" })).resolves.toBeUndefined()
+    await expect(
+      replyPermission(sdk, {
+        requestID: "perm-1",
+        reply: "once",
+        signal: new AbortController().signal,
+      }),
+    ).resolves.toBeUndefined()
   })
 
-  test("rejects permission reply error envelopes", async () => {
+  test("retries the selected permission reply after a transient failure", async () => {
+    let replies = 0
     const sdk = client({
-      reply: () => Promise.resolve({ error: new Error("reply rejected") }),
+      reply: () => {
+        replies += 1
+        if (replies === 1) return Promise.resolve({ error: new Error("reply failed") })
+        return Promise.resolve({ data: true })
+      },
     })
 
-    await expect(replyPermission(sdk, { requestID: "perm-1", reply: "once" })).rejects.toThrow("reply rejected")
+    await replyPermission(sdk, {
+      requestID: "perm-1",
+      reply: "once",
+      signal: new AbortController().signal,
+    })
+
+    expect(replies).toBe(2)
+  })
+
+  test("stops retrying a stalled permission reply when cancelled", async () => {
+    let attempts = 0
+    const controller = new AbortController()
+    const sdk = client({ reply: () => new Promise(() => {}) })
+    const reply = replyPermission(sdk, {
+      requestID: "perm-1",
+      reply: "once",
+      signal: controller.signal,
+      timeoutMs: 20,
+      onRetry: () => {
+        attempts += 1
+        controller.abort(new Error("stopped"))
+      },
+    })
+
+    await expect(reply).rejects.toThrow("stopped")
+    expect(attempts).toBe(1)
   })
 })

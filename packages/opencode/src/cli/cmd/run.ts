@@ -25,7 +25,8 @@ import { Filesystem } from "@/util/filesystem"
 import { createOpencodeClient, type OpencodeClient, type PermissionRequest, type ToolPart } from "@opencode-ai/sdk/v2"
 import { FormatError, FormatUnknownError } from "../error"
 import { INTERACTIVE_INPUT_ERROR, resolveInteractiveStdin } from "./run/runtime.stdin"
-import { DescendantFetchError, fetchDescendantIDs, replyPermission, resolveSessionTreeOwnership } from "./run/tree"
+import { DescendantFetchError, fetchDescendantIDs, resolveSessionTreeOwnership } from "./run/tree"
+import { replyPermission } from "@/session/permission-reply"
 
 type ModelInput = Parameters<OpencodeClient["session"]["prompt"]>[0]["model"]
 
@@ -733,6 +734,20 @@ export const RunCommand = effectCmd({
           const pendingPermissions = new Map<string, Promise<void>>()
           const seenPermissions = new Set<string>()
 
+          function answerPermission(requestID: string, reply: "once" | "always" | "reject") {
+            return replyPermission(client, {
+              requestID,
+              reply,
+              signal: ancestryAbort.signal,
+              onRetry: (retry) => {
+                if (retry.attempt !== 1 && retry.attempt % 5 !== 0) return
+                UI.error(
+                  `permission reply failed; retrying ${requestID} in ${retry.retryIn}ms (${String(retry.error)})`,
+                )
+              },
+            })
+          }
+
           function routePermission(permission: PermissionRequest) {
             if (seenPermissions.has(permission.id)) return pendingPermissions.get(permission.id)
             seenPermissions.add(permission.id)
@@ -760,17 +775,14 @@ export const RunCommand = effectCmd({
                 // A cycle or deleted parent never resolves, and the server
                 // waits on an untimed deferred, so reject rather than hang.
                 UI.error(`permission ancestry unresolvable for ${permission.id}; rejecting (${String(ownership.error)})`)
-                await replyPermission(client, { requestID: permission.id, reply: "reject" })
+                await answerPermission(permission.id, "reject")
                 return
               }
 
               // Auto-accept/reject behaviour applies to every descendant
               // because they are all part of this run.
               if (auto) {
-                await replyPermission(client, {
-                  requestID: permission.id,
-                  reply: "once",
-                })
+                await answerPermission(permission.id, "once")
                 return
               }
 
@@ -779,11 +791,10 @@ export const RunCommand = effectCmd({
                 UI.Style.TEXT_NORMAL +
                   `permission requested: ${permission.permission} (${permission.patterns.join(", ")}); auto-rejecting`,
               )
-              await replyPermission(client, {
-                requestID: permission.id,
-                reply: "reject",
-              })
+              await answerPermission(permission.id, "reject")
             })().catch((failure) => {
+              seenPermissions.delete(permission.id)
+              if (ancestryAbort.signal.aborted) return
               const message = `failed to route permission ${permission.id}: ${String(failure)}`
               error = error ? error + EOL + message : message
               UI.error(message)
@@ -799,7 +810,10 @@ export const RunCommand = effectCmd({
           // subscription and deduplicate them against events arriving while the
           // list call is in flight.
           const recoverPermissions = async () => {
-            const response = await client.permission.list(undefined, { signal: ancestryAbort.signal })
+            const response = await client.permission.list(undefined, {
+              signal: ancestryAbort.signal,
+              throwOnError: true,
+            })
             await Promise.all((response.data ?? []).map(routePermission))
           }
           const recoveredPermissions = args.attach
@@ -812,8 +826,8 @@ export const RunCommand = effectCmd({
             await recoverPermissions().catch((failure) =>
               UI.error(`failed to finish pending permission recovery (${String(failure)})`),
             )
-            await Promise.allSettled(pendingPermissions.values())
             ancestryAbort.abort()
+            await Promise.allSettled(pendingPermissions.values())
           }
 
           try {
@@ -925,10 +939,9 @@ export const RunCommand = effectCmd({
               }
             }
           } finally {
-            if (!idle) ancestryAbort.abort()
+            if (!idle || !args.attach) ancestryAbort.abort()
             await recoveredPermissions
             await Promise.allSettled(pendingPermissions.values())
-            if (!args.attach) ancestryAbort.abort()
           }
           return error
         }

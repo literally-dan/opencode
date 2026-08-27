@@ -1,3 +1,5 @@
+import { withAbortTimeout } from "@/util/timeout"
+
 // Shared bounded retry for "which session that I own does this descendant
 // belong to" lookups. Both the ACP permission handler and run mode need it, and
 // keeping one implementation stops the two from drifting apart.
@@ -21,6 +23,7 @@ export type Resolution<T> =
 // 100, 200, 400, 800, 1600, 2000, 2000 -> about 7s before giving up. Long enough
 // to ride out a server restart, short enough that a cycle surfaces promptly.
 export const MAX_ATTEMPTS = 8
+export const LOOKUP_TIMEOUT_MS = 5_000
 
 export function retryDelay(attempt: number) {
   return Math.min(100 * 2 ** Math.min(attempt - 1, 4), 2_000)
@@ -31,13 +34,22 @@ export async function resolve<T>(input: {
   lookup: (signal: AbortSignal) => Promise<Ownership<T>>
   onRetry?: (input: { error: unknown; attempt: number; retryIn: number }) => void
   attempts?: number
+  timeoutMs?: number
 }): Promise<Resolution<T>> {
   const attempts = input.attempts ?? MAX_ATTEMPTS
   let last: unknown
   for (let attempt = 1; attempt <= attempts; attempt++) {
     if (input.signal.aborted) return { type: "cancelled" }
-    const ownership = await input.lookup(input.signal)
-    if (input.signal.aborted) return { type: "cancelled" }
+    const timeoutMs = input.timeoutMs ?? LOOKUP_TIMEOUT_MS
+    const ownership = await withAbortTimeout(input.lookup, {
+      signal: input.signal,
+      timeoutMs,
+      label: `session ancestry lookup timed out after ${timeoutMs}ms`,
+    }).then(
+      (result) => result,
+      (error) => (input.signal.aborted ? ({ type: "cancelled" } as const) : ({ type: "unknown", error } as const)),
+    )
+    if (ownership.type === "cancelled") return ownership
     if (ownership.type !== "unknown") return ownership
     last = ownership.error
     if (attempt === attempts) break

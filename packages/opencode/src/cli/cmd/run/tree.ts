@@ -139,12 +139,14 @@ export function resolveSessionTreeOwnership(
     signal: AbortSignal
     onUnknown?: (input: { error: unknown; attempt: number; retryIn: number }) => void
     attempts?: number
+    timeoutMs?: number
   },
 ): Promise<SessionTreeResolution> {
   return SessionAncestry.resolve({
     signal: input.signal,
     onRetry: input.onUnknown,
     attempts: input.attempts,
+    timeoutMs: input.timeoutMs,
     lookup: (signal) => lookupSessionTreeOwnership(sdk, tree, sessionID, signal),
   })
 }
@@ -189,27 +191,4 @@ async function addAncestryToTree(sdk: OpencodeClient, tree: Set<string>, session
     current = result.data.parentID
   }
   return false
-}
-
-export async function replyPermission(
-  sdk: OpencodeClient,
-  input: { requestID: string; reply: "once" | "always" | "reject"; directory?: string },
-) {
-  try {
-    const result: unknown = await sdk.permission.reply(input, { throwOnError: true })
-    if (typeof result === "object" && result !== null && "error" in result && result.error !== undefined) {
-      throw result.error
-    }
-  } catch (error) {
-    // The server drops a pending request when its session is aborted or the
-    // turn tears down, and it also rejects the whole cascade itself. A reply
-    // that lost that race is already answered, so treat it as done rather than
-    // failing the run.
-    if (isPermissionNotFound(error)) return
-    throw error
-  }
-}
-
-function isPermissionNotFound(error: unknown) {
-  return typeof error === "object" && error !== null && "_tag" in error && error._tag === "PermissionNotFoundError"
 }

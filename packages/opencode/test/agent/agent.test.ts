@@ -92,6 +92,15 @@ it.instance("plan agent denies the general subagent by default", () =>
   }),
 )
 
+it.instance("plan agent keeps todowrite available", () =>
+  Effect.gen(function* () {
+    const plan = yield* load((svc) => svc.get("plan"))
+    expect(plan).toBeDefined()
+    expect(evalPerm(plan, "todowrite")).toBe("allow")
+    expect(plan ? Permission.disabled(["todowrite"], plan.permission).has("todowrite") : undefined).toBe(false)
+  }),
+)
+
 it.instance(
   "user permission can allow the general subagent from plan mode",
   () =>

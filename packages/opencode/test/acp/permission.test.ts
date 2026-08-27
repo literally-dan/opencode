@@ -530,17 +530,34 @@ describe("acp permissions", () => {
     expect(harness.replies[0]).toMatchObject({ requestID: "perm_retry_owned", reply: "once" })
   })
 
-  it("rejects an owned permission when the SDK returns a reply error envelope", async () => {
+  it("retries the selected reply when the SDK returns a transient error envelope", async () => {
+    let attempts = 0
     const harness = createHarness({
-      permissionReply: async (params) =>
-        params.reply === "once" ? { error: new Error("reply failed") } : { data: true },
+      permissionReply: async () => {
+        attempts += 1
+        return attempts === 1 ? { error: new Error("reply failed") } : { data: true }
+      },
     })
     await createSession(harness.session, "ses_a")
 
     harness.subscription.handle(permissionAsked("ses_a", "perm_reply_error"))
 
     await pollUntil(() => harness.replies.length === 2, "reply error envelope was not handled")
-    expect(harness.replies.map((item) => item.reply)).toEqual(["once", "reject"])
+    expect(harness.replies.map((item) => item.reply)).toEqual(["once", "once"])
+  })
+
+  it("keeps retrying a permission reply until stopped", async () => {
+    const harness = createHarness({ permissionReply: async () => ({ error: new Error("reply failed") }) })
+    await createSession(harness.session, "ses_a")
+
+    harness.handler.handle(permissionAsked("ses_a", "perm_reply_stalled"))
+    await pollUntil(() => harness.replies.length >= 2, "permission reply was not retried")
+    harness.handler.stop()
+    const stoppedAt = harness.replies.length
+    await Bun.sleep(250)
+
+    expect(harness.replies).toHaveLength(stoppedAt)
+    expect(harness.replies.every((item) => item.reply === "once")).toBe(true)
   })
 
   it("does not let a blocked session A permission block session B message updates", async () => {

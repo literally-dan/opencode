@@ -12,6 +12,7 @@ import { exists, readText } from "@/util/filesystem"
 import type { ACPSession } from "./session"
 import { pendingToolCall, toLocations, type ToolInput } from "./tool"
 import { SessionAncestry } from "@/session/ancestry"
+import { replyPermission } from "@/session/permission-reply"
 import { Effect } from "effect"
 
 type PermissionEvent = Extract<Event, { type: "permission.asked" }>
@@ -100,7 +101,7 @@ export class Handler {
           error: ownership.error,
         }),
       )
-      await this.reply(permission.id, "reject", directory).catch(() => {})
+      await this.reply(permission.id, "reject", signal, directory).catch(() => {})
       return
     }
     const session = ownership.value
@@ -110,8 +111,8 @@ export class Handler {
     // for one displayed session.
     const previous = this.queues.get(session.id) ?? Promise.resolve()
     const next = previous
-      .then(() => (signal.aborted ? undefined : this.process(event, session)))
-      .catch((error) => this.rejectOwnedPermission(event, error, session.cwd))
+      .then(() => (signal.aborted ? undefined : this.process(event, session, signal)))
+      .catch((error) => (signal.aborted ? undefined : this.rejectOwnedPermission(event, error, session.cwd, signal)))
       .finally(() => {
         if (this.queues.get(session.id) === next) {
           this.queues.delete(session.id)
@@ -191,7 +192,7 @@ export class Handler {
     return parentID
   }
 
-  private async process(event: PermissionEvent, session: ACPSession.Info) {
+  private async process(event: PermissionEvent, session: ACPSession.Info, signal: AbortSignal) {
     const permission = event.properties
     // Permissions raised inside a nested subagent carry the deepest
     // session's ID, which the ACP client never explicitly created. Walk
@@ -199,7 +200,7 @@ export class Handler {
     // client knows about; otherwise the deferred on the server never
     // resolves and the nested tool call (including MCP calls) hangs.
     if (!this.input.connection.requestPermission) {
-      await this.reply(permission.id, "reject", session.cwd)
+      await this.reply(permission.id, "reject", signal, session.cwd)
       return
     }
 
@@ -217,7 +218,7 @@ export class Handler {
 
     const reply = selectedReply(result)
     if (reply !== "once" && reply !== "always") {
-      await this.reply(permission.id, "reject", session.cwd)
+      await this.reply(permission.id, "reject", signal, session.cwd)
       return
     }
 
@@ -225,10 +226,10 @@ export class Handler {
       await this.writeProposedEdit(session.id, permission.metadata).catch(() => {})
     }
 
-    await this.reply(permission.id, reply, session.cwd)
+    await this.reply(permission.id, reply, signal, session.cwd)
   }
 
-  private async rejectOwnedPermission(event: PermissionEvent, error: unknown, directory: string) {
+  private async rejectOwnedPermission(event: PermissionEvent, error: unknown, directory: string, signal: AbortSignal) {
     const permission = event.properties
     Effect.runSync(
       Effect.logError("failed to process owned permission request", {
@@ -237,7 +238,7 @@ export class Handler {
         error,
       }),
     )
-    await this.reply(permission.id, "reject", directory).catch((replyError) => {
+    await this.reply(permission.id, "reject", signal, directory).catch((replyError) => {
       Effect.runSync(
         Effect.logError("failed to reject owned permission request", {
           requestID: permission.id,
@@ -248,26 +249,29 @@ export class Handler {
     })
   }
 
-  private async reply(requestID: string, reply: Reply, directory?: string) {
-    try {
-      const result: unknown = await this.input.sdk.permission.reply(
-        {
-          requestID,
-          reply,
-          ...(directory ? { directory } : {}),
-        },
-        { throwOnError: true },
-      )
-      if (typeof result === "object" && result !== null && "error" in result && result.error !== undefined) {
-        throw result.error
-      }
-    } catch (error) {
-      // The server drops a pending request when its session is aborted and
-      // rejects the cascade itself, so a reply that lost that race is already
-      // answered. Nothing left to do.
-      if (isPermissionNotFound(error)) return
-      throw error
-    }
+  private reply(requestID: string, reply: Reply, signal: AbortSignal, directory?: string) {
+    // A permission dialog already answered by the user still gets one bounded
+    // delivery attempt during shutdown; queued dialogs remain cancelled.
+    const finishing = signal.aborted
+    return replyPermission(this.input.sdk, {
+      requestID,
+      reply,
+      directory,
+      signal: finishing ? AbortSignal.timeout(10_000) : signal,
+      maxAttempts: finishing ? 1 : undefined,
+      onRetry: (retry) => {
+        if (retry.attempt !== 1 && retry.attempt % 5 !== 0) return
+        Effect.runSync(
+          Effect.logWarning("permission reply failed; retrying", {
+            requestID,
+            reply,
+            attempt: retry.attempt,
+            retryIn: retry.retryIn,
+            error: retry.error,
+          }),
+        )
+      },
+    })
   }
 
   private async writeProposedEdit(sessionId: string, metadata: ToolInput) {
@@ -287,10 +291,6 @@ export class Handler {
       content: next,
     })
   }
-}
-
-function isPermissionNotFound(error: unknown) {
-  return typeof error === "object" && error !== null && "_tag" in error && error._tag === "PermissionNotFoundError"
 }
 
 async function permissionToolCall(input: {
