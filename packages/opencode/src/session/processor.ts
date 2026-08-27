@@ -125,6 +125,13 @@ interface ProcessorContext extends Input {
   // first, otherwise the truncated output from the failed attempt stays in the
   // transcript alongside its replacement.
   attemptParts: SessionV1.Part["id"][]
+  attemptAccounting:
+    | {
+        finish: SessionV1.Assistant["finish"]
+        cost: SessionV1.Assistant["cost"]
+        tokens: SessionV1.Assistant["tokens"]
+      }
+    | undefined
   request: LLM.StreamInput | undefined
 }
 
@@ -169,6 +176,7 @@ const layer = Layer.effect(
         toolFailed: false,
         toolFailure: yield* Deferred.make<void>(),
         attemptParts: [],
+        attemptAccounting: undefined,
         request: undefined,
       }
       let aborted = false
@@ -637,16 +645,18 @@ const layer = Layer.effect(
           case "provider-error":
             throw new Error(value.message)
 
-          case "step-start":
+          case "step-start": {
             if (!ctx.snapshot) ctx.snapshot = yield* snapshot.track()
-            yield* session.updatePart({
+            const part = yield* session.updatePart({
               id: PartID.ascending(),
               messageID: ctx.assistantMessage.id,
               sessionID: ctx.sessionID,
               snapshot: ctx.snapshot,
               type: "step-start",
             })
+            ctx.attemptParts.push(part.id)
             return
+          }
 
           case "step-finish": {
             const completedSnapshot = yield* snapshot.track()
@@ -659,7 +669,7 @@ const layer = Layer.effect(
             ctx.assistantMessage.finish = value.reason
             ctx.assistantMessage.cost += usage.cost
             ctx.assistantMessage.tokens = usage.tokens
-            yield* session.updatePart({
+            const part = yield* session.updatePart({
               id: PartID.ascending(),
               reason: value.reason,
               snapshot: completedSnapshot,
@@ -669,11 +679,12 @@ const layer = Layer.effect(
               tokens: usage.tokens,
               cost: usage.cost,
             })
+            ctx.attemptParts.push(part.id)
             yield* session.updateMessage(ctx.assistantMessage)
             if (ctx.snapshot) {
               const patch = yield* snapshot.patch(ctx.snapshot)
               if (patch.files.length) {
-                yield* session.updatePart({
+                const part = yield* session.updatePart({
                   id: PartID.ascending(),
                   messageID: ctx.assistantMessage.id,
                   sessionID: ctx.sessionID,
@@ -681,6 +692,7 @@ const layer = Layer.effect(
                   hash: patch.hash,
                   files: patch.files,
                 })
+                ctx.attemptParts.push(part.id)
               }
               ctx.snapshot = undefined
             }
@@ -868,6 +880,25 @@ const layer = Layer.effect(
         yield* session.updateMessage(ctx.assistantMessage)
       })
 
+      const rollbackAttempt = Effect.fn("SessionProcessor.rollbackAttempt")(function* () {
+        yield* Effect.forEach(ctx.attemptParts, (partID) =>
+          session.removePart({
+            sessionID: ctx.assistantMessage.sessionID,
+            messageID: ctx.assistantMessage.id,
+            partID,
+          }),
+        )
+        if (ctx.attemptAccounting) {
+          ctx.assistantMessage.finish = ctx.attemptAccounting.finish
+          ctx.assistantMessage.cost = ctx.attemptAccounting.cost
+          ctx.assistantMessage.tokens = structuredClone(ctx.attemptAccounting.tokens)
+          yield* session.updateMessage(ctx.assistantMessage)
+        }
+        ctx.attemptParts = []
+        ctx.currentText = undefined
+        ctx.reasoningMap = {}
+      })
+
       const halt = Effect.fn("SessionProcessor.halt")(function* (e: unknown) {
         toolController.abort()
         yield* Effect.logError("process", {
@@ -911,19 +942,6 @@ const layer = Layer.effect(
             openToolGeneration,
             (attemptGeneration) =>
               Effect.gen(function* () {
-                // Drop whatever the previous attempt managed to write. The request is
-                // replayed unchanged, so leaving those parts behind would show the
-                // truncated output followed by the full replacement.
-                yield* Effect.forEach(ctx.attemptParts, (partID) =>
-                  session.removePart({
-                    sessionID: ctx.assistantMessage.sessionID,
-                    messageID: ctx.assistantMessage.id,
-                    partID,
-                  }),
-                )
-                ctx.attemptParts = []
-                ctx.currentText = undefined
-                ctx.reasoningMap = {}
                 if (attemptGeneration > 1)
                   yield* toolLock.withPermits(1)(
                     Effect.sync(() => {
@@ -933,6 +951,11 @@ const layer = Layer.effect(
                       settled.clear()
                     }),
                   )
+                ctx.attemptAccounting = {
+                  finish: ctx.assistantMessage.finish,
+                  cost: ctx.assistantMessage.cost,
+                  tokens: structuredClone(ctx.assistantMessage.tokens),
+                }
                 yield* status.set(ctx.sessionID, { type: "busy" })
                 const stream = llm.stream({
                   ...streamInput,
@@ -955,18 +978,22 @@ const layer = Layer.effect(
               schedule: SessionRetry.policy({
                 provider: input.model.providerID,
                 parse,
-                set: (info) => {
-                  return status.set(ctx.sessionID, {
-                    type: "retry",
-                    attempt: info.attempt,
-                    message: info.message,
-                    action: info.action,
-                    next: info.next,
-                  })
-                },
+                set: (info) =>
+                  Effect.gen(function* () {
+                    // Retry status is the observable backoff boundary. Roll back
+                    // first so cancellation during the delay cannot preserve a
+                    // discarded attempt or only reverse part of its accounting.
+                    if (!ctx.executed) yield* Effect.uninterruptible(rollbackAttempt())
+                    yield* status.set(ctx.sessionID, {
+                      type: "retry",
+                      attempt: info.attempt,
+                      message: info.message,
+                      action: info.action,
+                      next: info.next,
+                    })
+                  }),
               }),
-              // Text and reasoning written by a failed attempt are removed before
-              // the next one, but a tool that already ran cannot be undone.
+              // A tool that already ran cannot be undone, so do not replay it.
               while: () => !ctx.executed,
             }),
             Effect.catch((error) => {

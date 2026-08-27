@@ -25,7 +25,7 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
-import { LLMEvent } from "@opencode-ai/llm"
+import { LLMEvent, Usage } from "@opencode-ai/llm"
 import { SessionTools } from "@/session/tools"
 import { ToolRegistry } from "@/tool/registry"
 import { Tool } from "@/tool/tool"
@@ -239,6 +239,55 @@ const fragmentFailureLLM = Layer.succeed(
 )
 const fragmentFailureEnv = LayerNode.compile(root, [...replacements, [LLM.node, fragmentFailureLLM]])
 const itFragmentFailure = testEffect(fragmentFailureEnv)
+
+const discardedUsage = new Usage({ inputTokens: 19, outputTokens: 11, totalTokens: 30 })
+const successfulUsage = new Usage({ inputTokens: 5, outputTokens: 3, totalTokens: 8 })
+
+class RetryAccountingState extends Context.Service<RetryAccountingState, { calls: number }>()(
+  "@test/RetryAccountingState",
+) {}
+
+const retryAccountingState = Layer.effect(
+  RetryAccountingState,
+  Effect.sync(() => RetryAccountingState.of({ calls: 0 })),
+)
+const retryAccountingStateNode = LayerNode.make({
+  service: RetryAccountingState,
+  layer: retryAccountingState,
+  deps: [],
+})
+const retryAccountingLLM = Layer.effect(
+  LLM.Service,
+  Effect.gen(function* () {
+    const state = yield* RetryAccountingState
+    return LLM.Service.of({
+      stream: () => {
+        state.calls++
+        const first = state.calls === 1
+        const events = Stream.make(
+          LLMEvent.stepStart({ index: 0 }),
+          LLMEvent.stepFinish({
+            index: 0,
+            reason: first ? "length" : "stop",
+            usage: first ? discardedUsage : successfulUsage,
+          }),
+        )
+        if (first) return events.pipe(Stream.concat(Stream.make(LLMEvent.providerError({ message: "terminated" }))))
+        return events.pipe(Stream.concat(Stream.make(LLMEvent.finish({ reason: "stop", usage: successfulUsage }))))
+      },
+    })
+  }),
+)
+const retryAccountingLLMNode = LayerNode.make({
+  service: LLM.Service,
+  layer: retryAccountingLLM,
+  deps: [retryAccountingStateNode],
+})
+const retryAccountingEnv = LayerNode.compile(LayerNode.group([root, retryAccountingStateNode]), [
+  ...replacements,
+  [LLM.node, retryAccountingLLMNode],
+])
+const itRetryAccounting = testEffect(retryAccountingEnv)
 
 type RecoveryStateValue = {
   mode: "recovery" | "cleanup" | "retry" | "sibling"
@@ -469,8 +518,10 @@ const recoverySetup = Effect.fn("test.recoverySetup")(function* (root: string) {
       checkpoint: () => Effect.succeed(0),
       retain: () => Effect.succeed(Option.some(Effect.void)),
       admitIfCurrent: (effect) => effect.pipe(Effect.map(Option.some)),
+      admitChild: (_sessionID, effect) => effect.pipe(Effect.map(Option.some)),
       resolvePromptParts: () => Effect.die("unused"),
       prompt: () => Effect.die("unused"),
+      admitNotification: () => Effect.die("unused"),
       notify: () => Effect.void,
     },
   }).pipe(
@@ -1082,6 +1133,194 @@ it.live("session.processor effect tests discard a failed attempt's parts before 
         expect(parts.filter((part) => part.type === "step-start")).toHaveLength(1)
       }),
     { config: (url) => providerCfg(url) },
+  ),
+)
+
+itRetryAccounting.live("session.processor effect tests reverse terminal artifacts and usage before retrying", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+        const events = yield* EventV2Bridge.Service
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "retry accounting")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({
+          assistantMessage: msg,
+          sessionID: chat.id,
+          model: mdl,
+        })
+        yield* Effect.promise(() => Bun.write(path.join(dir, "discarded-attempt.txt"), "discarded"))
+        let patchWritten = false
+        const off = yield* events.listen((event) => {
+          if (event.type !== SessionV1.Event.PartUpdated.type) return Effect.void
+          const data = event.data as typeof SessionV1.Event.PartUpdated.data.Type
+          if (data.sessionID === chat.id && data.part.messageID === msg.id && data.part.type === "patch")
+            patchWritten = true
+          return Effect.void
+        })
+
+        const value = yield* handle.process({
+          user: parent,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "retry accounting" }],
+          tools: {},
+        })
+        yield* off
+
+        const expected = Session.getUsage({ model: mdl, usage: successfulUsage })
+        const parts = yield* MessageV2.parts(msg.id)
+        const aggregate = yield* session.get(chat.id)
+
+        expect(value).toBe("continue")
+        expect(patchWritten).toBe(true)
+        expect(parts.filter((part) => part.type === "step-start")).toHaveLength(1)
+        expect(parts.filter((part) => part.type === "step-finish")).toHaveLength(1)
+        expect(parts.filter((part) => part.type === "patch")).toHaveLength(0)
+        expect(handle.message.finish).toBe("stop")
+        expect(handle.message.cost).toBe(expected.cost)
+        expect(handle.message.tokens).toEqual(expected.tokens)
+        expect(aggregate.cost).toBe(expected.cost)
+        expect(aggregate.tokens).toEqual({
+          input: expected.tokens.input,
+          output: expected.tokens.output,
+          reasoning: expected.tokens.reasoning,
+          cache: expected.tokens.cache,
+        })
+      }),
+    {
+      git: true,
+      config: {
+        ...cfg,
+        provider: {
+          test: {
+            ...cfg.provider.test,
+            models: {
+              "test-model": {
+                ...cfg.provider.test.models["test-model"],
+                cost: { input: 1, output: 2 },
+              },
+            },
+          },
+        },
+      },
+    },
+  ),
+)
+
+itRetryAccounting.live("session.processor effect tests roll back before cancellation during retry backoff", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+        const state = yield* RetryAccountingState
+        const statuses = yield* SessionStatus.Service
+        const events = yield* EventV2Bridge.Service
+        const retryStarted = yield* Deferred.make<void>()
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "cancel retry accounting")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const handle = yield* processors.create({
+          assistantMessage: msg,
+          sessionID: chat.id,
+          model: mdl,
+        })
+        yield* Effect.promise(() => Bun.write(path.join(dir, "discarded-attempt.txt"), "discarded"))
+        let patchWritten = false
+        const off = yield* events.listen((event) => {
+          if (event.type === SessionV1.Event.PartUpdated.type) {
+            const data = event.data as typeof SessionV1.Event.PartUpdated.data.Type
+            if (data.sessionID === chat.id && data.part.messageID === msg.id && data.part.type === "patch") {
+              patchWritten = true
+            }
+            return Effect.void
+          }
+          if (event.type !== SessionStatus.Event.Status.type) return Effect.void
+          const data = event.data as typeof SessionStatus.Event.Status.data.Type
+          if (data.sessionID !== chat.id || data.status.type !== "retry") return Effect.void
+          return Deferred.succeed(retryStarted, undefined).pipe(Effect.asVoid)
+        })
+
+        const run = yield* handle
+          .process({
+            user: parent,
+            sessionID: chat.id,
+            model: mdl,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "cancel retry accounting" }],
+            tools: {},
+          })
+          .pipe(Effect.forkChild)
+
+        yield* Deferred.await(retryStarted)
+        yield* waitFor(
+          statuses.get(chat.id).pipe(Effect.map((status) => (status.type === "retry" ? true : undefined))),
+          "retry status was not stored",
+        )
+        yield* Effect.yieldNow
+        expect(state.calls).toBe(1)
+        yield* Fiber.interrupt(run)
+        const exit = yield* Fiber.await(run)
+        yield* off
+
+        const parts = yield* MessageV2.parts(msg.id)
+        const stored = yield* MessageV2.get({ sessionID: chat.id, messageID: msg.id })
+        const aggregate = yield* session.get(chat.id)
+        const emptyTokens = {
+          total: 0,
+          input: 0,
+          output: 0,
+          reasoning: 0,
+          cache: { read: 0, write: 0 },
+        }
+
+        expect(Exit.isFailure(exit)).toBe(true)
+        if (Exit.isFailure(exit)) expect(Cause.hasInterruptsOnly(exit.cause)).toBe(true)
+        expect(patchWritten).toBe(true)
+        expect(state.calls).toBe(1)
+        expect(parts.filter((part) => part.type === "step-start")).toHaveLength(0)
+        expect(parts.filter((part) => part.type === "step-finish")).toHaveLength(0)
+        expect(parts.filter((part) => part.type === "patch")).toHaveLength(0)
+        expect(handle.message.finish).toBe("end_turn")
+        expect(handle.message.cost).toBe(0)
+        expect(handle.message.tokens).toEqual(emptyTokens)
+        expect(stored.info.role).toBe("assistant")
+        if (stored.info.role === "assistant") {
+          expect(stored.info.finish).toBe("end_turn")
+          expect(stored.info.cost).toBe(0)
+          expect(stored.info.tokens).toEqual(emptyTokens)
+        }
+        expect(aggregate.cost).toBe(0)
+        expect(aggregate.tokens).toEqual({
+          input: 0,
+          output: 0,
+          reasoning: 0,
+          cache: { read: 0, write: 0 },
+        })
+      }),
+    {
+      git: true,
+      config: {
+        ...cfg,
+        provider: {
+          test: {
+            ...cfg.provider.test,
+            models: {
+              "test-model": {
+                ...cfg.provider.test.models["test-model"],
+                cost: { input: 1, output: 2 },
+              },
+            },
+          },
+        },
+      },
+    },
   ),
 )
 
