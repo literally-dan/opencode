@@ -1,10 +1,14 @@
 import { describe, expect, test } from "bun:test"
+import type { PermissionRequest, Session } from "@opencode-ai/sdk/v2/client"
+import { autoRespondsPermission } from "@/context/permission-auto-respond"
+import { sessionPermissionRequest } from "@/pages/session/composer/session-request-tree"
 import { createApiForServer, createSdkForServer } from "./server"
 import { createCompatibleApi } from "./server-compat"
+import { normalizeSessionInfo } from "./session"
 
 function setup(
   protocol: "v1" | "v2" | Promise<"v1" | "v2">,
-  responses?: { vcs?: { branch: string; default_branch: string } },
+  responses?: { vcs?: { branch: string; default_branch: string }; sessions?: Session[] },
 ) {
   const requests: Request[] = []
   const fetcher = Object.assign(
@@ -37,6 +41,8 @@ function setup(
       }
       if (request.method === "GET" && new URL(request.url).pathname === "/vcs")
         return Response.json(responses?.vcs ?? {})
+      const session = responses?.sessions?.find((item) => new URL(request.url).pathname === `/session/${item.id}`)
+      if (request.method === "GET" && session) return Response.json(session)
       if (request.method === "GET") return Response.json([])
       return new Response(undefined, { status: 204 })
     },

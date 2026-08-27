@@ -23,6 +23,7 @@ import { SessionInputTable, SessionMessageTable, SessionTable } from "@opencode-
 import { testEffect } from "./lib/effect"
 import { Snapshot } from "@opencode-ai/core/snapshot"
 import { Location } from "@opencode-ai/core/location"
+import { SessionV1 } from "@opencode-ai/core/v1/session"
 
 const it = testEffect(AppNodeBuilder.build(LayerNode.group([Database.node, EventV2.node, SessionProjector.node])))
 const sessionsLayer = AppNodeBuilder.build(SessionV2.node, [[SessionExecution.node, SessionExecution.noopLayer]])
@@ -45,6 +46,67 @@ const assistantRow = (
 }
 
 describe("SessionProjector", () => {
+  it.effect("preserves the first Task owner across concurrent stale updates", () =>
+    Effect.gen(function* () {
+      const { db } = yield* Database.Service
+      const events = yield* EventV2.Service
+      const ownerID = SessionV2.ID.make("ses_task_owner")
+      const otherID = SessionV2.ID.make("ses_other_owner")
+      const info = SessionV1.SessionInfo.make({
+        id: sessionID,
+        projectID: Project.ID.global,
+        parentID: ownerID,
+        slug: "test",
+        directory: "/project",
+        title: "test",
+        version: "test",
+        time: { created: 0, updated: 0 },
+      })
+      yield* db
+        .insert(ProjectTable)
+        .values({ id: Project.ID.global, worktree: AbsolutePath.make("/project"), sandboxes: [] })
+        .run()
+        .pipe(Effect.orDie)
+      yield* db
+        .insert(SessionTable)
+        .values({
+          id: sessionID,
+          project_id: Project.ID.global,
+          parent_id: ownerID,
+          slug: "test",
+          directory: "/project",
+          title: "test",
+          version: "test",
+        })
+        .run()
+        .pipe(Effect.orDie)
+
+      yield* events.publish(SessionV1.Event.Updated, {
+        sessionID,
+        info: { ...info, taskParentID: ownerID },
+      })
+      yield* Effect.all(
+        [
+          events.publish(SessionV1.Event.Updated, { sessionID, info: { ...info, title: "stale" } }),
+          events.publish(SessionV1.Event.Updated, {
+            sessionID,
+            info: { ...info, title: "conflicting", taskParentID: otherID },
+          }),
+        ],
+        { concurrency: "unbounded", discard: true },
+      )
+
+      expect(
+        yield* db
+          .select({ taskParentID: SessionTable.task_parent_id })
+          .from(SessionTable)
+          .where(eq(SessionTable.id, sessionID))
+          .get()
+          .pipe(Effect.orDie),
+      ).toEqual({ taskParentID: ownerID })
+    }),
+  )
+
   it.effect("projects moved sessions without the transitional context epoch table", () =>
     Effect.gen(function* () {
       const { db } = yield* Database.Service

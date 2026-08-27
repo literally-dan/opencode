@@ -10,6 +10,8 @@ import { DatabaseMigration } from "@opencode-ai/core/database/migration"
 import { migrations } from "@opencode-ai/core/database/migration.gen"
 import workspaceNameMigration from "@opencode-ai/core/database/migration/20260410174513_workspace-name"
 import sessionListIndexesMigration from "@opencode-ai/core/database/migration/20260724103001_session_list_indexes"
+import sessionTaskParentMigration from "@opencode-ai/core/database/migration/20260827164832_session_task_parent"
+import sessionRootIndexMigration from "@opencode-ai/core/database/migration/20261001220119_session_root_index"
 import sessionUsageMigration from "@opencode-ai/core/database/migration/20260510033149_session_usage"
 import normalizeStoragePathsMigration from "@opencode-ai/core/database/migration/20260601010001_normalize_storage_paths"
 import sessionMessageProjectionOrderMigration from "@opencode-ai/core/database/migration/20260603040000_session_message_projection_order"
@@ -195,7 +197,11 @@ describe("DatabaseMigration", () => {
       Effect.gen(function* () {
         const db = yield* makeDb
         yield* legacySessionTable(db)
-        yield* DatabaseMigration.applyOnly(db, [sessionListIndexesMigration])
+        yield* DatabaseMigration.applyOnly(db, [
+          sessionListIndexesMigration,
+          sessionTaskParentMigration,
+          sessionRootIndexMigration,
+        ])
         return yield* sessionIndexes(db)
       }),
     )
@@ -228,6 +234,31 @@ describe("DatabaseMigration", () => {
         // the ORDER BY reverses both columns uniformly. A temp B-tree here means
         // the index no longer matches the query and the scan is back.
         expect(plan).not.toContain("TEMP B-TREE")
+      }),
+    )
+  })
+
+  test("serves the root session list of a project from session_root_idx", async () => {
+    await run(
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        yield* DatabaseMigration.apply(db)
+
+        // Matches Session.listByProject with `roots`. Most rows of a project are child sessions, so an index that
+        // also holds them makes this list read every child row.
+        const plan = (yield* db.all<{ detail: string }>(
+          sql`EXPLAIN QUERY PLAN select * from "session" where (("session"."project_id" = 'p') and (("session"."parent_id" is null))) order by "session"."time_updated" desc limit 100`,
+        ))
+          .map((row) => row.detail)
+          .join("\n")
+
+        expect(plan).toContain("session_root_idx")
+        expect(plan).not.toContain("TEMP B-TREE")
+        expect(
+          yield* db.get<{ sql: string }>(sql`SELECT sql FROM sqlite_master WHERE name = 'session_root_idx'`),
+        ).toEqual({
+          sql: "CREATE INDEX `session_root_idx` ON `session` (`project_id`,`time_updated`) WHERE parent_id is null",
+        })
       }),
     )
   })

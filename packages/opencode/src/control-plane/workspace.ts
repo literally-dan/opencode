@@ -565,6 +565,7 @@ const layer = Layer.effect(
           .get()
           .pipe(Effect.orDie)
 
+        if (current && !current.workspaceID) yield* prompt.cancel(input.sessionID)
         if (current?.workspaceID) {
           const previous = yield* get(current.workspaceID)
           if (previous) {

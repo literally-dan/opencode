@@ -345,6 +345,57 @@ describe("opencode run (non-interactive subprocess)", () => {
     60_000,
   )
 
+  cliIt.concurrent(
+    "waits for background task results before exiting",
+    ({ llm, opencode }) =>
+      Effect.gen(function* () {
+        // Release the child only after the root turn that launched it has been answered,
+        // so the run must stay attached until the background result is delivered.
+        const rootTurnAnswered = Effect.runPromise(
+          pollWithTimeout(
+            llm.hits.pipe(
+              Effect.map((hits) =>
+                hits.some((hit) => JSON.stringify(hit.body).includes("Background task started")) ? true : undefined,
+              ),
+            ),
+            "root turn never reported the background task start",
+            "30 seconds",
+          ).pipe(Effect.andThen(Effect.sleep("1 second")), Effect.ignore),
+        )
+        yield* llm.pushMatch(
+          (hit) => JSON.stringify(hit.body).includes("delegate in the background"),
+          reply().tool("task", {
+            description: "inspect bug",
+            prompt: "Inspect the background path.",
+            subagent_type: "general",
+          }),
+        )
+        yield* llm.pushMatch(
+          (hit) => JSON.stringify(hit.body).includes("subagent-context parent-session-id="),
+          reply().wait(rootTurnAnswered).text("child result").stop(),
+        )
+        yield* llm.textMatch((hit) => JSON.stringify(hit.body).includes("Background task started"), "launched")
+        yield* llm.textMatch(
+          (hit) => JSON.stringify(hit.body).includes("Background task completed"),
+          "final answer after background task",
+        )
+
+        const result = yield* opencode.run("delegate in the background", {
+          timeoutMs: 45_000,
+          env: {
+            OPENCODE_CONFIG_CONTENT: JSON.stringify({
+              ...testProviderConfig(llm.url),
+              permission: { task: "allow" },
+            }),
+          },
+        })
+
+        opencode.expectExit(result, 0)
+        expect(result.stdout).toBe("launched\nfinal answer after background task\n")
+      }),
+    60_000,
+  )
+
   cliIt.live(
     "attach mode recovers permissions pending before subscription",
     ({ home, llm, opencode }) =>
@@ -367,16 +418,9 @@ describe("opencode run (non-interactive subprocess)", () => {
         const sdk = createOpencodeClient({ baseUrl: server.url, directory: home })
         const root = yield* Effect.promise(() => sdk.session.create({ title: "root" }))
         if (!root.data) return yield* Effect.fail(new Error("failed to create root session"))
-        const child = yield* Effect.promise(() =>
-          sdk.session.create({
-            title: "child",
-            parentID: root.data.id,
-          }),
-        )
-        if (!child.data) return yield* Effect.fail(new Error("failed to create child session"))
         const admission = yield* Effect.promise(() =>
           sdk.session.promptAsync({
-            sessionID: child.data.id,
+            sessionID: root.data.id,
             agent: "build",
             model: { providerID: "test", modelID: "test-model" },
             parts: [{ type: "text", text: "create the marker" }],
@@ -386,9 +430,9 @@ describe("opencode run (non-interactive subprocess)", () => {
 
         yield* pollWithTimeout(
           Effect.promise(() => sdk.permission.list()).pipe(
-            Effect.map((response) => response.data?.find((permission) => permission.sessionID === child.data.id)),
+            Effect.map((response) => response.data?.find((permission) => permission.sessionID === root.data.id)),
           ),
-          "child permission never became pending",
+          "root permission never became pending",
           "15 seconds",
         )
 

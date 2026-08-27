@@ -1,13 +1,55 @@
 import { test, expect } from "bun:test"
+import type { Session as SDKSession } from "@opencode-ai/sdk/v2"
+import { Database } from "@opencode-ai/core/database/database"
+import { ProjectV2 } from "@opencode-ai/core/project"
+import { ProjectTable } from "@opencode-ai/core/project/sql"
+import { AbsolutePath } from "@opencode-ai/core/schema"
+import { SessionTable } from "@opencode-ai/core/session/sql"
+import { eq } from "drizzle-orm"
+import { Effect } from "effect"
 import {
   formatImportFileError,
   parseShareUrl,
   shouldAttachShareAuthHeaders,
   transformShareData,
+  upsertImportedSession,
   type ShareData,
 } from "../../src/cli/cmd/import"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { PlatformError } from "effect"
+import { SessionID } from "../../src/session/schema"
+import { testEffect } from "../lib/effect"
+
+const it = testEffect(Database.layerFromPath(":memory:"))
+
+function importedSession(input: { id: string; parentID?: string; taskParentID?: string }): SDKSession {
+  return {
+    id: input.id,
+    slug: input.id,
+    projectID: ProjectV2.ID.global,
+    directory: "/source",
+    ...(input.parentID === undefined ? {} : { parentID: input.parentID }),
+    ...(input.taskParentID === undefined ? {} : { taskParentID: input.taskParentID }),
+    title: "Imported session",
+    version: "test",
+    time: { created: 1, updated: 1 },
+  }
+}
+
+const importLocation = {
+  projectID: ProjectV2.ID.global,
+  directory: "/target",
+  worktree: "/target",
+}
+
+const ensureProject = Database.Service.use(({ db }) =>
+  db
+    .insert(ProjectTable)
+    .values({ id: ProjectV2.ID.global, worktree: AbsolutePath.make("/target"), sandboxes: [] })
+    .onConflictDoNothing()
+    .run()
+    .pipe(Effect.orDie),
+)
 
 test("formats import file errors", () => {
   expect(
@@ -88,3 +130,54 @@ test("returns null for invalid share data", () => {
   expect(transformShareData([{ type: "message", data: {} as any }])).toBeNull()
   expect(transformShareData([{ type: "session", data: { id: "s" } as any }])).toBeNull() // no messages
 })
+
+it.live("strips Task ownership from a new imported session", () =>
+  Effect.gen(function* () {
+    yield* ensureProject
+    const { db } = yield* Database.Service
+    const id = SessionID.descending()
+    const parentID = SessionID.descending()
+
+    yield* upsertImportedSession({
+      info: importedSession({ id, parentID, taskParentID: parentID }),
+      ...importLocation,
+    })
+
+    const row = yield* db
+      .select({ parentID: SessionTable.parent_id, taskParentID: SessionTable.task_parent_id })
+      .from(SessionTable)
+      .where(eq(SessionTable.id, id))
+      .get()
+      .pipe(Effect.orDie)
+    expect(row).toEqual({ parentID, taskParentID: null })
+  }),
+)
+
+it.live("preserves an existing Task owner during an import conflict", () =>
+  Effect.gen(function* () {
+    yield* ensureProject
+    const { db } = yield* Database.Service
+    const id = SessionID.descending()
+    const ownerID = SessionID.descending()
+
+    yield* upsertImportedSession({ info: importedSession({ id }), ...importLocation })
+    yield* db
+      .update(SessionTable)
+      .set({ parent_id: ownerID, task_parent_id: ownerID })
+      .where(eq(SessionTable.id, id))
+      .run()
+      .pipe(Effect.orDie)
+    yield* upsertImportedSession({
+      info: importedSession({ id, parentID: SessionID.descending(), taskParentID: SessionID.descending() }),
+      ...importLocation,
+    })
+
+    const row = yield* db
+      .select({ parentID: SessionTable.parent_id, taskParentID: SessionTable.task_parent_id })
+      .from(SessionTable)
+      .where(eq(SessionTable.id, id))
+      .get()
+      .pipe(Effect.orDie)
+    expect(row).toEqual({ parentID: ownerID, taskParentID: ownerID })
+  }),
+)

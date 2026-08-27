@@ -58,10 +58,12 @@ function mime(uri: string) {
   return match?.[1] ?? "application/octet-stream"
 }
 
-function sessionInfo(session: Session): SessionInfo {
+// V2 SessionInfo has no taskParentID. Keep the V1 value so fetched Task children still match isTaskChild.
+function sessionInfo(session: Session): SessionInfo & Pick<Session, "taskParentID"> {
   return {
     id: session.id,
     parentID: session.parentID,
+    taskParentID: session.taskParentID,
     projectID: session.projectID,
     agent: session.agent,
     model: session.model && {

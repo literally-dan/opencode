@@ -1,8 +1,8 @@
 {
   "version": "7",
   "dialect": "sqlite",
-  "id": "40d5fbe0-94c3-434a-8751-a3e796d88d57",
-  "prevIds": ["f14a9b18-8207-487e-a3d3-227e629ba9ad"],
+  "id": "c8051cb2-1e9d-4979-bd04-542341878554",
+  "prevIds": ["40d5fbe0-94c3-434a-8751-a3e796d88d57"],
   "ddl": [
     {
       "name": "workspace",
@@ -1102,6 +1102,16 @@
     },
     {
       "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "task_parent_id",
+      "entityType": "columns",
+      "table": "session"
+    },
+    {
+      "type": "text",
       "notNull": true,
       "autoincrement": false,
       "default": null,
@@ -2061,6 +2071,20 @@
       "where": null,
       "origin": "manual",
       "name": "session_parent_idx",
+      "entityType": "indexes",
+      "table": "session"
+    },
+    {
+      "columns": [
+        {
+          "value": "task_parent_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "session_task_parent_idx",
       "entityType": "indexes",
       "table": "session"
     },

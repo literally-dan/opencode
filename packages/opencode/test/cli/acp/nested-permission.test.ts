@@ -22,8 +22,8 @@ describe("acp nested permissions", () => {
           env: {
             OPENCODE_CONFIG_CONTENT: JSON.stringify({
               ...verifierConfig(llm.url),
-              // Required: the default of 1 stops the child from delegating, so
-              // the write permission would come from the child and the test would
+              // Pins the current default of 2 so the child can delegate. At depth 1
+              // the write permission would come from the child, and the test would
               // pass on depth-1 routing without ever reaching a grandchild.
               subagent_depth: 2,
               permission: { task: "allow", edit: "ask" },

@@ -348,7 +348,7 @@ function textDelta(messageID: string, partID: string, delta: string, sessionID =
   }
 }
 
-function child(id: string): SessionChild {
+function session(id: string): SessionChild {
   return {
     id,
     slug: id,
@@ -360,6 +360,15 @@ function child(id: string): SessionChild {
       created: 1,
       updated: 1,
     },
+  }
+}
+
+function child(id: string, parentID = "session-1", input: Partial<SessionChild> = {}): SessionChild {
+  return {
+    ...session(id),
+    parentID,
+    taskParentID: parentID,
+    ...input,
   }
 }
 
@@ -421,6 +430,7 @@ function sdk(
     globalEvent?: OpencodeClient["global"]["event"]
     promptAsync?: OpencodeClient["session"]["promptAsync"]
     status?: OpencodeClient["session"]["status"]
+    get?: OpencodeClient["session"]["get"]
     messages?: OpencodeClient["session"]["messages"]
     children?: OpencodeClient["session"]["children"]
     permissions?: OpencodeClient["permission"]["list"]
@@ -434,6 +444,7 @@ function sdk(
     input.globalEvent ?? (() => globalSse(input.globalStream ?? wrapGlobalStream(input.stream ?? emptyStream())))
   const promptAsync: OpencodeClient["session"]["promptAsync"] = input.promptAsync ?? (() => ok(undefined))
   const status: OpencodeClient["session"]["status"] = input.status ?? (() => ok({}))
+  const get: OpencodeClient["session"]["get"] = input.get ?? (({ sessionID }) => ok(session(sessionID)))
   const messages: OpencodeClient["session"]["messages"] = input.messages ?? (() => ok([]))
   const children: OpencodeClient["session"]["children"] = input.children ?? (() => ok([]))
   const permissions: OpencodeClient["permission"]["list"] = input.permissions ?? (() => ok([]))
@@ -443,6 +454,7 @@ function sdk(
   spyOn(client.global, "event").mockImplementation(globalEvent)
   spyOn(client.session, "promptAsync").mockImplementation(promptAsync)
   spyOn(client.session, "status").mockImplementation(status)
+  spyOn(client.session, "get").mockImplementation(get)
   spyOn(client.session, "messages").mockImplementation(messages)
   spyOn(client.session, "children").mockImplementation(children)
   spyOn(client.permission, "list").mockImplementation(permissions)
@@ -1286,6 +1298,42 @@ describe("run stream transport", () => {
     }
   })
 
+  test("does not bootstrap blockers from a parent-only child", async () => {
+    const src = eventFeed()
+    const ui = footer()
+    const transport = await createSessionTransport({
+      sdk: sdk({
+        stream: src.stream,
+        children: async () => ok([child("history-1", "session-1", { taskParentID: undefined })]),
+        permissions: async () =>
+          ok([
+            {
+              id: "perm-history",
+              sessionID: "history-1",
+              permission: "edit",
+              patterns: ["src/history.ts"],
+              metadata: {},
+              always: [],
+            },
+          ]),
+      }),
+      sessionID: "session-1",
+      thinking: true,
+      limits: () => ({}),
+      footer: ui.api,
+    })
+
+    try {
+      const item = ui.events.findLast((event) => event.type === "stream.subagent")
+      const state = item?.type === "stream.subagent" ? item.state : undefined
+      expect(state?.tabs).toEqual([])
+      expect(state?.permissions).toEqual([])
+    } finally {
+      src.close()
+      await transport.close()
+    }
+  })
+
   test("bootstraps blockers from a grandchild session", async () => {
     const src = eventFeed()
     const ui = footer()
@@ -1294,7 +1342,7 @@ describe("run stream transport", () => {
         stream: src.stream,
         children: async ({ sessionID }) => {
           if (sessionID === "session-1") return ok([child("child-1")])
-          if (sessionID === "child-1") return ok([child("grandchild-1")])
+          if (sessionID === "child-1") return ok([child("grandchild-1", "child-1")])
           return ok([])
         },
         permissions: async () =>

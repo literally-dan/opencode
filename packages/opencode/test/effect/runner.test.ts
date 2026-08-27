@@ -464,6 +464,35 @@ describe("Runner", () => {
   )
 
   it.live(
+    "keeps finalization busy and queues wakes while onIdle is blocked",
+    Effect.gen(function* () {
+      const s = yield* Scope.Scope
+      const idleStarted = yield* Deferred.make<void>()
+      const releaseIdle = yield* Deferred.make<void>()
+      const secondStarted = yield* Deferred.make<void>()
+      const runner = Runner.make<string>(s, {
+        onIdle: Deferred.succeed(idleStarted, undefined).pipe(Effect.andThen(Deferred.await(releaseIdle))),
+      })
+
+      const first = yield* runner.wake(Effect.succeed("first")).pipe(Effect.forkChild)
+      yield* Deferred.await(idleStarted).pipe(Effect.timeout("250 millis"))
+      expect(runner.state._tag).toBe("Finalizing")
+      expect(runner.busy).toBe(true)
+
+      const second = yield* runner
+        .wake(Deferred.succeed(secondStarted, undefined).pipe(Effect.as("second")))
+        .pipe(Effect.forkChild)
+      yield* waitForState(runner, "FinalizingThenRun")
+      expect(yield* Deferred.isDone(secondStarted)).toBe(false)
+
+      yield* Deferred.succeed(releaseIdle, undefined)
+      expect(yield* Fiber.join(first)).toBe("first")
+      expect(yield* Fiber.join(second)).toBe("second")
+      expect(runner.state._tag).toBe("Idle")
+    }),
+  )
+
+  it.live(
     "onBusy fires when shell starts",
     Effect.gen(function* () {
       const s = yield* Scope.Scope
@@ -492,6 +521,32 @@ describe("Runner", () => {
       yield* Deferred.succeed(gate, undefined)
       yield* Fiber.await(fiber)
       expect(runner.busy).toBe(false)
+    }),
+  )
+
+  it.live(
+    "wake queues one follow-up run and coalesces later wakes",
+    Effect.gen(function* () {
+      const s = yield* Scope.Scope
+      const runner = Runner.make<string>(s)
+      const gate = yield* Deferred.make<void>()
+      const calls = yield* Ref.make(0)
+
+      const active = yield* runner.ensureRunning(Deferred.await(gate).pipe(Effect.as("first"))).pipe(Effect.forkChild)
+      yield* waitForState(runner, "Running")
+      const wake = yield* runner
+        .wake(Ref.update(calls, (count) => count + 1).pipe(Effect.as("second")))
+        .pipe(Effect.forkChild)
+      yield* waitForState(runner, "RunningThenRun")
+      const coalesced = yield* runner.wake(Effect.die("coalesced wake should not run")).pipe(Effect.forkChild)
+      yield* Effect.yieldNow
+
+      yield* Deferred.succeed(gate, undefined)
+      expect(yield* Fiber.join(active)).toBe("first")
+      expect(yield* Fiber.join(wake)).toBe("second")
+      expect(yield* Fiber.join(coalesced)).toBe("second")
+      expect(yield* Ref.get(calls)).toBe(1)
+      expect(runner.state._tag).toBe("Idle")
     }),
   )
 

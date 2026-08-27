@@ -1,4 +1,6 @@
 import { base64Encode } from "@opencode-ai/core/util/encode"
+import type { Session } from "@opencode-ai/sdk/v2/client"
+import { isTaskChild } from "@/utils/task-session"
 
 export function acceptKey(sessionID: string, directory?: string) {
   if (!directory) return sessionID
@@ -19,19 +21,18 @@ export function isDirectoryAutoAccepting(autoAccept: Record<string, boolean>, di
   return autoAccept[key] ?? false
 }
 
-function sessionLineage(session: { id: string; parentID?: string }[], sessionID: string) {
-  const parent = session.reduce((acc, item) => {
-    if (item.parentID) acc.set(item.id, item.parentID)
-    return acc
-  }, new Map<string, string>())
+function sessionLineage(session: Session[], sessionID: string) {
+  const sessions = new Map(session.map((item) => [item.id, item]))
   const seen = new Set([sessionID])
   const ids = [sessionID]
 
   for (const id of ids) {
-    const parentID = parent.get(id)
-    if (!parentID || seen.has(parentID)) continue
-    seen.add(parentID)
-    ids.push(parentID)
+    const child = sessions.get(id)
+    if (!child?.parentID || seen.has(child.parentID)) continue
+    const parent = sessions.get(child.parentID)
+    if (!parent || !isTaskChild(parent, child)) continue
+    seen.add(parent.id)
+    ids.push(parent.id)
   }
 
   return ids
@@ -39,7 +40,7 @@ function sessionLineage(session: { id: string; parentID?: string }[], sessionID:
 
 export function autoRespondsPermission(
   autoAccept: Record<string, boolean>,
-  session: { id: string; parentID?: string }[],
+  session: Session[],
   permission: { sessionID: string },
   directory?: string,
 ) {
@@ -50,7 +51,7 @@ export function autoRespondsPermission(
 
 export function sessionAutoAccept(
   autoAccept: Record<string, boolean>,
-  session: { id: string; parentID?: string }[],
+  session: Session[],
   permission: { sessionID: string },
   directory?: string,
 ) {

@@ -29,8 +29,8 @@ export const Info = Schema.Struct({
   // Some command templates are lazy promises from MCP prompt resolution.
   template: Schema.Unknown,
   subtask: Schema.optional(Schema.Boolean),
-  // Only meaningful with `subtask`: dispatch the subtask as a background job so
-  // the calling session stays idle and is notified when the subagent finishes.
+  // Only meaningful with `subtask`: dispatch the subtask as a background job. The calling
+  // session stays busy until the result is delivered, but the user can still prompt it.
   background: Schema.optional(Schema.Boolean),
   hints: Schema.Array(Schema.String),
 }).annotate({ identifier: "Command" })

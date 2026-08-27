@@ -10,6 +10,7 @@ import type { ProviderMetadata, Usage } from "@opencode-ai/llm"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import { Database } from "@opencode-ai/core/database/database"
 import { EventV2Bridge } from "@/event-v2-bridge"
+import { EventV2 } from "@opencode-ai/core/event"
 import { SessionV2 } from "@opencode-ai/core/session"
 import * as SessionExecutionLocal from "@opencode-ai/core/session/execution/local"
 import { locationServiceMapLayer } from "@opencode-ai/core/location-services"
@@ -44,6 +45,7 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { SessionMessage } from "@opencode-ai/schema/session-message"
+import { KeyedMutex } from "@opencode-ai/core/effect/keyed-mutex"
 
 const parentTitlePrefix = "New session - "
 const childTitlePrefix = "Child session - "
@@ -83,6 +85,7 @@ export function fromRow(row: SessionRow): Info {
     directory: row.directory,
     path: row.path ?? undefined,
     parentID: row.parent_id ?? undefined,
+    taskParentID: row.task_parent_id ?? undefined,
     title: row.title,
     agent: row.agent ?? undefined,
     model: row.model
@@ -123,6 +126,7 @@ export function toRow(info: Info) {
     project_id: info.projectID,
     workspace_id: info.workspaceID,
     parent_id: info.parentID,
+    task_parent_id: info.taskParentID,
     slug: info.slug,
     directory: info.directory,
     path: info.path,
@@ -229,6 +233,7 @@ export const Info = Schema.Struct({
   directory: Schema.String,
   path: optional(Schema.String),
   parentID: optional(SessionID),
+  taskParentID: optional(SessionID),
   summary: optional(Summary),
   cost: optional(Schema.Finite),
   tokens: optional(Tokens),
@@ -321,6 +326,10 @@ export type GlobalListInput = {
 }
 
 export const Event = {
+  Removing: EventV2.define({
+    type: "session.removing",
+    schema: { sessionID: SessionID },
+  }),
   Created: SessionV1.Event.Created,
   Updated: SessionV1.Event.Updated,
   Deleted: SessionV1.Event.Deleted,
@@ -408,6 +417,10 @@ export class BusyError extends Schema.TaggedErrorClass<BusyError>()("SessionBusy
   sessionID: SessionID,
 }) {}
 
+export class RemovingError extends Schema.TaggedErrorClass<RemovingError>()("SessionRemovingError", {
+  sessionID: SessionID,
+}) {}
+
 export type NotFound = NotFoundError
 
 export interface Interface {
@@ -422,6 +435,16 @@ export interface Interface {
     permission?: PermissionV1.Ruleset
     workspaceID?: WorkspaceV2.ID
   }) => Effect.Effect<Info>
+  readonly createTask: (input: {
+    parentID: SessionID
+    title?: string
+    agent?: string
+    model?: Schema.Schema.Type<typeof Model>
+    metadata?: typeof Metadata.Type
+    permission?: PermissionV1.Ruleset
+    workspaceID?: WorkspaceV2.ID
+  }) => Effect.Effect<Info>
+  readonly claimTask: (input: { sessionID: SessionID; parentID: SessionID }) => Effect.Effect<void, NotFound | Error>
   readonly fork: (input: { sessionID: SessionID; messageID?: MessageID }) => Effect.Effect<Info, NotFound>
   readonly touch: (sessionID: SessionID) => Effect.Effect<void>
   readonly get: (id: SessionID) => Effect.Effect<Info, NotFound>
@@ -482,7 +505,7 @@ export class Service extends Context.Service<Service, Interface>()("@opencode/Se
 
 export const use = serviceUse(Service)
 
-export type Patch = Omit<Partial<Info>, "time" | "share" | "summary" | "revert" | "permission"> & {
+export type Patch = Omit<Partial<Info>, "time" | "share" | "summary" | "revert" | "permission" | "taskParentID"> & {
   time?: Partial<Info["time"]>
   share?: Partial<NonNullable<Info["share"]>> | null
   summary?: Info["summary"] | null
@@ -502,6 +525,7 @@ const layer: Layer.Layer<
     const background = yield* BackgroundJob.Service
     const events = yield* EventV2Bridge.Service
     const flags = yield* RuntimeFlags.Service
+    const updateLock = KeyedMutex.makeUnsafe<SessionID>()
 
     const createNext = Effect.fn("Session.createNext")(function* (input: {
       id?: SessionID
@@ -509,6 +533,7 @@ const layer: Layer.Layer<
       agent?: string
       model?: Schema.Schema.Type<typeof Model>
       parentID?: SessionID
+      taskParentID?: SessionID
       workspaceID?: WorkspaceV2.ID
       directory: string
       path?: string
@@ -525,6 +550,7 @@ const layer: Layer.Layer<
         path: input.path,
         workspaceID: input.workspaceID,
         parentID: input.parentID,
+        taskParentID: input.taskParentID,
         title: input.title ?? (input.parentID ? childTitlePrefix : parentTitlePrefix) + new Date().toISOString(),
         agent: input.agent,
         model: input.model,
@@ -620,7 +646,10 @@ const layer: Layer.Layer<
           Effect.catchCause(() => Effect.succeed(false)),
         )
 
-        if (hasInstance) yield* cancelBackgroundJobs(background, sessionID)
+        if (hasInstance) {
+          yield* events.publish(Event.Removing, { sessionID })
+          yield* cancelBackgroundJobs(background, sessionID)
+        }
         const kids = yield* children(sessionID)
         for (const child of kids) {
           yield* remove(child.id)
@@ -727,6 +756,48 @@ const layer: Layer.Layer<
       })
     })
 
+    const createTask = Effect.fn("Session.createTask")(function* (input: {
+      parentID: SessionID
+      title?: string
+      agent?: string
+      model?: Schema.Schema.Type<typeof Model>
+      metadata?: typeof Metadata.Type
+      permission?: PermissionV1.Ruleset
+      workspaceID?: WorkspaceV2.ID
+    }) {
+      const ctx = yield* InstanceState.context
+      const workspace = yield* InstanceState.workspaceID
+      return yield* createNext({
+        parentID: input.parentID,
+        taskParentID: input.parentID,
+        directory: ctx.directory,
+        path: sessionPath(ctx.worktree, ctx.directory),
+        title: input.title,
+        agent: input.agent,
+        model: input.model,
+        metadata: input.metadata,
+        permission: input.permission,
+        workspaceID: input.workspaceID ?? workspace,
+      })
+    })
+
+    const claimTask = Effect.fn("Session.claimTask")(function* (input: { sessionID: SessionID; parentID: SessionID }) {
+      yield* updateLock.withLock(input.sessionID)(
+        Effect.gen(function* () {
+          const current = yield* get(input.sessionID)
+          if (current.taskParentID === input.parentID) return
+          if (current.taskParentID)
+            return yield* Effect.fail(
+              new Error(`Task session ${input.sessionID} is already owned by ${current.taskParentID}`),
+            )
+          yield* events.publish(SessionV1.Event.Updated, {
+            sessionID: input.sessionID,
+            info: { ...current, taskParentID: input.parentID },
+          })
+        }),
+      )
+    })
+
     const fork = Effect.fn("Session.fork")(function* (input: { sessionID: SessionID; messageID?: MessageID }) {
       const ctx = yield* InstanceState.context
       const original = yield* get(input.sessionID)
@@ -771,19 +842,21 @@ const layer: Layer.Layer<
     })
 
     const patch = (sessionID: SessionID, info: Patch) =>
-      Effect.gen(function* () {
-        const current = yield* get(sessionID)
-        const next = {
-          ...current,
-          ...info,
-          time: info.time ? { ...current.time, ...info.time } : current.time,
-          share: info.share === null ? undefined : info.share ? { ...current.share, ...info.share } : current.share,
-          summary: info.summary === null ? undefined : (info.summary ?? current.summary),
-          revert: info.revert === null ? undefined : (info.revert ?? current.revert),
-          permission: info.permission === null ? undefined : (info.permission ?? current.permission),
-        } as Info
-        yield* events.publish(SessionV1.Event.Updated, { sessionID, info: next })
-      })
+      updateLock.withLock(sessionID)(
+        Effect.gen(function* () {
+          const current = yield* get(sessionID)
+          const next = {
+            ...current,
+            ...info,
+            time: info.time ? { ...current.time, ...info.time } : current.time,
+            share: info.share === null ? undefined : info.share ? { ...current.share, ...info.share } : current.share,
+            summary: info.summary === null ? undefined : (info.summary ?? current.summary),
+            revert: info.revert === null ? undefined : (info.revert ?? current.revert),
+            permission: info.permission === null ? undefined : (info.permission ?? current.permission),
+          } as Info
+          yield* events.publish(SessionV1.Event.Updated, { sessionID, info: next })
+        }),
+      )
 
     const touch = Effect.fn("Session.touch")(function* (sessionID: SessionID) {
       yield* patch(sessionID, { time: { updated: Date.now() } }).pipe(Effect.orDie)
@@ -946,6 +1019,8 @@ const layer: Layer.Layer<
       list,
       listGlobal,
       create,
+      createTask,
+      claimTask,
       fork,
       touch,
       get,

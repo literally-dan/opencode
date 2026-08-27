@@ -179,6 +179,7 @@ const layer = Layer.effect(
       const pendingSettlements = new Map<string, ToolSettlement>()
       const settling = new Set<string>()
       const settled = new Set<string>()
+      const admittedToolCalls = new Set<string>()
       let generation = 0
       let activeGeneration: number | undefined
       let admissionClosed = false
@@ -470,6 +471,8 @@ const layer = Layer.effect(
             if (admissionClosed || requestedGeneration === undefined || requestedGeneration !== activeGeneration) {
               return false
             }
+            if (admittedToolCalls.has(toolCallID)) return false
+            admittedToolCalls.add(toolCallID)
             yield* startToolCallUnlocked({ id: toolCallID, name, args, admitted: true })
             return true
           }),
@@ -480,6 +483,7 @@ const layer = Layer.effect(
           if (admissionClosed) return yield* Effect.interrupt
           generation += 1
           activeGeneration = generation
+          admittedToolCalls.clear()
           return generation
         }),
       )
@@ -613,6 +617,10 @@ const layer = Layer.effect(
           }
 
           case "tool-result": {
+            // An admitted call is settled by its own execution wrapper. A stream
+            // result or error for the same ID can come from a rejected duplicate
+            // while the admitted execution still runs.
+            if (admittedToolCalls.has(value.id)) return
             if (value.result.type === "error") {
               yield* failToolCall(value.id, value.result.value)
               return
@@ -622,6 +630,7 @@ const layer = Layer.effect(
           }
 
           case "tool-error": {
+            if (admittedToolCalls.has(value.id)) return
             yield* failToolCall(value.id, value.error ?? new Error(value.message))
             return
           }

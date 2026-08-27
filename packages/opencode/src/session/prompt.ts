@@ -110,6 +110,23 @@ function isOrphanedInterruptedTool(part: SessionV1.ToolPart) {
   return part.state.status === "error" && part.state.metadata?.interrupted === true
 }
 
+// A command subtask that started in the background has no result for the model
+// yet. Another turn would send a request that ends with the synthetic task call,
+// which some thinking models reject. The task notification starts the next turn.
+function isBackgroundSubtaskLaunch(user: SessionV1.WithParts | undefined, assistant: SessionV1.WithParts | undefined) {
+  if (!user || assistant?.info.role !== "assistant" || assistant.info.parentID !== user.info.id) return false
+  return assistant.parts.some(
+    (part) =>
+      part.type === "tool" &&
+      part.tool === TaskTool.id &&
+      part.state.status === "completed" &&
+      part.state.metadata.background === true &&
+      user.parts.some(
+        (subtask) => subtask.type === "subtask" && !!subtask.command && subtask.command === part.state.input.command,
+      ),
+  )
+}
+
 function successfulContextCompaction(message: SessionV1.WithParts | undefined) {
   return (
     message?.parts.some((part) => {
@@ -287,9 +304,20 @@ function compactionCandidates(
   }
 }
 
+export type NotificationContinuation = Effect.Effect<SessionV1.WithParts | undefined, Image.Error>
+
 export interface Interface {
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
+  readonly checkpoint: (sessionID: SessionID) => Effect.Effect<number>
   readonly prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
+  readonly admitNotification: (
+    input: PromptInput,
+    checkpoint: number,
+  ) => Effect.Effect<Option.Option<NotificationContinuation>, Image.Error>
+  readonly notify: (
+    input: PromptInput,
+    checkpoint: number,
+  ) => Effect.Effect<SessionV1.WithParts | undefined, Image.Error>
   readonly loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts>
   readonly shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError>
   readonly command: (input: CommandInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
@@ -344,11 +372,21 @@ const layer = Layer.effect(
       contextStates.set(sessionID, next)
       return next
     }
-    const ops = Effect.fn("SessionPrompt.ops")(function* () {
+    const ops = Effect.fn("SessionPrompt.ops")(function* (sessionID: SessionID) {
+      const checkpoint = yield* state.checkpoint(sessionID)
       return {
         cancel: (sessionID: SessionID) => cancel(sessionID),
+        checkpoint: (sessionID: SessionID) => state.checkpoint(sessionID),
+        retain: (sessionID: SessionID, checkpoint: number) => state.retain(sessionID, checkpoint),
+        admitIfCurrent: <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+          state.admitIfCurrent(sessionID, checkpoint, effect),
+        admitChild: <A, E, R>(childID: SessionID, effect: Effect.Effect<A, E, R>) =>
+          state.admit([{ sessionID, checkpoint }, { sessionID: childID }], effect),
         resolvePromptParts: (template: string) => resolvePromptParts(template),
         prompt: (input: PromptInput) => prompt(input).pipe(Effect.catch(Effect.die)),
+        admitNotification: (input: PromptInput, checkpoint: number) =>
+          admitNotification(input, checkpoint).pipe(Effect.catch(Effect.die)),
+        notify: (input: PromptInput, checkpoint: number) => notify(input, checkpoint).pipe(Effect.catch(Effect.die)),
       } satisfies TaskPromptOps
     })
 
@@ -465,7 +503,7 @@ const layer = Layer.effect(
     }) {
       const { task, model, lastUser, sessionID, session, msgs } = input
       const ctx = yield* InstanceState.context
-      const promptOps = yield* ops()
+      const promptOps = yield* ops(input.sessionID)
       const { task: taskTool } = yield* registry.named()
       const taskModel = task.model ? yield* getModel(task.model.providerID, task.model.modelID, sessionID) : model
       const assistantMessage: SessionV1.Assistant = yield* sessions.updateMessage({
@@ -497,7 +535,7 @@ const layer = Layer.effect(
             description: task.description,
             subagent_type: task.agent,
             command: task.command,
-            background: task.background,
+            background: task.background ?? false,
           },
           time: { start: Date.now() },
         },
@@ -507,7 +545,7 @@ const layer = Layer.effect(
         description: task.description,
         subagent_type: task.agent,
         command: task.command,
-        ...(task.background === true ? { background: true } : {}),
+        background: task.background ?? false,
       }
       yield* plugin.trigger(
         "tool.execute.before",
@@ -632,7 +670,9 @@ const layer = Layer.effect(
         } satisfies SessionV1.ToolPart)
       }
 
-      if (!task.command) return
+      // A background start has no output to summarize yet. The loop exit check
+      // ends the turn, and the task notification starts the next turn.
+      if (!task.command || result?.metadata?.background === true) return
 
       const summaryUserMsg: SessionV1.User = {
         id: MessageID.ascending(),
@@ -837,7 +877,7 @@ const layer = Layer.effect(
       return yield* provider.defaultModel().pipe(Effect.orDie)
     })
 
-    const createUserMessage = Effect.fn("SessionPrompt.createUserMessage")(function* (input: PromptInput) {
+    const prepareUserMessage = Effect.fn("SessionPrompt.prepareUserMessage")(function* (input: PromptInput) {
       const agentName = input.agent
       const ag = agentName ? yield* agents.get(agentName) : yield* agents.defaultInfo()
       if (!ag) {
@@ -872,25 +912,6 @@ const layer = Layer.effect(
         },
         system: input.system,
         format: input.format,
-      }
-
-      const current = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
-      if (
-        current.agent !== info.agent ||
-        current.model?.providerID !== info.model.providerID ||
-        current.model?.id !== info.model.modelID ||
-        (current.model?.variant === "default" ? undefined : current.model?.variant) !== info.model.variant
-      ) {
-        yield* sessions.setAgentModel({
-          sessionID: input.sessionID,
-          agent: info.agent,
-          model: {
-            id: info.model.modelID,
-            providerID: info.model.providerID,
-            variant: info.model.variant ?? "default",
-          },
-          time: info.time.created,
-        })
       }
 
       yield* Effect.addFinalizer(() => instruction.clear(info.id))
@@ -1194,6 +1215,10 @@ const layer = Layer.effect(
           ]
         }
 
+        if (part.type === "subtask") {
+          return [{ ...part, messageID: info.id, sessionID: input.sessionID, background: part.background ?? true }]
+        }
+
         return [{ ...part, messageID: info.id, sessionID: input.sessionID }]
       })
 
@@ -1248,18 +1273,33 @@ const layer = Layer.effect(
         })
       }
 
-      yield* sessions.updateMessage(info)
-      for (const part of parts) yield* sessions.updatePart(part)
-
       return { info, parts }
     }, Effect.scoped)
 
-    const prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error> = Effect.fn(
-      "SessionPrompt.prompt",
-    )(function* (input: PromptInput) {
+    const persistPrompt = Effect.fn("SessionPrompt.persistPrompt")(function* (
+      message: SessionV1.WithParts & { info: SessionV1.User },
+      input: PromptInput,
+    ) {
       const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
-      yield* revert.cleanup(session)
-      const message = yield* createUserMessage(input)
+      if (
+        session.agent !== message.info.agent ||
+        session.model?.providerID !== message.info.model.providerID ||
+        session.model?.id !== message.info.model.modelID ||
+        (session.model?.variant === "default" ? undefined : session.model?.variant) !== message.info.model.variant
+      ) {
+        yield* sessions.setAgentModel({
+          sessionID: input.sessionID,
+          agent: message.info.agent,
+          model: {
+            id: message.info.model.modelID,
+            providerID: message.info.model.providerID,
+            variant: message.info.model.variant ?? "default",
+          },
+          time: message.info.time.created,
+        })
+      }
+      yield* sessions.updateMessage(message.info)
+      for (const part of message.parts) yield* sessions.updatePart(part)
       yield* sessions.touch(input.sessionID)
 
       const permissions: PermissionV1.Rule[] = []
@@ -1270,6 +1310,20 @@ const layer = Layer.effect(
         session.permission = permissions
         yield* sessions.setPermission({ sessionID: session.id, permission: permissions })
       }
+
+      return message
+    })
+
+    const savePrompt = Effect.fn("SessionPrompt.savePrompt")(function* (input: PromptInput) {
+      return yield* persistPrompt(yield* prepareUserMessage(input), input)
+    })
+
+    const prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error> = Effect.fn(
+      "SessionPrompt.prompt",
+    )(function* (input: PromptInput) {
+      const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
+      yield* revert.cleanup(session)
+      const message = yield* savePrompt(input)
 
       if (input.noReply === true) return message
       return yield* loop({ sessionID: input.sessionID })
@@ -1330,10 +1384,12 @@ const layer = Layer.effect(
             ) ?? false
 
           if (
-            lastAssistant?.finish &&
-            !["tool-calls", "unknown"].includes(lastAssistant.finish) &&
-            !hasToolCalls &&
-            lastAssistant.parentID === lastUser.id
+            lastAssistant?.parentID === lastUser.id &&
+            ((lastAssistant.finish && !["tool-calls", "unknown"].includes(lastAssistant.finish) && !hasToolCalls) ||
+              isBackgroundSubtaskLaunch(
+                msgs.findLast((msg) => msg.info.id === lastUser.id),
+                lastAssistantMsg,
+              ))
           ) {
             const orphan = lastAssistantMsg?.parts.find(
               (part): part is SessionV1.ToolPart => part.type === "tool" && isOrphanedInterruptedTool(part),
@@ -1481,7 +1537,7 @@ const layer = Layer.effect(
           const outcome: "break" | "continue" = yield* Effect.gen(function* () {
             const lastUserMsg = msgs.findLast((m) => m.info.role === "user")
             const bypassAgentCheck = lastUserMsg?.parts.some((p) => p.type === "agent") ?? false
-            const promptOps = yield* ops()
+            const promptOps = yield* ops(sessionID)
 
             const tools = yield* SessionTools.resolve({
               agent,
@@ -1682,6 +1738,87 @@ const layer = Layer.effect(
       return yield* state.ensureRunning(input.sessionID, lastAssistant(input.sessionID), runLoop(input.sessionID))
     })
 
+    const runNotification = Effect.fn("SessionPrompt.runNotification")(function* (
+      message: SessionV1.WithParts,
+      checkpoint: number,
+    ) {
+      if (!(yield* state.isCurrent(message.info.sessionID, checkpoint))) return
+      const result = yield* state.ensureRunning(
+        message.info.sessionID,
+        lastAssistant(message.info.sessionID),
+        Effect.gen(function* () {
+          if (!(yield* state.isCurrent(message.info.sessionID, checkpoint))) return message
+          return yield* runLoop(message.info.sessionID)
+        }),
+      )
+      if (!(yield* state.isCurrent(message.info.sessionID, checkpoint))) return
+      return result
+    })
+
+    const admitNotification: Interface["admitNotification"] = Effect.fn("SessionPrompt.admitNotification")(function* (
+      input: PromptInput,
+      checkpoint: number,
+    ) {
+      if (!(yield* state.isCurrent(input.sessionID, checkpoint))) return Option.none()
+      const prepared = yield* prepareUserMessage(input)
+      const admitted = yield* state.admitIfCurrent(
+        input.sessionID,
+        checkpoint,
+        Effect.gen(function* () {
+          const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
+          if (session.revert) return false as const
+          // Task tools build the notification input when the task starts.
+          // persistPrompt switches the session to the message's agent and model,
+          // so use the session's current values. Read them inside the admission,
+          // so a prompt admitted while this notification was prepared is not reverted.
+          return yield* persistPrompt(
+            {
+              ...prepared,
+              info: {
+                ...prepared.info,
+                agent: session.agent ?? prepared.info.agent,
+                model: session.model
+                  ? {
+                      providerID: session.model.providerID,
+                      modelID: session.model.id,
+                      variant: session.model.variant === "default" ? undefined : session.model.variant,
+                    }
+                  : prepared.info.model,
+              },
+            },
+            input,
+          )
+        }),
+      )
+      if (Option.isNone(admitted)) return Option.none()
+      const message = admitted.value
+      if (message === false) return Option.none()
+      if (input.noReply === true) return Option.some(Effect.succeed(undefined))
+      return Option.some(
+        Effect.gen(function* () {
+          const result = yield* runNotification(message, checkpoint)
+          if (!result) return
+          if (result.info.role === "assistant" && result.info.parentID === message.info.id) return result
+          const latest = MessageV2.latest(
+            yield* MessageV2.filterCompactedEffect(input.sessionID).pipe(
+              Effect.provideService(Database.Service, database),
+            ),
+          )
+          if (latest.user?.id !== message.info.id) return
+          return yield* runNotification(message, checkpoint)
+        }),
+      )
+    })
+
+    const notify: Interface["notify"] = Effect.fn("SessionPrompt.notify")(function* (
+      input: PromptInput,
+      checkpoint: number,
+    ) {
+      const continuation = yield* admitNotification(input, checkpoint)
+      if (Option.isNone(continuation)) return
+      return yield* continuation.value
+    })
+
     const shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError> = Effect.fn(
       "SessionPrompt.shell",
     )(function* (input: ShellInput) {
@@ -1782,7 +1919,7 @@ const layer = Layer.effect(
               command: input.command,
               model: { providerID: taskModel.providerID, modelID: taskModel.modelID },
               prompt: templateParts.find((y) => y.type === "text")?.text ?? "",
-              ...(cmd.background === true ? { background: true } : {}),
+              background: cmd.background ?? true,
             },
           ]
         : [...uniqueTemplateParts, ...(input.parts ?? [])]
@@ -1819,7 +1956,10 @@ const layer = Layer.effect(
 
     return Service.of({
       cancel,
+      checkpoint: state.checkpoint,
       prompt,
+      admitNotification,
+      notify,
       loop,
       shell,
       command,

@@ -9,6 +9,7 @@ import { Effect } from "effect"
 import { Session } from "@/session/session"
 
 import { SessionRevert } from "../../src/session/revert"
+import { SessionRunState } from "../../src/session/run-state"
 import { MessageV2 } from "../../src/session/message-v2"
 import { Snapshot } from "../../src/snapshot"
 import { MessageID, PartID, SessionID } from "../../src/session/schema"
@@ -19,7 +20,14 @@ import { ModelV2 } from "@opencode-ai/core/model"
 
 const it = testEffect(
   LayerNode.compile(
-    LayerNode.group([Session.node, SessionRevert.node, Snapshot.node, SessionProjector.node, CrossSpawnSpawner.node]),
+    LayerNode.group([
+      Session.node,
+      SessionRevert.node,
+      SessionRunState.node,
+      Snapshot.node,
+      SessionProjector.node,
+      CrossSpawnSpawner.node,
+    ]),
   ),
 )
 
@@ -678,6 +686,24 @@ describe("revert + compact workflow", () => {
           expect(yield* read(path.join(dir, "a.txt"))).toBe("a3")
         }),
       { git: true },
+    ),
+  )
+
+  it.live(
+    "no-op revert operations preserve the session checkpoint",
+    provideTmpdirInstance(() =>
+      Effect.gen(function* () {
+        const session = yield* Session.Service
+        const revert = yield* SessionRevert.Service
+        const run = yield* SessionRunState.Service
+        const info = yield* session.create({})
+        const checkpoint = yield* run.checkpoint(info.id)
+
+        yield* revert.revert({ sessionID: info.id, messageID: MessageID.ascending() })
+        yield* revert.unrevert({ sessionID: info.id })
+
+        expect(yield* run.checkpoint(info.id)).toBe(checkpoint)
+      }),
     ),
   )
 })

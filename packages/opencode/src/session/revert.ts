@@ -37,6 +37,16 @@ const layer = Layer.effect(
 
     const revert = Effect.fn("SessionRevert.revert")(function* (input: RevertInput) {
       yield* state.assertNotBusy(input.sessionID)
+      const initial = yield* sessions.messages({ sessionID: input.sessionID }).pipe(Effect.orDie)
+      const current = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
+      const exists = initial.some(
+        (message) =>
+          (!input.partID && message.info.id === input.messageID) ||
+          message.parts.some((part) => part.id === input.partID),
+      )
+      if (!exists) return current
+
+      yield* state.cancel(input.sessionID)
       const all = yield* sessions.messages({ sessionID: input.sessionID }).pipe(Effect.orDie)
       let lastUser: SessionV1.User | undefined
       const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
@@ -93,7 +103,10 @@ const layer = Layer.effect(
       yield* state.assertNotBusy(input.sessionID)
       const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
       if (!session.revert) return session
-      if (session.revert.snapshot) yield* snap.restore(session.revert.snapshot)
+      yield* state.cancel(input.sessionID)
+      const current = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
+      if (!current.revert) return current
+      if (current.revert.snapshot) yield* snap.restore(current.revert.snapshot)
       yield* sessions.clearRevert(input.sessionID)
       return yield* sessions.get(input.sessionID).pipe(Effect.orDie)
     })
