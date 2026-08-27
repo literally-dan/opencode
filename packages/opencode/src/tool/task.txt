@@ -11,16 +11,17 @@ When NOT to use the Task tool:
 
 Usage notes:
 1. Launch multiple agents concurrently whenever possible, to maximize performance; to do that, use a single message with multiple tool uses
-2. Once you have delegated work to an agent, do not duplicate that work yourself. Continue with non-overlapping tasks, or wait for the result. For background tasks, you will be notified automatically when the result is ready.
+2. Once you have delegated work to an agent, do not duplicate that work yourself. Continue with non-overlapping tasks. You will be notified automatically when the result is ready.
 3. When the agent is done, it will return a single message back to you. The result returned by the agent is not visible to the user. To show the user the result, you should send a text message back to the user with a concise summary of the result. The output includes a task_id you can reuse later to continue the same subagent session.
-4. Each agent invocation starts with a fresh context unless you provide task_id to resume the same subagent session (which continues with its previous messages and tool outputs). When starting fresh, your prompt should contain a highly detailed task description for the agent to perform autonomously and you should specify exactly what information the agent should return back to you in its final and only message to you.
+4. Each agent invocation starts with a fresh context unless you provide task_id to resume the same direct child subagent session with the same agent (which continues with its previous messages and tool outputs). Invalid, missing, unrelated, or mismatched task_id values fail instead of creating a replacement task. When starting fresh, your prompt should contain a highly detailed task description for the agent to perform autonomously and you should specify exactly what information the agent should return back to you in its final and only message to you.
 5. Omit model to use the subagent's configured model, or the current model when the subagent has no model configured. Set model to any available provider/model when the task benefits from a different model.
 6. The agent's outputs should generally be trusted
 7. Clearly tell the agent whether you expect it to write code or just to do research (search, file reads, web fetches, etc.), since it is not aware of the user's intent. Tell it how to verify its work if possible (e.g., relevant test commands).
 8. If the agent description mentions that it should be used proactively, then you should try your best to use it without the user having to ask for it first. Use your judgement.
 
 Background tasks:
-- Set background=true for independent work that does not block your next action. The call returns immediately so you can keep helping the user while the subagent runs.
-- Prefer background=true for parallel research, long-running verification, and independent implementation in files you will not touch.
+- Background is the default. The call returns immediately with a task_id so you can keep helping the user while the subagent runs.
+- Set background=false only when the parent must block for the result.
+- The task_id is the durable child session ID and can be passed back to resume the task, including after an error. Active execution itself remains process-local.
 - Do not poll, sleep, or ask for status. Completion is delivered automatically into the conversation.
 - Keep working on non-overlapping tasks after launch. Do not duplicate the background agent's work or edit the same files.

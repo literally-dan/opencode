@@ -23,12 +23,15 @@ type Active = {
   done: Deferred.Deferred<Info>
   scope: Scope.Closeable
   token: object
+  settling: boolean
   pending: number
   next: number
   output?: { sequence: number; text: string }
   tail: Deferred.Deferred<void>
   promoted: Deferred.Deferred<Info>
   onPromote?: Effect.Effect<void>
+  onComplete?: (info: Info) => Effect.Effect<void>
+  notifyOnComplete: boolean
 }
 
 type State = {
@@ -40,6 +43,8 @@ type FinishResult = {
   info?: Info
   done?: Deferred.Deferred<Info>
   scope?: Scope.Closeable
+  token?: object
+  onComplete?: (info: Info) => Effect.Effect<void>
 }
 
 type PromoteResult = {
@@ -67,11 +72,17 @@ export type StartInput = {
   title?: string
   metadata?: Record<string, unknown>
   onPromote?: Effect.Effect<void>
+  /** Runs once for this in-memory generation when completion delivery is enabled. */
+  onComplete?: (info: Info) => Effect.Effect<void>
+  notifyOnComplete?: boolean
   run: Effect.Effect<string, unknown>
 }
 
 export type ExtendInput = {
   id: string
+  expectedType?: string
+  /** Atomically transfers this generation's completion delivery to the extending caller. */
+  claimCompletion?: boolean
   run: Effect.Effect<string, unknown>
 }
 
@@ -134,7 +145,7 @@ export const make = Effect.gen(function* () {
       const job = jobs.get(id)
       if (!job) return [{}, jobs]
       if (job.token !== token) return [{}, jobs]
-      if (job.info.status !== "running") return [{ info: snapshot(job) }, jobs]
+      if (job.info.status !== "running" || job.settling) return [{ info: snapshot(job) }, jobs]
       const pending = job.pending - 1
       const output =
         Exit.isSuccess(exit) && (!job.output || sequence > job.output.sequence)
@@ -150,22 +161,51 @@ export const make = Effect.gen(function* () {
           : "error"
       const next = {
         ...job,
+        settling: true,
         onPromote: undefined,
+        onComplete: undefined,
+        notifyOnComplete: false,
         pending: 0,
         output,
-        info: {
-          ...job.info,
-          status,
-          completed_at,
-          ...(output ? { output: output.text } : {}),
-          ...(Exit.isFailure(exit) ? { error: errorText(Cause.squash(exit.cause)) } : {}),
-        },
       }
-      return [{ info: snapshot(next), done: job.done, scope: job.scope }, new Map(jobs).set(id, next)]
+      const info = {
+        ...job.info,
+        status,
+        completed_at,
+        ...(output ? { output: output.text } : {}),
+        ...(Exit.isFailure(exit) ? { error: errorText(Cause.squash(exit.cause)) } : {}),
+      }
+      // Extensions must lose before delivery starts, while a replacement start
+      // may install a new generation without changing this one's callback.
+      return [
+        {
+          info,
+          done: job.done,
+          scope: job.scope,
+          token: job.token,
+          ...(job.notifyOnComplete && job.onComplete ? { onComplete: job.onComplete } : {}),
+        },
+        new Map(jobs).set(id, next),
+      ]
     })
-    if (result.info && result.done) yield* Deferred.succeed(result.done, result.info).pipe(Effect.ignore)
-    if (result.scope) {
-      yield* Scope.close(result.scope, Exit.void).pipe(Effect.forkIn(state.scope, { startImmediately: true }))
+    if (result.info && result.token) {
+      const info = result.info
+      const token = result.token
+      const done = result.done
+      const finalize = Effect.gen(function* () {
+        yield* SynchronizedRef.update(state.jobs, (jobs) => {
+          const job = jobs.get(id)
+          if (!job || job.token !== token || !job.settling) return jobs
+          return new Map(jobs).set(id, { ...job, settling: false, info })
+        })
+        if (done) yield* Deferred.succeed(done, info).pipe(Effect.ignore)
+        if (result.scope)
+          yield* Scope.close(result.scope, Exit.void).pipe(Effect.forkIn(state.scope, { startImmediately: true }))
+      })
+      yield* (result.onComplete ? result.onComplete(info) : Effect.void).pipe(
+        Effect.ignore,
+        Effect.ensuring(finalize),
+      )
     }
     return result.info
   })
@@ -211,7 +251,7 @@ export const make = Effect.gen(function* () {
           state.jobs,
           Effect.fnUntraced(function* (jobs) {
             const existing = jobs.get(id)
-            if (existing?.info.status === "running") {
+            if (existing?.info.status === "running" && !existing.settling) {
               return [{ info: snapshot(existing) }, jobs] as readonly [StartResult, Map<string, Active>]
             }
             const scope = yield* Scope.fork(state.scope, "parallel")
@@ -228,11 +268,14 @@ export const make = Effect.gen(function* () {
               done,
               scope,
               token,
+              settling: false,
               pending: 1,
               next: 1,
               tail,
               promoted,
               onPromote: input.onPromote,
+              onComplete: input.onComplete,
+              notifyOnComplete: input.notifyOnComplete ?? false,
             }
             return [{ info: snapshot(job), scope, token }, new Map(jobs).set(id, job)] as readonly [
               StartResult,
@@ -261,7 +304,13 @@ export const make = Effect.gen(function* () {
           state.jobs,
           (jobs): readonly [ExtendResult, Map<string, Active>] => {
             const job = jobs.get(input.id)
-            if (!job || job.info.status !== "running") return [{ extended: false }, jobs]
+            if (
+              !job ||
+              job.info.status !== "running" ||
+              job.settling ||
+              (input.expectedType !== undefined && job.info.type !== input.expectedType)
+            )
+              return [{ extended: false }, jobs]
             return [
               { extended: true, previous: job.tail, scope: job.scope, tail, token: job.token, sequence: job.next },
               new Map(jobs).set(input.id, {
@@ -269,6 +318,7 @@ export const make = Effect.gen(function* () {
                 pending: job.pending + 1,
                 next: job.next + 1,
                 tail,
+                notifyOnComplete: input.claimCompletion ? false : job.notifyOnComplete,
               }),
             ]
           },
@@ -302,7 +352,7 @@ export const make = Effect.gen(function* () {
 
   const waitForPromotion: Interface["waitForPromotion"] = Effect.fn("BackgroundJob.waitForPromotion")(function* (id) {
     const job = (yield* SynchronizedRef.get(state.jobs)).get(id)
-    if (!job || job.info.status !== "running") return yield* Effect.never
+    if (!job || job.info.status !== "running" || job.settling) return yield* Effect.never
     if (job.info.metadata?.background === true) return snapshot(job)
     return yield* Deferred.await(job.promoted)
   })
@@ -312,12 +362,14 @@ export const make = Effect.gen(function* () {
       state.jobs,
       Effect.fnUntraced(function* (jobs) {
         const job = jobs.get(id)
-        if (!job || job.info.status !== "running") return [{}, jobs] as readonly [PromoteResult, Map<string, Active>]
+        if (!job || job.info.status !== "running" || job.settling)
+          return [{}, jobs] as readonly [PromoteResult, Map<string, Active>]
         if (job.info.metadata?.background === true)
           return [{ info: snapshot(job) }, jobs] as readonly [PromoteResult, Map<string, Active>]
         const next = {
           ...job,
           onPromote: undefined,
+          notifyOnComplete: true,
           info: {
             ...job.info,
             metadata: { ...job.info.metadata, background: true },
@@ -342,7 +394,10 @@ export const make = Effect.gen(function* () {
       if (job.info.status !== "running") return [{ info: snapshot(job) }, jobs]
       const next = {
         ...job,
+        settling: false,
         onPromote: undefined,
+        onComplete: undefined,
+        notifyOnComplete: false,
         pending: 0,
         info: {
           ...job.info,
@@ -350,10 +405,28 @@ export const make = Effect.gen(function* () {
           completed_at,
         },
       }
-      return [{ info: snapshot(next), done: job.done, scope: job.scope }, new Map(jobs).set(id, next)]
+      return [
+        {
+          info: snapshot(next),
+          done: job.done,
+          scope: job.scope,
+          ...(job.notifyOnComplete && job.onComplete ? { onComplete: job.onComplete } : {}),
+        },
+        new Map(jobs).set(id, next),
+      ]
     })
-    if (result.info && result.done) yield* Deferred.succeed(result.done, result.info).pipe(Effect.ignore)
-    if (result.scope) yield* Scope.close(result.scope, Exit.void)
+    if (result.info && result.done) {
+      const info = result.info
+      const done = result.done
+      const finalize = Effect.gen(function* () {
+        yield* Deferred.succeed(done, info).pipe(Effect.ignore)
+        if (result.scope) yield* Scope.close(result.scope, Exit.void)
+      })
+      yield* (result.onComplete ? result.onComplete(info) : Effect.void).pipe(
+        Effect.ignore,
+        Effect.ensuring(finalize),
+      )
+    }
     return result.info
   })
 

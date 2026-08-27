@@ -1764,6 +1764,7 @@ it.instance("failed subtask preserves metadata on error tool state", () =>
       description: "inspect bug",
       prompt: "look into the cache key path",
       subagent_type: "general",
+      background: false,
     })
     yield* llm.text("done")
     const msg = yield* user(chat.id, "hello")
@@ -1920,6 +1921,7 @@ it.instance(
         description: "inspect bug",
         prompt: "look into the cache key path",
         subagent_type: "general",
+        background: false,
       })
       yield* llm.hang
       yield* user(chat.id, "hello")

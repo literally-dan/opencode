@@ -86,6 +86,98 @@ describe("BackgroundJob", () => {
     }).pipe(Effect.provide(jobsLayer)),
   )
 
+  it.live("atomically claims completion delivery with an accepted extension", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const first = yield* Deferred.make<void>()
+      const second = yield* Deferred.make<void>()
+      let notifications = 0
+      const job = yield* jobs.start({
+        id: "job_claimed_completion",
+        type: "test",
+        notifyOnComplete: true,
+        onComplete: () => Effect.sync(() => notifications++).pipe(Effect.asVoid),
+        run: Deferred.await(first).pipe(Effect.as("first")),
+      })
+
+      expect(
+        yield* jobs.extend({
+          id: job.id,
+          claimCompletion: true,
+          run: Deferred.await(second).pipe(Effect.as("second")),
+        }),
+      ).toBe(true)
+      yield* Deferred.succeed(first, undefined)
+      expect((yield* jobs.get(job.id))?.status).toBe("running")
+      yield* Deferred.succeed(second, undefined)
+
+      expect((yield* jobs.wait({ id: job.id })).info?.output).toBe("second")
+      expect(notifications).toBe(0)
+    }).pipe(Effect.provide(jobsLayer)),
+  )
+
+  it.live("keeps completion ownership isolated when an extension loses to settlement", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const oldSettling = yield* Deferred.make<void>()
+      const releaseOld = yield* Deferred.make<void>()
+      let oldNotifications = 0
+      let newNotifications = 0
+      const id = "job_completion_generations"
+      yield* jobs.start({
+        id,
+        type: "test",
+        notifyOnComplete: true,
+        onComplete: () =>
+          Effect.gen(function* () {
+            oldNotifications++
+            yield* Deferred.succeed(oldSettling, undefined)
+            yield* Deferred.await(releaseOld)
+          }),
+        run: Effect.succeed("old"),
+      })
+
+      yield* Deferred.await(oldSettling)
+      expect(yield* jobs.extend({ id, claimCompletion: true, run: Effect.succeed("late") })).toBe(false)
+
+      const replacement = yield* jobs.start({
+        id,
+        type: "test",
+        notifyOnComplete: true,
+        onComplete: () => Effect.sync(() => newNotifications++).pipe(Effect.asVoid),
+        run: Effect.succeed("new"),
+      })
+      expect((yield* jobs.wait({ id: replacement.id })).info?.output).toBe("new")
+      yield* Deferred.succeed(releaseOld, undefined)
+
+      expect(oldNotifications).toBe(1)
+      expect(newNotifications).toBe(1)
+    }).pipe(Effect.provide(jobsLayer)),
+  )
+
+  it.live("finalizes a settling generation when its completion callback is interrupted", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const callbackStarted = yield* Deferred.make<void>()
+      const id = "job_interrupted_completion"
+      yield* jobs.start({
+        id,
+        type: "test",
+        notifyOnComplete: true,
+        onComplete: () => Deferred.succeed(callbackStarted, undefined).pipe(Effect.andThen(Effect.never)),
+        run: Effect.succeed("done"),
+      })
+
+      yield* Deferred.await(callbackStarted)
+      expect((yield* jobs.get(id))?.status).toBe("running")
+      expect((yield* jobs.cancel(id))?.status).toBe("cancelled")
+      expect((yield* jobs.wait({ id })).info?.status).toBe("cancelled")
+
+      yield* jobs.start({ id, type: "test", run: Effect.succeed("replacement") })
+      expect((yield* jobs.wait({ id })).info?.output).toBe("replacement")
+    }).pipe(Effect.provide(jobsLayer)),
+  )
+
   it.live("interrupts live work without promising settlement after the owning process-local scope closes", () =>
     Effect.gen(function* () {
       const scope = yield* Scope.make()

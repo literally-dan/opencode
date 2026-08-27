@@ -29,9 +29,8 @@ const id = "task"
 // cannot nest further.
 const DEFAULT_SUBAGENT_DEPTH = 2
 const BACKGROUND_DESCRIPTION = [
-  "Background mode: background=true launches the subagent asynchronously and returns immediately.",
-  "Foreground is the default; use it when you need the result before continuing.",
-  "Use background only for independent work that can run while you continue elsewhere.",
+  "Background mode is the default: the subagent launches asynchronously and returns a resumable task_id immediately.",
+  "Set background=false only when the parent must wait synchronously for the result.",
   "You will be notified automatically when it finishes.",
 ].join(" ")
 const BACKGROUND_STARTED = [
@@ -65,7 +64,8 @@ export const Parameters = Schema.Struct({
   ...BaseParameterFields,
   background: Schema.optional(Schema.Boolean).annotate({
     description:
-      "Run the agent in the background. You will be notified when it completes. DO NOT sleep, poll, or proactively check on its progress",
+      "Run the agent in the background (default true). Set false only to wait synchronously. You will be notified when it completes. DO NOT sleep, poll, or proactively check on its progress",
+    default: true,
   }),
 })
 
@@ -116,21 +116,65 @@ export const TaskTool = Tool.define(
       ctx: Tool.Context,
     ) {
       const cfg = yield* config.get()
-      const runInBackground = params.background === true
+      const runInBackground = params.background !== false
 
       const parent = yield* sessions.get(ctx.sessionID)
+      const ancestors = [parent]
       let current = parent
       let depth = 0
       while (current.parentID) {
         depth++
         current = yield* sessions.get(current.parentID)
+        ancestors.push(current)
       }
       const maxDepth = cfg.subagent_depth ?? DEFAULT_SUBAGENT_DEPTH
       if (depth >= maxDepth) {
         return yield* Effect.fail(
-          new Error(`Subagent depth limit reached (${maxDepth}). Increase "subagent_depth" to allow nested subagents.`),
+          new Error(
+            `Subagent depth limit reached (${maxDepth}). Increase "subagent_depth" to allow nested subagents.${params.task_id ? ` (task_id: ${params.task_id})` : ""}`,
+          ),
         )
       }
+
+      const next = yield* agent.get(params.subagent_type)
+      if (!next) {
+        return yield* Effect.fail(
+          new Error(
+            `Unknown agent type: ${params.subagent_type} is not a valid agent type${params.task_id ? ` (task_id: ${params.task_id})` : ""}`,
+          ),
+        )
+      }
+
+      const resume = Effect.fn("TaskTool.resume")(function* (taskID: string) {
+        const decoded = Schema.decodeUnknownExit(SessionID)(taskID)
+        if (Exit.isFailure(decoded))
+          return yield* Effect.fail(new Error(`Cannot resume task_id ${taskID}: invalid session ID`))
+        const session = yield* sessions.get(decoded.value).pipe(Effect.catchCause(() => Effect.succeed(undefined)))
+        if (!session) return yield* Effect.fail(new Error(`Cannot resume task_id ${taskID}: session not found`))
+        if (session.id === parent.id)
+          return yield* Effect.fail(
+            new Error(`Cannot resume task_id ${taskID}: a task cannot resume its parent session`),
+          )
+        if (session.parentID !== parent.id)
+          return yield* Effect.fail(
+            new Error(`Cannot resume task_id ${taskID}: session is not a direct child of ${parent.id}`),
+          )
+        if (
+          session.projectID !== parent.projectID ||
+          session.workspaceID !== parent.workspaceID ||
+          session.directory !== parent.directory ||
+          session.path !== parent.path
+        )
+          return yield* Effect.fail(
+            new Error(`Cannot resume task_id ${taskID}: session belongs to a different project or location`),
+          )
+        if (session.agent !== undefined && session.agent !== next.name)
+          return yield* Effect.fail(
+            new Error(`Cannot resume task_id ${taskID}: session agent ${session.agent} does not match ${next.name}`),
+          )
+        return session
+      })
+      const session = params.task_id ? yield* resume(params.task_id) : undefined
 
       if (!ctx.extra?.bypassAgentCheck) {
         yield* ctx.ask({
@@ -144,14 +188,6 @@ export const TaskTool = Tool.define(
         })
       }
 
-      const next = yield* agent.get(params.subagent_type)
-      if (!next) {
-        return yield* Effect.fail(new Error(`Unknown agent type: ${params.subagent_type} is not a valid agent type`))
-      }
-
-      const session = params.task_id
-        ? yield* sessions.get(SessionID.make(params.task_id)).pipe(Effect.catchCause(() => Effect.succeed(undefined)))
-        : undefined
       const childPermission = deriveSubagentSessionPermission({
         parentSessionPermission: parent.permission ?? [],
         subagent: next,
@@ -194,10 +230,11 @@ export const TaskTool = Tool.define(
       if (msg.info.role !== "assistant") return yield* Effect.fail(new Error("Not an assistant message"))
       const variant = msg.info.variant
 
-      const model = (params.model ? Provider.parseModel(params.model) : undefined) ?? next.model ?? {
-        modelID: msg.info.modelID,
-        providerID: msg.info.providerID,
-      }
+      const model = (params.model ? Provider.parseModel(params.model) : undefined) ??
+        next.model ?? {
+          modelID: msg.info.modelID,
+          providerID: msg.info.providerID,
+        }
       const metadata = {
         parentSessionId: ctx.sessionID,
         sessionId: nextSession.id,
@@ -212,7 +249,15 @@ export const TaskTool = Tool.define(
 
       const ops = ctx.extra?.promptOps as TaskPromptOps
       if (!ops) return yield* Effect.fail(new Error("TaskTool requires promptOps in ctx.extra"))
-      const parentCheckpoint = yield* ops.checkpoint(ctx.sessionID)
+      const notificationTargets = yield* Effect.forEach(ancestors, (session) =>
+        ops.checkpoint(session.id).pipe(Effect.map((checkpoint) => ({ session, checkpoint }))),
+      )
+      const resumableFailure = (message: string) =>
+        message.includes(`task_id: ${nextSession.id}`)
+          ? message
+          : `Subagent failed (task_id: ${nextSession.id}): ${message}`
+      const resumableError = (error: unknown) =>
+        new Error(resumableFailure(error instanceof Error ? error.message : String(error)))
 
       const runTask = Effect.fn("TaskTool.runTask")(function* () {
         const basicParts = yield* ops.resolvePromptParts(params.prompt)
@@ -254,55 +299,73 @@ export const TaskTool = Tool.define(
         return text
       })
 
-      const inject = Effect.fn("TaskTool.injectBackgroundResult")(function* (
+      const notificationInput = (
+        target: (typeof notificationTargets)[number],
+        state: "completed" | "error",
+        text: string,
+      ): SessionPrompt.PromptInput => ({
+        sessionID: target.session.id,
+        agent: target.session.agent ?? (target.session.id === ctx.sessionID ? ctx.agent : undefined),
+        variant,
+        parts: [
+          {
+            type: "text",
+            synthetic: true,
+            text: renderOutput({
+              sessionID: nextSession.id,
+              state,
+              summary:
+                state === "completed"
+                  ? `Background task completed: ${params.description}`
+                  : `Background task failed: ${params.description}`,
+              text,
+            }),
+          },
+        ],
+      })
+
+      const forward = Effect.fn("TaskTool.forwardBackgroundResult")(function* (
+        target: (typeof notificationTargets)[number],
         state: "completed" | "error",
         text: string,
       ) {
-        const currentParent = yield* sessions.get(ctx.sessionID)
-        yield* ops
-          .notify(
-            {
-              sessionID: ctx.sessionID,
-              agent: currentParent.agent ?? ctx.agent,
-              variant,
-              parts: [
-                {
-                  type: "text",
-                  synthetic: true,
-                  text: renderOutput({
-                    sessionID: nextSession.id,
-                    state,
-                    summary:
-                      state === "completed"
-                        ? `Background task completed: ${params.description}`
-                        : `Background task failed: ${params.description}`,
-                    text,
-                  }),
-                },
-              ],
-            },
-            parentCheckpoint,
+        yield* ops.notify(notificationInput(target, state, text), target.checkpoint)
+        const latest = (yield* sessions.messages({ sessionID: target.session.id })).findLast(
+          (message) => message.info.role === "assistant",
+        )
+        const part = latest?.parts.findLast((item) => item.type === "text")
+        return part?.type === "text" ? part.text : text
+      })
+
+      const route = Effect.fn("TaskTool.routeBackgroundResult")(function* (
+        state: "completed" | "error",
+        text: string,
+      ) {
+        for (const target of notificationTargets.slice(0, -1)) {
+          if (
+            yield* background.extend({
+              id: target.session.id,
+              expectedType: id,
+              run: forward(target, state, text),
+            })
           )
+            return
+        }
+        const root = notificationTargets.at(-1)
+        if (!root) return
+        yield* ops
+          .notify(notificationInput(root, state, text), root.checkpoint)
           .pipe(Effect.ignore, Effect.forkIn(scope, { startImmediately: true }))
       })
 
-      const notify = Effect.fn("TaskTool.notifyBackgroundResult")(function* (jobID: string) {
-        yield* background.wait({ id: jobID }).pipe(
-          Effect.flatMap((result) => {
-            if (result.info?.status === "completed") return inject("completed", result.info.output ?? "")
-            if (result.info?.status === "error") return inject("error", result.info.error ?? "")
-            // Cancellation is still an outcome the caller has to react to.
-            // Staying silent leaves it waiting for a delivery that never comes.
-            // A cancel that targeted the caller too bumps its checkpoint, so
-            // `notify` drops this injection on admission.
-            if (result.info?.status === "cancelled") return inject("error", "Task cancelled")
-            return Effect.void
-          }),
-          Effect.forkIn(scope, { startImmediately: true }),
-        )
-      })
+      const complete = (info: BackgroundJob.Info) => {
+        if (info.status === "completed") return route("completed", info.output ?? "")
+        if (info.status === "error") return route("error", info.error ?? "")
+        if (info.status === "cancelled") return route("error", "Task cancelled")
+        return Effect.void
+      }
 
-      if (yield* background.extend({ id: nextSession.id, run: runTask() })) {
+      function backgroundResult(summary: string, text: string) {
         return {
           title: params.description,
           metadata: {
@@ -313,87 +376,96 @@ export const TaskTool = Tool.define(
           output: renderOutput({
             sessionID: nextSession.id,
             state: "running",
-            summary: "Background task updated",
-            text: BACKGROUND_UPDATED,
+            summary,
+            text,
           }),
         }
       }
 
-      const info = yield* background.start({
+      const waitForeground = Effect.fn("TaskTool.waitForeground")(function* (allowPromotion: boolean) {
+        const runCancel = yield* EffectBridge.make()
+        const cancel = ops.cancel(nextSession.id)
+
+        function onAbort() {
+          runCancel.fork(cancel)
+        }
+
+        return yield* Effect.acquireUseRelease(
+          Effect.sync(() => {
+            ctx.abort.addEventListener("abort", onAbort)
+          }),
+          () =>
+            Effect.gen(function* () {
+              const result = allowPromotion
+                ? yield* Effect.raceFirst(
+                    background.wait({ id: nextSession.id }).pipe(Effect.map((waited) => waited.info)),
+                    background.waitForPromotion(nextSession.id),
+                  )
+                : (yield* background.wait({ id: nextSession.id })).info
+              if (result?.status === "running" && result.metadata?.background === true)
+                return backgroundResult("Background task started", BACKGROUND_STARTED)
+              if (!result) return yield* Effect.fail(new Error(resumableFailure("Task result unavailable")))
+              if (result.status === "error")
+                return yield* Effect.fail(new Error(resumableFailure(result.error ?? "Task failed")))
+              if (result.status === "cancelled")
+                return yield* Effect.fail(new Error(resumableFailure("Task cancelled")))
+              return {
+                title: params.description,
+                metadata,
+                output: renderOutput({ sessionID: nextSession.id, state: "completed", text: result.output ?? "" }),
+              }
+            }),
+          (_, exit) =>
+            Effect.gen(function* () {
+              if (Exit.hasInterrupts(exit))
+                yield* Effect.all([cancel, background.cancel(nextSession.id)], { discard: true })
+            }).pipe(
+              Effect.ensuring(
+                Effect.sync(() => {
+                  ctx.abort.removeEventListener("abort", onAbort)
+                }),
+              ),
+            ),
+        )
+      })
+
+      const taskRun = runTask().pipe(
+        Effect.mapError(resumableError),
+        Effect.catchDefect((defect) => Effect.fail(resumableError(defect))),
+        Effect.onInterrupt(() => ops.cancel(nextSession.id)),
+      )
+      if (
+        yield* background.extend({
+          id: nextSession.id,
+          expectedType: id,
+          claimCompletion: !runInBackground,
+          run: taskRun,
+        })
+      ) {
+        if (runInBackground) return backgroundResult("Background task updated", BACKGROUND_UPDATED)
+        const active = yield* background.get(nextSession.id)
+        return yield* waitForeground(active?.metadata?.background !== true)
+      }
+
+      yield* background.start({
         id: nextSession.id,
         type: id,
         title: params.description,
         metadata,
-        onPromote: Effect.all([
-          ctx.metadata({
-            title: params.description,
-            metadata: { ...metadata, background: true, jobId: nextSession.id },
-          }),
-          notify(nextSession.id),
-        ]),
-        run: runTask().pipe(Effect.onInterrupt(() => ops.cancel(nextSession.id))),
+        onPromote: ctx.metadata({
+          title: params.description,
+          metadata: { ...metadata, background: true, jobId: nextSession.id },
+        }),
+        onComplete: complete,
+        notifyOnComplete: runInBackground,
+        run: taskRun,
       })
 
-      function backgroundResult() {
-        return {
-          title: params.description,
-          metadata: {
-            ...metadata,
-            background: true,
-            jobId: info.id,
-          },
-          output: renderOutput({
-            sessionID: nextSession.id,
-            state: "running",
-            summary: "Background task started",
-            text: BACKGROUND_STARTED,
-          }),
-        }
-      }
-
       if (runInBackground) {
-        yield* notify(info.id)
-        return backgroundResult()
+        return backgroundResult("Background task started", BACKGROUND_STARTED)
       }
 
-      const runCancel = yield* EffectBridge.make()
-      const cancel = ops.cancel(nextSession.id)
-
-      function onAbort() {
-        runCancel.fork(cancel)
-      }
-
-      return yield* Effect.acquireUseRelease(
-        Effect.sync(() => {
-          ctx.abort.addEventListener("abort", onAbort)
-        }),
-        () =>
-          Effect.gen(function* () {
-            const result = yield* Effect.raceFirst(
-              background.wait({ id: nextSession.id }).pipe(Effect.map((waited) => waited.info)),
-              background.waitForPromotion(nextSession.id),
-            )
-            if (result?.metadata?.background === true) return backgroundResult()
-            if (result?.status === "error") return yield* Effect.fail(new Error(result.error ?? "Task failed"))
-            if (result?.status === "cancelled") return yield* Effect.fail(new Error("Task cancelled"))
-            return {
-              title: params.description,
-              metadata,
-              output: renderOutput({ sessionID: nextSession.id, state: "completed", text: result?.output ?? "" }),
-            }
-          }),
-        (_, exit) =>
-          Effect.gen(function* () {
-            if (Exit.hasInterrupts(exit))
-              yield* Effect.all([cancel, background.cancel(nextSession.id)], { discard: true })
-          }).pipe(
-            Effect.ensuring(
-              Effect.sync(() => {
-                ctx.abort.removeEventListener("abort", onAbort)
-              }),
-            ),
-          ),
-      )
+      return yield* waitForeground(true)
     })
 
     return {

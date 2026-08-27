@@ -302,7 +302,8 @@ exports[`tool parameters JSON Schema (wire shape) task 1`] = `
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "properties": {
     "background": {
-      "description": "Run the agent in the background. You will be notified when it completes. DO NOT sleep, poll, or proactively check on its progress",
+      "default": true,
+      "description": "Run the agent in the background (default true). Set false only to wait synchronously. You will be notified when it completes. DO NOT sleep, poll, or proactively check on its progress",
       "type": "boolean",
     },
     "command": {
@@ -311,6 +312,10 @@ exports[`tool parameters JSON Schema (wire shape) task 1`] = `
     },
     "description": {
       "description": "A short (3-5 words) description of the task",
+      "type": "string",
+    },
+    "model": {
+      "description": "Optional provider/model to use for the subagent (for example, anthropic/claude-sonnet-4-5). Defaults to the subagent's configured model, or the current model when none is configured",
       "type": "string",
     },
     "prompt": {
