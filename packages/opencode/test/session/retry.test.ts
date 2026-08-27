@@ -306,6 +306,27 @@ describe("session.retry.retryable", () => {
     expect(SessionRetry.retryable(error, retryProvider)).toEqual({ message: "Request failed" })
   })
 
+  test("does not retry a classifier rejection whose body also matches a transient pattern", () => {
+    const error = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
+      new SessionV1.APIError({
+        message: "Provider request failed with HTTP 400",
+        isRetryable: false,
+        statusCode: 400,
+        responseBody: JSON.stringify({
+          error: { message: "Output blocked by content filtering policy", request_id: "req_500" },
+        }),
+      }).toObject(),
+    )
+    expect(SessionRetry.retryable(error, retryProvider)).toBeUndefined()
+  })
+
+  test("does not retry a content filter verdict", () => {
+    const error = Schema.decodeUnknownSync(SessionV1.ContentFilterError.Schema)(
+      new SessionV1.ContentFilterError({ message: "Response was blocked by the content filter" }).toObject(),
+    )
+    expect(SessionRetry.retryable(error, retryProvider)).toBeUndefined()
+  })
+
   test("retries transport timeout errors", () => {
     const request = MessageV2.fromError(new ProviderError.HeaderTimeoutError(10000), { providerID })
     expect(SessionV1.APIError.isInstance(request)).toBe(true)

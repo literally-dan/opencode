@@ -40,6 +40,12 @@ const RETRYABLE_MESSAGE_PATTERNS = [
   /\btry again (?:later|in\b)|\b(?:currently|temporarily) at capacity\b/i,
 ]
 
+// A safety classifier reports its verdict in the response body, and the patterns
+// above are substring matches — a rejection body that merely contains "500" or
+// "terminated" would otherwise be retried until the attempts run out.
+const CONTENT_POLICY_PATTERN =
+  /content[-_\s]?polic|content[-_\s]?filter|prohibited[-_\s]?content|safety[-_\s]?(?:filter|polic|classifier|setting)|blocked by (?:the )?(?:content|safety|provider)|guardrail/i
+
 function cap(ms: number) {
   return Math.min(ms, RETRY_MAX_DELAY)
 }
@@ -85,6 +91,14 @@ function exponential(attempt: number, random: number) {
 export function retryable(error: Err, provider: string) {
   // context overflow errors should not be retried
   if (SessionV1.ContextOverflowError.isInstance(error)) return undefined
+  // A classifier rejection is a verdict on the request, not a transport fault.
+  // Every retry re-sends the same prompt for the same verdict.
+  if (SessionV1.ContentFilterError.isInstance(error)) return undefined
+  if (
+    isRecord(error.data) &&
+    (matchesContentPolicy(error.data.message) || matchesContentPolicy(error.data.responseBody))
+  )
+    return undefined
   if (SessionV1.APIError.isInstance(error)) {
     if (MessageV2.isPermanentTransportCode(error.data.metadata?.code)) return undefined
     const status = error.data.statusCode
@@ -157,6 +171,10 @@ export function retryable(error: Err, provider: string) {
 
 function matchesRetryableMessage(value: unknown) {
   return typeof value === "string" && RETRYABLE_MESSAGE_PATTERNS.some((pattern) => pattern.test(value))
+}
+
+function matchesContentPolicy(value: unknown) {
+  return typeof value === "string" && CONTENT_POLICY_PATTERN.test(value)
 }
 
 function str(value: unknown) {

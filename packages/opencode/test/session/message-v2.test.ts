@@ -1942,6 +1942,80 @@ describe("session.message-v2.toModelMessage", () => {
     ])
   })
 
+  test("replaces a classifier-rejected assistant turn with a note instead of dropping it", async () => {
+    const assistantID = "m-assistant"
+
+    const input: SessionV1.WithParts[] = [
+      {
+        info: assistantInfo(
+          assistantID,
+          "m-parent",
+          new SessionV1.ContentFilterError({
+            message: "blocked by content filtering policy",
+          }).toObject() as SessionV1.Assistant["error"],
+        ),
+        parts: [
+          {
+            ...basePart(assistantID, "a1"),
+            type: "text",
+            text: "the text that got refused",
+          },
+        ] as SessionV1.Part[],
+      },
+    ]
+
+    expect(await MessageV2.toModelMessages(input, model)).toStrictEqual([
+      {
+        role: "assistant",
+        content: [{ type: "text", text: MessageV2.CONTENT_FILTER_NOTE }],
+      },
+    ])
+  })
+
+  test("removes classifier-rejected stored parts from inventory-visible history", () => {
+    const assistantID = "m-assistant"
+    const rejected = {
+      info: assistantInfo(
+        assistantID,
+        "m-parent",
+        new SessionV1.ContentFilterError({
+          message: "blocked by content filtering policy",
+        }).toObject() as SessionV1.Assistant["error"],
+      ),
+      parts: [
+        {
+          ...basePart(assistantID, "rejected-text"),
+          type: "text",
+          text: "classifier rejected text",
+        },
+        {
+          ...basePart(assistantID, "rejected-tool"),
+          type: "tool",
+          callID: "rejected-call",
+          tool: "read",
+          state: {
+            status: "completed",
+            input: { filePath: "rejected.txt" },
+            output: "classifier rejected tool output",
+            title: "rejected",
+            metadata: {},
+            time: { start: 0, end: 1 },
+          },
+        },
+      ] as SessionV1.Part[],
+    } satisfies SessionV1.WithParts
+    const current = {
+      info: userInfo("m-current"),
+      parts: [{ ...basePart("m-current", "current"), type: "text", text: "continue" }] as SessionV1.Part[],
+    } satisfies SessionV1.WithParts
+
+    const projected = MessageV2.filterCompacted([current, rejected])
+
+    expect(projected.find((message) => message.info.id === assistantID)?.parts).toEqual([])
+    expect(JSON.stringify(projected)).not.toContain("classifier rejected")
+    expect(rejected.parts).toHaveLength(2)
+  })
+
   test("preserves OpenRouter reasoning details through provider transform", async () => {
     const assistantID = "m-assistant"
     const openrouterModel: Provider.Model = {

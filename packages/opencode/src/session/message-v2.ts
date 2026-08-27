@@ -7,6 +7,7 @@ import {
   Assistant,
   AuthError,
   CompactionPart,
+  ContentFilterError,
   ContextOverflowError,
   Info,
   OutputLengthError,
@@ -45,6 +46,8 @@ interface FetchDecompressionError extends Error {
 }
 
 export const SYNTHETIC_ATTACHMENT_PROMPT = "Attached media from tool result:"
+export const CONTENT_FILTER_NOTE =
+  "[This turn was blocked by the provider's safety classifier and produced no usable output. Do not repeat it — take a different approach, or explain to the user why you cannot proceed.]"
 export { isMedia }
 
 function truncateToolOutput(text: string, maxChars?: number) {
@@ -255,6 +258,14 @@ function rendersStoredParts(message: SessionV1.WithParts) {
   )
 }
 
+export function projectErroredTurns(messages: Iterable<WithParts>) {
+  // Durable parts stay recoverable, but every model-facing history consumer
+  // must see the same errored-turn boundary as toModelMessages.
+  return Array.from(messages, (message) =>
+    rendersStoredParts(message) || message.parts.length === 0 ? message : { ...message, parts: [] },
+  )
+}
+
 function willRender(message: SessionV1.WithParts) {
   return hasContentFilterNote(message) || rendersStoredParts(message)
 }
@@ -435,6 +446,7 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
   model: Provider.Model,
   options?: { stripMedia?: boolean; toolOutputMaxChars?: number; stampUser?: boolean },
 ) {
+  const projected = projectErroredTurns(input)
   const result: UIMessage[] = []
   const toolNames = new Set<string>()
   // Track media from tool results that need to be injected as user messages
@@ -494,10 +506,10 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
     return { type: "json", value: output as never }
   }
 
-  const groups = compactionGroups(input)
-  const spans = compactionSpans(input, groups)
+  const groups = compactionGroups(projected)
+  const spans = compactionSpans(projected, groups)
 
-  for (const [messageIndex, msg] of input.entries()) {
+  for (const [messageIndex, msg] of projected.entries()) {
     if (!willRender(msg)) continue
     const span = spans.get(messageIndex)
     // The rest of the span left with the carrier.
@@ -599,6 +611,17 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
           msg.parts.some((part) => part.type !== "step-start" && part.type !== "reasoning")
         )
       ) {
+        // Dropping a classifier-rejected turn entirely leaves no evidence it
+        // happened, so the model replays the request that was refused and gets
+        // refused again. Replace it with a note instead of its content: the
+        // content is what was refused, and any tool calls in it never got
+        // results.
+        if (ContentFilterError.isInstance(msg.info.error))
+          result.push({
+            id: msg.info.id,
+            role: "assistant",
+            parts: [{ type: "text", text: CONTENT_FILTER_NOTE }],
+          })
         continue
       }
       const assistantMessage: UIMessage = {
@@ -969,13 +992,13 @@ export function filterCompacted(msgs: Iterable<WithParts>) {
     : -1
   const tailIndex = part?.tail_start_id ? result.findIndex((msg) => msg.info.id === part.tail_start_id) : -1
   if (tailIndex >= 0 && tailIndex < compactionIndex && summaryIndex > compactionIndex) {
-    return [
+    return projectErroredTurns([
       ...result.slice(compactionIndex, summaryIndex + 1),
       ...result.slice(tailIndex, compactionIndex),
       ...result.slice(summaryIndex + 1),
-    ]
+    ])
   }
-  return result
+  return projectErroredTurns(result)
 }
 
 export const filterCompactedEffect = Effect.fnUntraced(function* (sessionID: SessionID) {
