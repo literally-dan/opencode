@@ -13,7 +13,7 @@ import { Truncate } from "@/tool/truncate"
 import { Plugin } from "@/plugin"
 import type { TaskPromptOps } from "@/tool/task"
 import { type Tool as AITool, tool, jsonSchema, type ToolExecutionOptions, asSchema } from "ai"
-import { Effect } from "effect"
+import { Cause, Effect } from "effect"
 import { MessageV2 } from "./message-v2"
 import { Session } from "./session"
 import { SessionProcessor } from "./processor"
@@ -42,7 +42,10 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
   agent: Agent.Info
   model: Provider.Model
   session: Session.Info
-  processor: Pick<SessionProcessor.Handle, "message" | "updateToolCall" | "completeToolCall">
+  processor: Pick<
+    SessionProcessor.Handle,
+    "message" | "toolSignal" | "startToolCall" | "updateToolCall" | "completeToolCall" | "failToolCall"
+  >
   bypassAgentCheck: boolean
   messages: SessionV1.WithParts[]
   promptOps: TaskPromptOps
@@ -58,7 +61,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
 
   const context = (args: Record<string, unknown>, options: ToolExecutionOptions): Tool.Context => ({
     sessionID: input.session.id,
-    abort: options.abortSignal!,
+    abort: input.processor.toolSignal ?? options.abortSignal!,
     messageID: input.processor.message.id,
     callID: options.toolCallId,
     extra: { model: input.model, bypassAgentCheck: input.bypassAgentCheck, promptOps: input.promptOps },
@@ -88,6 +91,30 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
         })
         .pipe(Effect.orDie),
   })
+
+  const settle =
+    (toolCallID: string, name: string, args: unknown, options: ToolExecutionOptions) =>
+    <A extends Parameters<SessionProcessor.Handle["completeToolCall"]>[1], E, R>(effect: Effect.Effect<A, E, R>) =>
+      (
+        input.processor.startToolCall?.(
+          SessionProcessor.getToolGeneration(options),
+          toolCallID,
+          name,
+          toRecord(args),
+        ) ?? Effect.succeed(true)
+      ).pipe(
+        Effect.flatMap((accepted) => (accepted ? effect : Effect.interrupt)),
+        // A tool may handle cancellation by returning a useful partial result
+        // (notably shell's "User aborted" output). The processor's serialized
+        // terminal transition accepts that prompt settlement but rejects late
+        // completion after cancellation cleanup has made the part terminal.
+        Effect.tap((output) => input.processor.completeToolCall(toolCallID, output)),
+        Effect.tapCause((cause) =>
+          input.processor.toolSignal?.aborted || Cause.hasInterruptsOnly(cause)
+            ? Effect.void
+            : (input.processor.failToolCall?.(toolCallID, Cause.squash(cause)) ?? Effect.void),
+        ),
+      )
 
   for (const item of yield* registry.tools({
     modelID: ModelV2.ID.make(input.model.api.id),
@@ -123,11 +150,8 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
               { tool: item.id, sessionID: ctx.sessionID, callID: ctx.callID, args },
               output,
             )
-            if (options.abortSignal?.aborted) {
-              yield* input.processor.completeToolCall(options.toolCallId, output)
-            }
             return output
-          }),
+          }).pipe(settle(options.toolCallId, item.id, args, options)),
         )
       },
     })
@@ -210,11 +234,8 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
               { tool: MCP_RESOURCE_TOOLS.list, sessionID: ctx.sessionID, callID: opts.toolCallId, args },
               output,
             )
-            if (opts.abortSignal?.aborted) {
-              yield* input.processor.completeToolCall(opts.toolCallId, output)
-            }
             return output
-          }),
+          }).pipe(settle(opts.toolCallId, MCP_RESOURCE_TOOLS.list, args, opts)),
         )
       },
     })
@@ -293,11 +314,8 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
               { tool: MCP_RESOURCE_TOOLS.listTemplates, sessionID: ctx.sessionID, callID: opts.toolCallId, args },
               output,
             )
-            if (opts.abortSignal?.aborted) {
-              yield* input.processor.completeToolCall(opts.toolCallId, output)
-            }
             return output
-          }),
+          }).pipe(settle(opts.toolCallId, MCP_RESOURCE_TOOLS.listTemplates, args, opts)),
         )
       },
     })
@@ -375,11 +393,8 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
               { tool: MCP_RESOURCE_TOOLS.read, sessionID: ctx.sessionID, callID: opts.toolCallId, args },
               output,
             )
-            if (opts.abortSignal?.aborted) {
-              yield* input.processor.completeToolCall(opts.toolCallId, output)
-            }
             return output
-          }),
+          }).pipe(settle(opts.toolCallId, MCP_RESOURCE_TOOLS.read, args, opts)),
         )
       },
     })
@@ -406,7 +421,9 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
           )
           const result: Awaited<ReturnType<NonNullable<typeof execute>>> = yield* Effect.gen(function* () {
             yield* ctx.ask({ permission: key, metadata: {}, patterns: ["*"], always: ["*"] })
-            return yield* Effect.promise(() => execute(args, opts))
+            return yield* Effect.promise(() =>
+              execute(args, { ...opts, abortSignal: input.processor.toolSignal ?? opts.abortSignal }),
+            )
           }).pipe(
             Effect.withSpan("Tool.execute", {
               attributes: {
@@ -480,11 +497,8 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
             })),
             content: result.content,
           }
-          if (opts.abortSignal?.aborted) {
-            yield* input.processor.completeToolCall(opts.toolCallId, output)
-          }
           return output
-        }),
+        }).pipe(settle(opts.toolCallId, key, args, opts)),
       )
     tools[key] = item
   }

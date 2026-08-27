@@ -4,7 +4,7 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { expect } from "bun:test"
 import { tool } from "ai"
-import { Cause, Effect, Exit, Fiber, Layer, Stream } from "effect"
+import { Cause, Context, Deferred, Effect, Exit, Fiber, Layer, Schema, Stream } from "effect"
 import path from "path"
 import z from "zod"
 import type { Agent } from "../../src/agent/agent"
@@ -26,6 +26,14 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { LLMEvent } from "@opencode-ai/llm"
+import { SessionTools } from "@/session/tools"
+import { ToolRegistry } from "@/tool/registry"
+import { Tool } from "@/tool/tool"
+import { MCP } from "@/mcp"
+import { Truncate } from "@/tool/truncate"
+import { Plugin } from "@/plugin"
+import { Permission } from "@/permission"
+import { Image } from "@/image/image"
 
 const summary = Layer.succeed(
   SessionSummary.Service,
@@ -225,6 +233,259 @@ const fragmentFailureLLM = Layer.succeed(
 )
 const fragmentFailureEnv = LayerNode.compile(root, [...replacements, [LLM.node, fragmentFailureLLM]])
 const itFragmentFailure = testEffect(fragmentFailureEnv)
+
+type RecoveryStateValue = {
+  mode: "recovery" | "cleanup" | "retry" | "sibling"
+  started: Deferred.Deferred<void>
+  release: Deferred.Deferred<void>
+  finished: Deferred.Deferred<void>
+  cancelled: Deferred.Deferred<void>
+  callbackReady: Deferred.Deferred<void>
+  retryStarted: Deferred.Deferred<void>
+  finishRetry: Deferred.Deferred<void>
+  delayed?: () => Promise<unknown>
+  providerCalls: number
+  toolCalls: number
+  cancellations: number
+  image: boolean
+  normalizations: number
+}
+
+class RecoveryState extends Context.Service<RecoveryState, RecoveryStateValue>()("@test/RecoveryState") {}
+
+const recoveryStateLayer = Layer.effect(
+  RecoveryState,
+  Effect.gen(function* () {
+    return RecoveryState.of({
+      mode: "recovery",
+      started: yield* Deferred.make<void>(),
+      release: yield* Deferred.make<void>(),
+      finished: yield* Deferred.make<void>(),
+      cancelled: yield* Deferred.make<void>(),
+      callbackReady: yield* Deferred.make<void>(),
+      retryStarted: yield* Deferred.make<void>(),
+      finishRetry: yield* Deferred.make<void>(),
+      providerCalls: 0,
+      toolCalls: 0,
+      cancellations: 0,
+      image: false,
+      normalizations: 0,
+    })
+  }),
+)
+const recoveryStateNode = LayerNode.make({ service: RecoveryState, layer: recoveryStateLayer, deps: [] })
+const recoveryLLM = Layer.effect(
+  LLM.Service,
+  Effect.gen(function* () {
+    const state = yield* RecoveryState
+    return LLM.Service.of({
+      stream: (input) => {
+        state.providerCalls += 1
+        const execute = input.tools.lookup?.execute
+        if (!execute) return Stream.fail(new Error("lookup tool is missing"))
+        const transport = new AbortController()
+        const invoke = () =>
+          Promise.resolve(
+            execute({}, { toolCallId: "call-1", messages: input.messages, abortSignal: transport.signal }),
+          )
+        if (state.mode === "cleanup") {
+          return Stream.fromEffectDrain(
+            Effect.sync(() => {
+              state.delayed = invoke
+            }).pipe(Effect.andThen(Deferred.succeed(state.callbackReady, undefined))),
+          )
+        }
+        if (state.mode === "retry") {
+          if (state.providerCalls === 1) {
+            return Stream.fromEffectDrain(
+              Effect.sync(() => {
+                state.delayed = invoke
+              }).pipe(Effect.andThen(Deferred.succeed(state.callbackReady, undefined))),
+            ).pipe(Stream.concat(Stream.fail(new Error("terminated"))))
+          }
+          return Stream.fromEffectDrain(Deferred.succeed(state.retryStarted, undefined)).pipe(
+            Stream.concat(Stream.fromEffectDrain(Deferred.await(state.finishRetry))),
+          )
+        }
+        const events = Stream.make(
+          LLMEvent.stepStart({ index: 0 }),
+          LLMEvent.toolInputStart({ id: "call-1", name: "lookup" }),
+          LLMEvent.toolInputEnd({ id: "call-1", name: "lookup" }),
+          LLMEvent.toolCall({ id: "call-1", name: "lookup", input: {} }),
+          ...(state.mode === "sibling"
+            ? [
+                LLMEvent.toolInputStart({ id: "call-fail", name: "failing" }),
+                LLMEvent.toolInputEnd({ id: "call-fail", name: "failing" }),
+                LLMEvent.toolCall({ id: "call-fail", name: "failing", input: {} }),
+                LLMEvent.toolResult({
+                  id: "call-fail",
+                  name: "failing",
+                  result: { type: "error", value: "sibling failed" },
+                }),
+              ]
+            : []),
+        )
+        return events.pipe(
+          Stream.concat(
+            Stream.fromEffectDrain(
+              Effect.gen(function* () {
+                yield* Effect.sync(() => {
+                  void invoke().catch(() => {})
+                })
+                yield* Deferred.await(state.started)
+                transport.abort()
+                return yield* Effect.fail(new Error("terminated"))
+              }),
+            ),
+          ),
+        )
+      },
+    })
+  }),
+)
+const recoveryLLMNode = LayerNode.make({
+  service: LLM.Service,
+  layer: recoveryLLM,
+  deps: [recoveryStateNode],
+})
+const recoveryImage = Layer.effect(
+  Image.Service,
+  Effect.gen(function* () {
+    const state = yield* RecoveryState
+    return Image.Service.of({
+      normalize: (input) =>
+        Effect.sync(() => {
+          state.normalizations += 1
+          return { ...input, mime: "image/webp", url: "data:image/webp;base64,normalized" }
+        }),
+    })
+  }),
+)
+const recoveryImageNode = LayerNode.make({
+  service: Image.Service,
+  layer: recoveryImage,
+  deps: [recoveryStateNode],
+})
+const recoveryEnv = LayerNode.compile(
+  LayerNode.group([root, recoveryStateNode, Plugin.node, Permission.node, RuntimeFlags.node]),
+  [...replacements, [LLM.node, recoveryLLMNode], [Image.node, recoveryImageNode]],
+)
+const itRecovery = testEffect(recoveryEnv)
+
+const emptyParameters = Schema.Struct({})
+
+function recoveryRegistry(state: RecoveryStateValue) {
+  const held: Tool.Def<typeof emptyParameters> = {
+    id: "lookup",
+    description: "Held lookup",
+    parameters: emptyParameters,
+    jsonSchema: { type: "object", properties: {}, additionalProperties: false },
+    execute: (_args, ctx) =>
+      Effect.gen(function* () {
+        state.toolCalls += 1
+        if (state.mode === "cleanup" || state.mode === "retry") {
+          return { title: "Unexpected lookup", metadata: {}, output: "unexpected" }
+        }
+        const onAbort = () => {
+          state.cancellations += 1
+          Effect.runSync(Deferred.succeed(state.cancelled, undefined).pipe(Effect.ignore))
+        }
+        ctx.abort.addEventListener("abort", onAbort, { once: true })
+        if (ctx.abort.aborted) onAbort()
+        yield* Deferred.succeed(state.started, undefined)
+        yield* Deferred.await(state.release)
+        ctx.abort.removeEventListener("abort", onAbort)
+        yield* Deferred.succeed(state.finished, undefined)
+        return {
+          title: "Lookup complete",
+          metadata: { source: "held" },
+          output: "held result",
+          attachments: state.image
+            ? [{ type: "file", mime: "image/png", url: "data:image/png;base64,original" }]
+            : undefined,
+        }
+      }),
+  }
+  return ToolRegistry.Service.of({
+    ids: () => Effect.succeed([held.id]),
+    all: () => Effect.succeed([held]),
+    named: () => Effect.die("unused"),
+    tools: () => Effect.succeed([held]),
+  })
+}
+
+const emptyMcp = MCP.Service.of({
+  status: () => Effect.succeed({}),
+  clients: () => Effect.succeed({}),
+  instructions: () => Effect.succeed([]),
+  tools: () => Effect.succeed({}),
+  prompts: () => Effect.succeed({}),
+  resources: () => Effect.succeed({}),
+  resourceTemplates: () => Effect.succeed({}),
+  add: () => Effect.die("unused"),
+  connect: () => Effect.die("unused"),
+  disconnect: () => Effect.die("unused"),
+  getPrompt: () => Effect.die("unused"),
+  readResource: () => Effect.die("unused"),
+  startAuth: () => Effect.die("unused"),
+  authenticate: () => Effect.die("unused"),
+  finishAuth: () => Effect.die("unused"),
+  removeAuth: () => Effect.die("unused"),
+  supportsOAuth: () => Effect.die("unused"),
+  hasStoredTokens: () => Effect.die("unused"),
+  getAuthStatus: () => Effect.succeed("not_authenticated"),
+})
+
+const passthroughTruncate = Truncate.Service.of({
+  cleanup: () => Effect.void,
+  write: (text) => Effect.succeed(text),
+  output: (text) => Effect.succeed({ content: text, truncated: false }),
+  limits: () => Effect.succeed({ maxLines: Truncate.MAX_LINES, maxBytes: Truncate.MAX_BYTES }),
+})
+
+const recoverySetup = Effect.fn("test.recoverySetup")(function* (root: string) {
+  const state = yield* RecoveryState
+  const { processors, session, provider } = yield* boot()
+  const chat = yield* session.create({})
+  const parent = yield* user(chat.id, "recover tool")
+  const msg = yield* assistant(chat.id, parent.id, root)
+  const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+  const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+  const tools = yield* SessionTools.resolve({
+    agent: agent(),
+    model: mdl,
+    session: chat,
+    processor: handle,
+    bypassAgentCheck: false,
+    messages: yield* session.messages({ sessionID: chat.id }),
+    promptOps: {
+      cancel: () => Effect.void,
+      checkpoint: () => Effect.succeed(0),
+      resolvePromptParts: () => Effect.die("unused"),
+      prompt: () => Effect.die("unused"),
+      notify: () => Effect.void,
+    },
+  }).pipe(
+    Effect.provideService(ToolRegistry.Service, recoveryRegistry(state)),
+    Effect.provideService(MCP.Service, emptyMcp),
+    Effect.provideService(Truncate.Service, passthroughTruncate),
+  )
+  return {
+    state,
+    session,
+    msg,
+    handle,
+    input: {
+      user: parent,
+      sessionID: chat.id,
+      model: mdl,
+      agent: agent(),
+      system: [],
+      messages: [{ role: "user" as const, content: "recover tool" }],
+      tools,
+    } satisfies LLM.StreamInput,
+  }
+})
 
 const boot = Effect.fn("test.boot")(function* () {
   const processors = yield* SessionProcessor.Service
@@ -806,14 +1067,83 @@ it.live("session.processor effect tests discard a failed attempt's parts before 
         expect(value).toBe("continue")
         expect(yield* llm.calls).toBe(2)
         expect(handle.message.error).toBeUndefined()
+        const parts = yield* MessageV2.parts(msg.id)
         expect(
-          (yield* MessageV2.parts(msg.id))
-            .filter((part): part is SessionV1.TextPart => part.type === "text")
-            .map((part) => part.text),
+          parts.filter((part): part is SessionV1.TextPart => part.type === "text").map((part) => part.text),
         ).toEqual(["recovered"])
+        expect(parts.filter((part) => part.type === "step-start")).toHaveLength(1)
       }),
     { config: (url) => providerCfg(url) },
   ),
+)
+
+it.live(
+  "session.processor effect tests settle a reused tool call ID after retrying",
+  () =>
+    provideTmpdirServer(
+      ({ dir, llm }) =>
+        Effect.gen(function* () {
+          const { processors, session, provider } = yield* boot()
+          let executions = 0
+
+          yield* llm.push(reply().pendingTool("lookup", { query: "par" }).reset())
+          yield* llm.tool("lookup", { query: "weather" })
+
+          const chat = yield* session.create({})
+          const parent = yield* user(chat.id, "retry tool")
+          const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+          const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+          const handle = yield* processors.create({
+            assistantMessage: msg,
+            sessionID: chat.id,
+            model: mdl,
+          })
+
+          const value = yield* handle.process({
+            user: {
+              id: parent.id,
+              sessionID: chat.id,
+              role: "user",
+              time: parent.time,
+              agent: parent.agent,
+              model: { providerID: ref.providerID, modelID: ref.modelID },
+            } satisfies SessionV1.User,
+            sessionID: chat.id,
+            model: mdl,
+            agent: agent(),
+            system: [],
+            messages: [{ role: "user", content: "retry tool" }],
+            tools: {
+              lookup: tool({
+                description: "Look up information",
+                inputSchema: z.object({ query: z.string() }),
+                execute: async (input) => {
+                  executions += 1
+                  return {
+                    title: "Weather lookup",
+                    output: `result:${input.query}`,
+                    metadata: { source: "test" },
+                  }
+                },
+              }),
+            },
+          })
+
+          const calls = (yield* MessageV2.parts(msg.id)).filter(
+            (part): part is SessionV1.ToolPart => part.type === "tool",
+          )
+          expect(value).toBe("continue")
+          expect(yield* llm.calls).toBe(2)
+          expect(executions).toBe(1)
+          expect(calls).toHaveLength(1)
+          expect(calls[0]?.state.status).toBe("completed")
+          if (calls[0]?.state.status !== "completed") return
+          expect(calls[0].state.input).toEqual({ query: "weather" })
+          expect(calls[0].state.output).toBe("result:weather")
+        }),
+      { config: (url) => providerCfg(url) },
+    ),
+  30_000,
 )
 
 it.live("session.processor effect tests compact on structured context overflow", () =>
@@ -921,6 +1251,278 @@ it.live("session.processor effect tests complete AI SDK tool calls when native f
         expect(call.state.time.end).toBeDefined()
       }),
     { config: (url) => providerCfg(url) },
+  ),
+)
+
+itRecovery.live("session.processor effect tests reject a tool callback delayed past cleanup", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const setup = yield* recoverySetup(path.resolve(dir))
+        setup.state.mode = "cleanup"
+
+        expect(yield* setup.handle.process(setup.input)).toBe("continue")
+        yield* Deferred.await(setup.state.callbackReady)
+        const delayed = setup.state.delayed
+        if (!delayed) return yield* Effect.die("delayed callback is missing")
+
+        const first = yield* Effect.tryPromise({ try: delayed, catch: (error) => error }).pipe(Effect.exit)
+        const second = yield* Effect.tryPromise({ try: delayed, catch: (error) => error }).pipe(Effect.exit)
+        const calls = (yield* MessageV2.parts(setup.msg.id)).filter((part) => part.type === "tool")
+
+        expect(Exit.isFailure(first)).toBe(true)
+        expect(Exit.isFailure(second)).toBe(true)
+        expect(setup.state.providerCalls).toBe(1)
+        expect(setup.state.toolCalls).toBe(0)
+        expect(calls).toHaveLength(0)
+        expect(setup.handle.message.time.completed).toBeDefined()
+      }),
+    { config: cfg },
+  ),
+)
+
+itRecovery.live("session.processor effect tests reject a stale tool callback after retry starts", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const setup = yield* recoverySetup(path.resolve(dir))
+        setup.state.mode = "retry"
+        const run = yield* setup.handle.process(setup.input).pipe(Effect.forkChild)
+
+        yield* Deferred.await(setup.state.callbackReady)
+        yield* Deferred.await(setup.state.retryStarted)
+        const delayed = setup.state.delayed
+        if (!delayed) return yield* Effect.die("delayed callback is missing")
+
+        const stale = yield* Effect.tryPromise({ try: delayed, catch: (error) => error }).pipe(Effect.exit)
+        expect(Exit.isFailure(stale)).toBe(true)
+        expect(setup.state.providerCalls).toBe(2)
+        expect(setup.state.toolCalls).toBe(0)
+        expect(run.pollUnsafe()).toBeUndefined()
+
+        yield* Deferred.succeed(setup.state.finishRetry, undefined)
+        expect(yield* Fiber.join(run)).toBe("continue")
+        const calls = (yield* MessageV2.parts(setup.msg.id)).filter((part) => part.type === "tool")
+        expect(calls).toHaveLength(0)
+        expect(setup.state.toolCalls).toBe(0)
+      }),
+    { config: cfg },
+  ),
+)
+
+itRecovery.live("session.processor effect tests continue after retryable stream failure with a running tool", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const setup = yield* recoverySetup(path.resolve(dir))
+        const run = yield* setup.handle.process(setup.input).pipe(Effect.forkChild)
+
+        yield* Deferred.await(setup.state.started)
+
+        expect(setup.state.providerCalls).toBe(1)
+        expect(setup.state.toolCalls).toBe(1)
+        expect(setup.state.cancellations).toBe(0)
+        expect(run.pollUnsafe()).toBeUndefined()
+
+        yield* Deferred.succeed(setup.state.release, undefined)
+
+        const value = yield* Fiber.join(run)
+        const call = (yield* MessageV2.parts(setup.msg.id)).find(
+          (part): part is SessionV1.ToolPart => part.type === "tool",
+        )
+
+        expect(value).toBe("continue")
+        expect(setup.state.providerCalls).toBe(1)
+        expect(setup.state.toolCalls).toBe(1)
+        expect(setup.state.cancellations).toBe(0)
+        expect(setup.handle.message.error).toBeUndefined()
+        expect(call?.state.status).toBe("completed")
+        if (call?.state.status !== "completed") return
+        expect(call.state.title).toBe("Lookup complete")
+        expect(call.state.output).toBe("held result")
+        expect(call.state.metadata).toEqual({ source: "held" })
+      }),
+    { config: cfg },
+  ),
+)
+
+itRecovery.live("session.processor effect tests apply completion buffered before running registration", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const setup = yield* recoverySetup(path.resolve(dir))
+        yield* setup.handle.completeToolCall("call-1", {
+          title: "Fast lookup",
+          metadata: { source: "early" },
+          output: "fast result",
+        })
+
+        const value = yield* setup.handle.process(setup.input)
+        const call = (yield* MessageV2.parts(setup.msg.id)).find(
+          (part): part is SessionV1.ToolPart => part.type === "tool",
+        )
+
+        expect(value).toBe("continue")
+        expect(setup.state.providerCalls).toBe(1)
+        expect(setup.state.toolCalls).toBe(1)
+        expect(call?.state.status).toBe("completed")
+        if (call?.state.status === "completed") {
+          expect(call.state.title).toBe("Fast lookup")
+          expect(call.state.output).toBe("fast result")
+          expect(call.state.metadata).toEqual({ source: "early" })
+        }
+
+        yield* Deferred.succeed(setup.state.release, undefined)
+        yield* Deferred.await(setup.state.finished)
+      }),
+    { config: cfg },
+  ),
+)
+
+itRecovery.live("session.processor effect tests apply failure buffered before running registration", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const setup = yield* recoverySetup(path.resolve(dir))
+        const fail = setup.handle.failToolCall
+        if (!fail) return yield* Effect.die("processor does not support direct tool failure")
+        yield* fail("call-1", new Error("fast failure"))
+
+        const value = yield* setup.handle.process(setup.input)
+        const call = (yield* MessageV2.parts(setup.msg.id)).find(
+          (part): part is SessionV1.ToolPart => part.type === "tool",
+        )
+
+        expect(value).toBe("stop")
+        expect(setup.state.providerCalls).toBe(1)
+        expect(setup.state.toolCalls).toBe(1)
+        expect(setup.state.cancellations).toBe(1)
+        expect(call?.state.status).toBe("error")
+        if (call?.state.status === "error") expect(call.state.error).toBe("fast failure")
+
+        yield* Deferred.succeed(setup.state.release, undefined)
+        yield* Deferred.await(setup.state.finished)
+      }),
+    { config: cfg },
+  ),
+)
+
+itRecovery.live("session.processor effect tests stop waiting when one local tool fails", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const setup = yield* recoverySetup(path.resolve(dir))
+        setup.state.mode = "sibling"
+        const run = yield* setup.handle.process(setup.input).pipe(Effect.forkChild)
+
+        yield* Deferred.await(setup.state.started)
+
+        const value = yield* Fiber.join(run)
+        const calls = (yield* MessageV2.parts(setup.msg.id)).filter(
+          (part): part is SessionV1.ToolPart => part.type === "tool",
+        )
+        const failed = calls.find((part) => part.callID === "call-fail")
+        const hanging = calls.find((part) => part.callID === "call-1")
+
+        expect(value).toBe("stop")
+        expect(setup.state.cancellations).toBe(1)
+        expect(failed?.state.status).toBe("error")
+        if (failed?.state.status === "error") expect(failed.state.error).toBe("sibling failed")
+        expect(hanging?.state.status).toBe("error")
+        if (hanging?.state.status === "error") expect(hanging.state.metadata?.interrupted).toBe(true)
+
+        yield* Deferred.succeed(setup.state.release, undefined)
+        yield* Deferred.await(setup.state.finished)
+      }),
+    { config: cfg },
+  ),
+)
+
+itRecovery.live("session.processor effect tests normalize images settled after provider stream failure", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const setup = yield* recoverySetup(path.resolve(dir))
+        setup.state.image = true
+        const run = yield* setup.handle.process(setup.input).pipe(Effect.forkChild)
+
+        yield* Deferred.await(setup.state.started)
+        yield* Deferred.succeed(setup.state.release, undefined)
+
+        expect(yield* Fiber.join(run)).toBe("continue")
+        const call = (yield* MessageV2.parts(setup.msg.id)).find(
+          (part): part is SessionV1.ToolPart => part.type === "tool",
+        )
+
+        expect(setup.state.normalizations).toBe(1)
+        expect(call?.state.status).toBe("completed")
+        if (call?.state.status !== "completed") return
+        expect(call.state.attachments).toHaveLength(1)
+        expect(call.state.attachments?.[0]?.mime).toBe("image/webp")
+        expect(call.state.attachments?.[0]?.url).toBe("data:image/webp;base64,normalized")
+      }),
+    { config: cfg },
+  ),
+)
+
+itRecovery.live("session.processor effect tests preserve prompt tool completion that wins cancellation grace", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const setup = yield* recoverySetup(path.resolve(dir))
+        const run = yield* setup.handle.process(setup.input).pipe(Effect.forkChild)
+
+        yield* Deferred.await(setup.state.started)
+        const cancelling = yield* Fiber.interrupt(run).pipe(Effect.forkChild)
+        yield* Deferred.await(setup.state.cancelled)
+        yield* Deferred.succeed(setup.state.release, undefined)
+        yield* Fiber.join(cancelling)
+
+        const call = (yield* MessageV2.parts(setup.msg.id)).find(
+          (part): part is SessionV1.ToolPart => part.type === "tool",
+        )
+        expect((yield* Fiber.await(run))._tag).toBe("Failure")
+        expect(call?.state.status).toBe("completed")
+        if (call?.state.status === "completed") expect(call.state.output).toBe("held result")
+      }),
+    { config: cfg },
+  ),
+)
+
+itRecovery.live("session.processor effect tests abort the running tool when recovery is interrupted", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const setup = yield* recoverySetup(path.resolve(dir))
+        const run = yield* setup.handle.process(setup.input).pipe(Effect.forkChild)
+
+        yield* Deferred.await(setup.state.started)
+        yield* Fiber.interrupt(run)
+
+        const exit = yield* Fiber.await(run)
+        const call = (yield* MessageV2.parts(setup.msg.id)).find(
+          (part): part is SessionV1.ToolPart => part.type === "tool",
+        )
+
+        expect(Exit.isFailure(exit)).toBe(true)
+        expect(setup.state.providerCalls).toBe(1)
+        expect(setup.state.toolCalls).toBe(1)
+        expect(setup.state.cancellations).toBe(1)
+        expect(call?.state.status).toBe("error")
+        if (call?.state.status !== "error") return
+        expect(call.state.error).toBe("Tool execution aborted")
+        expect(call.state.metadata?.interrupted).toBe(true)
+
+        yield* Deferred.succeed(setup.state.release, undefined)
+        yield* Deferred.await(setup.state.finished)
+        yield* Effect.yieldNow
+        const after = (yield* MessageV2.parts(setup.msg.id)).find(
+          (part): part is SessionV1.ToolPart => part.type === "tool",
+        )
+        expect(after?.state.status).toBe("error")
+        if (after?.state.status === "error") expect(after.state.error).toBe("Tool execution aborted")
+      }),
+    { config: cfg },
   ),
 )
 
