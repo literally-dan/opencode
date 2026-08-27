@@ -204,8 +204,10 @@ function fake(
     get message() {
       return msg
     },
+    toolSignal: new AbortController().signal,
     updateToolCall: Effect.fn("TestSessionProcessor.updateToolCall")(() => Effect.succeed(undefined)),
     completeToolCall: Effect.fn("TestSessionProcessor.completeToolCall")(() => Effect.void),
+    failToolCall: Effect.fn("TestSessionProcessor.failToolCall")(() => Effect.void),
     process: Effect.fn("TestSessionProcessor.process")(() => Effect.succeed(result)),
   } satisfies SessionProcessorModule.SessionProcessor.Handle
 }
@@ -1349,6 +1351,213 @@ describe("session.compaction.process", () => {
   )
 
   itCompaction.instance(
+    "truncates oversized tool input only in the native summary request",
+    () => {
+      const stub = llm()
+      let captured = ""
+      stub.push(reply("summary", (input) => (captured = JSON.stringify(input.messages))))
+      return Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const session = yield* ssn.create({})
+        const root = yield* createUserMessage(session.id, "root")
+        const assistant = yield* createAssistantMessage(session.id, root.id, (yield* TestInstance).directory)
+        yield* ssn.updatePart({
+          id: PartID.ascending(),
+          messageID: assistant.id,
+          sessionID: session.id,
+          type: "tool",
+          callID: "large-input",
+          tool: "read",
+          state: {
+            status: "completed",
+            input: { payload: `INPUT_START${"x".repeat(20_000)}INPUT_END` },
+            output: "done",
+            title: "done",
+            metadata: {},
+            time: { start: 1, end: 2 },
+          },
+        })
+        yield* createCompactionMarker(session.id)
+        const msgs = yield* ssn.messages({ sessionID: session.id })
+
+        const result = yield* SessionCompaction.use.process({
+          parentID: msgs.at(-1)!.info.id,
+          messages: msgs,
+          sessionID: session.id,
+          auto: false,
+        })
+
+        expect(result).toBe("continue")
+        expect(captured).toContain("INPUT_START")
+        expect(captured).toContain("[truncated]")
+        expect(captured).not.toContain("INPUT_END")
+        const stored = yield* MessageV2.parts(assistant.id)
+        expect(JSON.stringify(stored)).toContain("INPUT_END")
+      }).pipe(withCompaction({ llm: stub.llmLayer, config: cfg({ tail_turns: 0 }) }))
+    },
+    { git: true },
+  )
+
+  itCompaction.instance(
+    "caps an oversized native summary before validating context reduction",
+    () => {
+      const stub = llm()
+      stub.push(reply("summary ".repeat(20_000)))
+      return Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const session = yield* ssn.create({})
+        yield* createUserMessage(session.id, "history ".repeat(5_000))
+        yield* createCompactionMarker(session.id)
+        const msgs = yield* ssn.messages({ sessionID: session.id })
+
+        const result = yield* SessionCompaction.use.process({
+          parentID: msgs.at(-1)!.info.id,
+          messages: msgs,
+          sessionID: session.id,
+          auto: false,
+        })
+
+        const generated = (yield* ssn.messages({ sessionID: session.id })).find(
+          (message) => message.info.role === "assistant" && message.info.summary,
+        )
+        const text = generated?.parts
+          .filter((part): part is SessionV1.TextPart => part.type === "text")
+          .map((part) => part.text)
+          .join("")
+        expect(result).toBe("continue")
+        expect(text?.length).toBeLessThanOrEqual(4_000)
+        expect(text).toEndWith("[truncated]")
+      }).pipe(withCompaction({ llm: stub.llmLayer, config: cfg({ tail_turns: 0 }) }))
+    },
+    { git: true },
+  )
+
+  itCompaction.instance(
+    "keeps a concurrent prompt last without appending an automatic continuation",
+    () =>
+      Effect.gen(function* () {
+        const started = yield* Deferred.make<void>()
+        const release = yield* Deferred.make<void>()
+        const stub = llm()
+        stub.push((input) =>
+          Stream.concat(
+            Stream.fromEffect(Effect.sync(() => Deferred.doneUnsafe(started, Effect.void))).pipe(Stream.drain),
+            Stream.concat(Stream.fromEffect(Deferred.await(release)).pipe(Stream.drain), reply("summary")(input)),
+          ),
+        )
+        return yield* Effect.gen(function* () {
+          const ssn = yield* SessionNs.Service
+          const session = yield* ssn.create({})
+          yield* createUserMessage(session.id, "old history ".repeat(4_000))
+          yield* createCompactionMarker(session.id)
+          const msgs = yield* ssn.messages({ sessionID: session.id })
+          const fiber = yield* SessionCompaction.use
+            .process({
+              parentID: msgs.at(-1)!.info.id,
+              messages: msgs,
+              sessionID: session.id,
+              auto: true,
+            })
+            .pipe(Effect.forkChild)
+
+          yield* Deferred.await(started)
+          const appended = yield* createUserMessage(session.id, "new prompt ".repeat(10_000))
+          Deferred.doneUnsafe(release, Effect.void)
+          const result = yield* Fiber.join(fiber)
+          const all = yield* ssn.messages({ sessionID: session.id })
+          const generated = all.find((message) => message.info.role === "assistant" && message.info.summary)
+
+          expect(result).toBe("continue")
+          expect(all.at(-1)?.info.id).toBe(appended.id)
+          expect(
+            all.some((message) =>
+              message.parts.some(
+                (part) => part.type === "text" && part.synthetic && part.metadata?.compaction_continue === true,
+              ),
+            ),
+          ).toBe(false)
+          expect(generated?.info.role === "assistant" ? generated.info.error : undefined).toBeUndefined()
+        }).pipe(withCompaction({ llm: stub.llmLayer, config: cfg({ tail_turns: 0 }) }))
+      }),
+    { git: true },
+  )
+
+  itCompaction.instance(
+    "reloads stale caller messages after acquiring the compaction lock",
+    () => {
+      const stub = llm()
+      let captured = ""
+      stub.push(reply("native summary", (input) => (captured = JSON.stringify(input.messages))))
+      return Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const session = yield* ssn.create({})
+        const root = yield* createUserMessage(session.id, "old history")
+        const assistant = yield* createAssistantMessage(session.id, root.id, (yield* TestInstance).directory)
+        const part = yield* ssn.updatePart({
+          id: PartID.ascending(),
+          messageID: assistant.id,
+          sessionID: session.id,
+          type: "tool",
+          callID: "stale-lock-input",
+          tool: "read",
+          state: {
+            status: "completed",
+            input: {},
+            output: `STALE_TOOL_OUTPUT${"x".repeat(20_000)}`,
+            title: "done",
+            metadata: {},
+            time: { start: 1, end: 2 },
+          },
+        })
+        yield* createCompactionMarker(session.id)
+        const stale = yield* ssn.messages({ sessionID: session.id })
+        const entered = yield* Deferred.make<void>()
+        const mutate = yield* Deferred.make<void>()
+        const persisted = yield* Deferred.make<void>()
+        const release = yield* Deferred.make<void>()
+        const holder = yield* withCompactionLock(
+          session.id,
+          undefined,
+          Effect.gen(function* () {
+            yield* Deferred.succeed(entered, undefined)
+            yield* Deferred.await(mutate)
+            const latest = yield* ssn.findPart({ sessionID: session.id, partID: part.id })
+            if (latest?.type !== "tool" || latest.state.status !== "completed") throw new Error("tool part missing")
+            latest.state.compactionGroup = "lock-rebase-group"
+            latest.state.compactionSummary = `LOCK_REBASED_SUMMARY${"y".repeat(8_000)}`
+            latest.state.compactionGeneration = 1
+            yield* ssn.updatePart(latest)
+            yield* Deferred.succeed(persisted, undefined)
+            yield* Deferred.await(release)
+          }),
+        ).pipe(Effect.forkScoped)
+        yield* Deferred.await(entered)
+        const compaction = yield* SessionCompaction.use
+          .process({
+            parentID: stale.at(-1)!.info.id,
+            messages: stale,
+            sessionID: session.id,
+            auto: false,
+          })
+          .pipe(Effect.forkScoped)
+        yield* pollWithTimeout(
+          Effect.sync(() => (compactionLockReferences(session.id) === 2 ? true : undefined)),
+          "native compaction did not wait for the shared lock",
+        )
+
+        yield* Deferred.succeed(mutate, undefined)
+        yield* Deferred.await(persisted)
+        yield* Deferred.succeed(release, undefined)
+        yield* Fiber.join(holder)
+        expect(yield* Fiber.join(compaction)).toBe("continue")
+        expect(captured).toContain("LOCK_REBASED_SUMMARY")
+        expect(captured).not.toContain("STALE_TOOL_OUTPUT")
+      }).pipe(withCompaction({ llm: stub.llmLayer, config: cfg({ tail_turns: 0 }) }))
+    },
+    { git: true },
+  )
+
+  itCompaction.instance(
     "fails explicitly when preserve_recent_tokens consumes the usable budget",
     () => {
       const stub = llm()
@@ -1430,7 +1639,7 @@ describe("session.compaction.process", () => {
   )
 
   itCompaction.instance(
-    "stops when an oversized automatic summary does not reduce the projected context",
+    "caps an oversized automatic summary before validating projected context",
     () => {
       const stub = llm()
       stub.push(reply("s".repeat(100_000)))
@@ -1470,11 +1679,15 @@ describe("session.compaction.process", () => {
 
         const all = yield* ssn.messages({ sessionID: session.id })
         const generated = all.find((message) => message.info.role === "assistant" && message.info.summary)
-        expect(result).toBe("stop")
-        expect(generated?.info.role === "assistant" ? JSON.stringify(generated.info.error) : "").toMatch(
-          /did not reduce|still leaves/,
-        )
-        expect(all.filter((message) => message.info.role === "user")).toHaveLength(3)
+        const text = generated?.parts
+          .filter((part): part is SessionV1.TextPart => part.type === "text")
+          .map((part) => part.text)
+          .join("")
+        expect(result).toBe("continue")
+        expect(generated?.info.role === "assistant" ? generated.info.error : undefined).toBeUndefined()
+        expect(text?.length).toBeLessThanOrEqual(4_000)
+        expect(text).toEndWith("[truncated]")
+        expect(all.filter((message) => message.info.role === "user")).toHaveLength(4)
       }).pipe(
         withCompaction({
           llm: stub.llmLayer,

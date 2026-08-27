@@ -43,6 +43,7 @@ export const Event = SessionCompactionEvent
 export const PRUNE_MINIMUM = 20_000
 export const PRUNE_PROTECT = 40_000
 const TOOL_OUTPUT_MAX_CHARS = 2_000
+const TOOL_INPUT_MAX_CHARS = 8_000
 const COMPACTION_SUMMARY_MAX_CHARS = 4_000
 const PRUNE_PROTECTED_TOOLS = ["skill"]
 const DEFAULT_TAIL_TURNS = 2
@@ -66,11 +67,26 @@ type CompletedCompaction = {
   summary: string
 }
 
+type ProcessInput = {
+  parentID: MessageID
+  messages: SessionV1.WithParts[]
+  sessionID: SessionID
+  auto: boolean
+  overflow?: boolean
+  attempt?: number
+  requestOverhead?: number
+}
+
 const truncate = (value: string) =>
   value.length <= TOOL_OUTPUT_MAX_CHARS ? value : `${value.slice(0, TOOL_OUTPUT_MAX_CHARS)}\n[truncated]`
 
 const truncateSummary = (value: string) =>
   value.length <= COMPACTION_SUMMARY_MAX_CHARS ? value : `${value.slice(0, COMPACTION_SUMMARY_MAX_CHARS)}\n[truncated]`
+
+const serializeToolInput = (value: unknown) => {
+  const input = JSON.stringify(value)
+  return input.length <= TOOL_INPUT_MAX_CHARS ? input : `${input.slice(0, TOOL_INPUT_MAX_CHARS)}\n[truncated]`
+}
 
 function serializer() {
   const seen = new Set<string>()
@@ -123,7 +139,7 @@ function serializer() {
         if (part.type !== "tool") return []
         const compacted = current(part, "[Tool]", message.info.role)
         if (compacted) return [compacted]
-        const call = `[Assistant tool call]: ${part.tool}(${JSON.stringify(part.state.input)})`
+        const call = `[Assistant tool call]: ${part.tool}(${serializeToolInput(part.state.input)})`
         if (part.state.status === "completed") {
           const attachments = (part.state.attachments ?? []).map(
             (item) => `[Attached ${item.mime}: ${item.filename ?? "file"}]`,
@@ -431,15 +447,7 @@ const layer = Layer.effect(
       )
     })
 
-    const processCompaction = Effect.fn("SessionCompaction.process")(function* (input: {
-      parentID: MessageID
-      messages: SessionV1.WithParts[]
-      sessionID: SessionID
-      auto: boolean
-      overflow?: boolean
-      attempt?: number
-      requestOverhead?: number
-    }) {
+    const processCompactionUnlocked = Effect.fn("SessionCompaction.processUnlocked")(function* (input: ProcessInput) {
       const parent = input.messages.findLast((m) => m.info.id === input.parentID)
       if (!parent || parent.info.role !== "user") {
         throw new Error(`Compaction parent must be a user message: ${input.parentID}`)
@@ -565,6 +573,9 @@ const layer = Layer.effect(
         },
       }
       yield* session.updateMessage(msg)
+      // Reserve automatic follow-up chronology before model execution. A prompt
+      // admitted after the final concurrency check must still sort after it.
+      const followup = input.auto ? { id: MessageID.ascending(), created: Date.now() } : undefined
       return yield* Effect.gen(function* () {
         const fail = Effect.fnUntraced(function* (message: string, target: SessionV1.Assistant = msg) {
           target.error = new SessionV1.ContextOverflowError({ message }).toObject()
@@ -643,7 +654,22 @@ const layer = Layer.effect(
         }
 
         const all = yield* session.messages({ sessionID: input.sessionID }).pipe(Effect.orDie)
-        const completed = all.find((item) => item.info.id === processor.message.id)
+        let completed = all.find((item) => item.info.id === processor.message.id)
+        const generated = completed ? summaryText(completed) : undefined
+        if (completed && generated && generated.length > COMPACTION_SUMMARY_MAX_CHARS) {
+          const suffix = "\n[truncated]"
+          const text = `${generated.slice(0, COMPACTION_SUMMARY_MAX_CHARS - suffix.length)}${suffix}`
+          const replacements = new Map(
+            completed.parts
+              .filter((part): part is SessionV1.TextPart => part.type === "text")
+              .map((part, index) => [part.id, { ...part, text: index === 0 ? text : "" }]),
+          )
+          for (const part of replacements.values()) yield* session.updatePart(part)
+          completed = {
+            ...completed,
+            parts: completed.parts.map((part) => replacements.get(part.id) ?? part),
+          }
+        }
         if (
           result === "continue" &&
           (!completed || completed.info.role !== "assistant" || !completed.info.finish || !summaryText(completed))
@@ -655,7 +681,12 @@ const layer = Layer.effect(
         }
 
         if (result === "continue") {
-          const projected = structuredClone(all)
+          const snapshot = new Set(input.messages.map((message) => message.info.id))
+          const projected = structuredClone(
+            all
+              .map((message) => (message.info.id === completed?.info.id ? completed : message))
+              .filter((message) => message.info.id === processor.message.id || snapshot.has(message.info.id)),
+          )
           if (compactionPart && selected.tail_start_id) {
             const boundary = projected.flatMap((message) => message.parts).find((part) => part.id === compactionPart.id)
             if (boundary?.type === "compaction") boundary.tail_start_id = selected.tail_start_id
@@ -684,14 +715,19 @@ const layer = Layer.effect(
           })
         }
 
-        if (result === "continue" && input.auto) {
+        const hasNewerUser = Effect.fnUntraced(function* () {
+          const current = yield* session.messages({ sessionID: input.sessionID }).pipe(Effect.orDie)
+          const ownerIndex = current.findIndex((message) => message.info.id === input.parentID)
+          return current.slice(ownerIndex + 1).some((message) => message.info.role === "user")
+        })
+        if (result === "continue" && followup && !(yield* hasNewerUser())) {
           if (replay) {
             const original = replay.info
             const replayMsg = yield* session.updateMessage({
-              id: MessageID.ascending(),
+              id: followup.id,
               role: "user",
               sessionID: input.sessionID,
-              time: { created: Date.now() },
+              time: { created: followup.created },
               agent: original.agent,
               model: original.model,
               format: original.format,
@@ -715,31 +751,30 @@ const layer = Layer.effect(
 
           if (!replay) {
             const info = yield* provider.getProvider(userMessage.model.providerID)
-            if (
-              (yield* plugin.trigger(
-                "experimental.compaction.autocontinue",
-                {
-                  sessionID: input.sessionID,
-                  agent: userMessage.agent,
-                  model: yield* provider
-                    .getModel(userMessage.model.providerID, userMessage.model.modelID)
-                    .pipe(Effect.orDie),
-                  provider: {
-                    source: info.source,
-                    info,
-                    options: info.options,
-                  },
-                  message: userMessage,
-                  overflow: input.overflow === true,
+            const enabled = (yield* plugin.trigger(
+              "experimental.compaction.autocontinue",
+              {
+                sessionID: input.sessionID,
+                agent: userMessage.agent,
+                model: yield* provider
+                  .getModel(userMessage.model.providerID, userMessage.model.modelID)
+                  .pipe(Effect.orDie),
+                provider: {
+                  source: info.source,
+                  info,
+                  options: info.options,
                 },
-                { enabled: true },
-              )).enabled
-            ) {
+                message: userMessage,
+                overflow: input.overflow === true,
+              },
+              { enabled: true },
+            )).enabled
+            if (enabled && !(yield* hasNewerUser())) {
               const continueMsg = yield* session.updateMessage({
-                id: MessageID.ascending(),
+                id: followup.id,
                 role: "user",
                 sessionID: input.sessionID,
-                time: { created: Date.now() },
+                time: { created: followup.created },
                 agent: userMessage.agent,
                 model: userMessage.model,
               })
@@ -782,6 +817,28 @@ const layer = Layer.effect(
             yield* session.updateMessage(msg)
           }),
         ),
+      )
+    })
+
+    const processCompaction = Effect.fn("SessionCompaction.process")(function* (input: ProcessInput) {
+      return yield* withCompactionLock(
+        input.sessionID,
+        undefined,
+        Effect.gen(function* () {
+          const durable = yield* session.messages({ sessionID: input.sessionID }).pipe(Effect.orDie)
+          const latest = new Map(durable.map((message, index) => [message.info.id, { message, index }]))
+          const snapshot = new Set(input.messages.map((message) => message.info.id))
+          const indexes = input.messages.flatMap((message) => {
+            const found = latest.get(message.info.id)
+            return found ? [found.index] : []
+          })
+          const newest = indexes.length ? Math.max(...indexes) : -1
+          const messages = [
+            ...input.messages.map((message) => latest.get(message.info.id)?.message ?? message),
+            ...(newest < 0 ? [] : durable.slice(newest + 1).filter((message) => !snapshot.has(message.info.id))),
+          ]
+          return yield* processCompactionUnlocked({ ...input, messages })
+        }),
       )
     })
 

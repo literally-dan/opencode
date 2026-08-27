@@ -1096,7 +1096,7 @@ it.instance("nudges from the live request size, not the previous response's usag
   }),
 )
 
-it.instance("computes reminder compliance before constructing a repeated nudge", () =>
+it.instance("does not repeat a reminder when no actionable compaction candidate changed", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig(providerCfg)
     const { prompt, sessions, chat } = yield* boot()
@@ -1130,7 +1130,63 @@ it.instance("computes reminder compliance before constructing a repeated nudge",
     const repeated = strings(hits[3]?.body).find((value) => value.includes("Context is ~"))
     expect(hits).toHaveLength(4)
     expect(first).toContain("Before it gets critical")
-    expect(repeated).toContain("passed on 3 previous reminders")
+    expect(repeated).toBeUndefined()
+  }),
+)
+
+it.instance("remembers reminders across runs and renudges only for new actionable content", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const { prompt, sessions, chat } = yield* boot()
+    const seeded = yield* seed(chat.id, { finish: "stop" })
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: seeded.assistant.id,
+      sessionID: chat.id,
+      type: "tool",
+      callID: "persistent-pressure-candidate",
+      tool: "read",
+      state: {
+        status: "completed",
+        input: {},
+        output: "settled output ".repeat(40_000),
+        title: "done",
+        metadata: {},
+        time: { start: 1, end: 2 },
+      },
+    })
+
+    yield* user(chat.id, "first request")
+    yield* llm.text("first response")
+    const first = yield* prompt.loop({ sessionID: chat.id })
+    yield* user(chat.id, "second request")
+    yield* llm.text("second response")
+    yield* prompt.loop({ sessionID: chat.id })
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: first.info.id,
+      sessionID: chat.id,
+      type: "tool",
+      callID: "new-pressure-candidate",
+      tool: "read",
+      state: {
+        status: "completed",
+        input: {},
+        output: "new settled output ".repeat(500),
+        title: "done",
+        metadata: {},
+        time: { start: 1, end: 2 },
+      },
+    })
+    yield* user(chat.id, "third request")
+    yield* llm.text("third response")
+    yield* prompt.loop({ sessionID: chat.id })
+
+    const hits = yield* llm.hits
+    const reminders = hits.map((hit) => strings(hit.body).find((value) => value.includes("Context is ~")))
+    expect(reminders[0]).toContain("compact_results")
+    expect(reminders[1]).toBeUndefined()
+    expect(reminders[2]).toContain("compact_results")
   }),
 )
 
@@ -1204,15 +1260,11 @@ function alreadyFolded(request: number) {
   })
 }
 
-it.instance("offers to fold existing notes once nothing fresh is left to compact", () =>
+it.instance("does not advertise already-folded notes that cannot guarantee savings", () =>
   Effect.gen(function* () {
     // Sized past the hard threshold, where native compaction is imminent.
     const { fiber, reminder } = yield* alreadyFolded(680_000)
-    expect(reminder).toContain("already been compacted once")
-    expect(reminder).toContain("list_context")
-    expect(reminder).toContain("single range marker")
-    // Deep history is folded reluctantly, so the ask says which end to take.
-    expect(reminder).toContain("keep recent work at full detail")
+    expect(reminder).toBeUndefined()
     yield* Fiber.interrupt(fiber)
   }),
 )
