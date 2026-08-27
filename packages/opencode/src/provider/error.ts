@@ -14,9 +14,13 @@ export class HeaderTimeoutError extends Error {
 
 export class ResponseStreamError extends Error {
   public override readonly name = "ProviderResponseStreamError"
+  // True when the stream failed because our own idle timeout expired, not
+  // because the connection or provider reported an error.
+  public readonly timeout: boolean
 
-  constructor(message: string, options?: ErrorOptions) {
+  constructor(message: string, options?: ErrorOptions & { timeout?: boolean }) {
     super(message, options)
+    this.timeout = options?.timeout === true
   }
 }
 

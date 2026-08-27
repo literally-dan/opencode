@@ -29,6 +29,10 @@ export const RETRY_JITTER_FACTOR = 0.25
 export const RETRY_MAX_DELAY_NO_HEADERS = 30_000 // 30 seconds
 export const RETRY_MAX_DELAY = 2_147_483_647 // max 32-bit signed integer for setTimeout
 export const RETRY_MAX_RETRIES = 5
+// A header or chunk timeout has already waited the whole provider timeout
+// (5 minutes by default) before it fails. Retrying it as often as a fast
+// transport error would hide a stalled endpoint for about half an hour.
+export const RETRY_MAX_TIMEOUT_RETRIES = 2
 
 const RETRYABLE_MESSAGE_PATTERNS = [
   /429|500|502|503|504|524/i,
@@ -94,13 +98,12 @@ export function retryable(error: Err, provider: string) {
   // A classifier rejection is a verdict on the request, not a transport fault.
   // Every retry re-sends the same prompt for the same verdict.
   if (SessionV1.ContentFilterError.isInstance(error)) return undefined
-  if (
-    isRecord(error.data) &&
-    (matchesContentPolicy(error.data.message) || matchesContentPolicy(error.data.responseBody))
-  )
-    return undefined
+  const contentPolicy =
+    isRecord(error.data) && (matchesContentPolicy(error.data.message) || matchesContentPolicy(error.data.responseBody))
   if (SessionV1.APIError.isInstance(error)) {
+    if (MessageV2.isPermanentTransportCode(error.data.metadata?.code)) return undefined
     const status = error.data.statusCode
+    if ((status === undefined || status < 500) && contentPolicy) return undefined
     // 5xx errors are transient server failures and should always be retried,
     // even when the provider SDK doesn't explicitly mark them as retryable.
     if (
@@ -158,6 +161,7 @@ export function retryable(error: Err, provider: string) {
     }
     return { message: error.data.message.includes("Overloaded") ? "Provider is overloaded" : error.data.message }
   }
+  if (contentPolicy) return undefined
 
   const message = isRecord(error.data) ? error.data.message : undefined
   if (typeof message !== "string") return undefined
@@ -204,22 +208,32 @@ export function policy(opts: {
   set: (input: { attempt: number; message: string; action?: Retryable["action"]; next: number }) => Effect.Effect<void>
 }) {
   return Schedule.fromStepWithMetadata(
-    Effect.succeed((meta: Schedule.InputMetadata<unknown>) => {
-      const error = opts.parse(meta.input)
-      const retry = retryable(error, opts.provider)
-      if (!retry) return Cause.done(meta.attempt)
-      if (meta.attempt > RETRY_MAX_RETRIES) return Cause.done(meta.attempt)
-      return Effect.gen(function* () {
-        const wait = delay(meta.attempt, SessionV1.APIError.isInstance(error) ? error : undefined)
-        const now = yield* Clock.currentTimeMillis
-        yield* opts.set({
-          attempt: meta.attempt,
-          message: retry.message,
-          action: retry.action,
-          next: now + wait,
+    Effect.sync(() => {
+      const timeouts = { count: 0 }
+      return (meta: Schedule.InputMetadata<unknown>) => {
+        const error = opts.parse(meta.input)
+        const retry = retryable(error, opts.provider)
+        if (!retry) return Cause.done(meta.attempt)
+        if (meta.attempt > RETRY_MAX_RETRIES) return Cause.done(meta.attempt)
+        if (
+          SessionV1.APIError.isInstance(error) &&
+          (error.data.metadata?.code === "ProviderHeaderTimeoutError" || error.data.metadata?.timeout === "true")
+        ) {
+          timeouts.count++
+          if (timeouts.count > RETRY_MAX_TIMEOUT_RETRIES) return Cause.done(meta.attempt)
+        }
+        return Effect.gen(function* () {
+          const wait = delay(meta.attempt, SessionV1.APIError.isInstance(error) ? error : undefined)
+          const now = yield* Clock.currentTimeMillis
+          yield* opts.set({
+            attempt: meta.attempt,
+            message: retry.message,
+            action: retry.action,
+            next: now + wait,
+          })
+          return [meta.attempt, Duration.millis(wait)] as [number, Duration.Duration]
         })
-        return [meta.attempt, Duration.millis(wait)] as [number, Duration.Duration]
-      })
+      }
     }),
   )
 }
