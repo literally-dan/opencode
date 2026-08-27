@@ -390,6 +390,10 @@ export type TextPart = {
   metadata?: {
     [key: string]: unknown
   }
+  compacted?: number
+  compactionGroup?: string
+  compactionSummary?: string
+  compactionGeneration?: number
 }
 
 export type SubtaskPart = {
@@ -420,6 +424,10 @@ export type ReasoningPart = {
     start: number
     end?: number
   }
+  compacted?: number
+  compactionGroup?: string
+  compactionSummary?: string
+  compactionGeneration?: number
 }
 
 export type FilePartSourceText = {
@@ -472,6 +480,10 @@ export type FilePart = {
   filename?: string
   url: string
   source?: FilePartSource
+  compacted?: number
+  compactionGroup?: string
+  compactionSummary?: string
+  compactionGeneration?: number
 }
 
 export type ToolStatePending = {
@@ -512,6 +524,9 @@ export type ToolStateCompleted = {
     compacted?: number
   }
   attachments?: Array<FilePart>
+  compactionGroup?: string
+  compactionSummary?: string
+  compactionGeneration?: number
 }
 
 export type ToolStateError = {

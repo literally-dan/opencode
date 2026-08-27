@@ -10,7 +10,7 @@ import { Agent } from "../agent/agent"
 import { deriveSubagentSessionPermission } from "../agent/subagent-permissions"
 import type { SessionPrompt } from "../session/prompt"
 import { Config } from "@/config/config"
-import { Effect, Exit, Schema, Scope } from "effect"
+import { Deferred, Effect, Exit, Option, Ref, Schema, Scope } from "effect"
 import { EffectBridge } from "@/effect/bridge"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Database } from "@opencode-ai/core/database/database"
@@ -198,7 +198,21 @@ export const TaskTool = Tool.define(
       if (!ops) return yield* Effect.fail(new Error("TaskTool requires promptOps in ctx.extra"))
 
       const runTask = Effect.fn("TaskTool.runTask")(function* () {
-        const parts = yield* ops.resolvePromptParts(params.prompt)
+        const basicParts = yield* ops.resolvePromptParts(params.prompt)
+        // Surface the parent session ID so the subagent can pass it to
+        // `read_part` / `search_session_history` when it needs to recover
+        // compacted history from the spawning session. Gated with those tools:
+        // without them the id is unusable, and naming the parent session at all
+        // is a capability worth withholding when the feature is off.
+        const parts = flags.disableContextCompaction
+          ? basicParts
+          : [
+              ...basicParts,
+              {
+                type: "text" as const,
+                text: `\n<subagent-context parent-session-id="${ctx.sessionID}" />`,
+              },
+            ]
         const result = yield* ops.prompt({
           messageID: MessageID.ascending(),
           sessionID: nextSession.id,

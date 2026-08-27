@@ -1,0 +1,12 @@
+Read the verbatim output of a part from this session's (or another session's) message history. Use it when you hit a placeholder in older messages like `[Old tool result (prt_abc123), summary: ...]` or `[... cleared]` and the summary isn't enough — compacted parts still live on disk; the placeholder is just what's surfaced to save tokens.
+
+WHEN NOT TO USE
+- Live outputs in the current message (already in context).
+- Idempotent operations (file reads, grep, glob, stable webfetch) — just re-run the original tool; it's cheaper and fresh.
+- Speculative "just in case" expansion — each costs tokens; only expand when you concretely need the content.
+
+PARAMETERS
+- part_id: the canonical `prt_…` id from a compacted placeholder or `search_session_history`.
+- session_id: optional canonical `ses_…` id; defaults to the current session. Subagents can read the parent by passing the `parent-session-id` from the `<subagent-context>` marker.
+
+Returns the verbatim tool output (with tool name, call id, input, error info), text/reasoning text, or file metadata; errors if the part isn't found. The result enters your next turn and is itself subject to future compaction.

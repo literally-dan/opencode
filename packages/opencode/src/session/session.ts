@@ -456,6 +456,13 @@ export interface Interface {
     messageID: MessageID
     partID: PartID
   }) => Effect.Effect<SessionV1.Part | undefined>
+  /**
+   * Like `getPart` but resolves by partID alone (scoped to a session for
+   * safety). Used by tools that recover a compacted part's verbatim
+   * output — the model has the partID from the compacted placeholder
+   * but typically not the messageID.
+   */
+  readonly findPart: (input: { sessionID: SessionID; partID: PartID }) => Effect.Effect<SessionV1.Part | undefined>
   readonly updatePart: <T extends SessionV1.Part>(part: T) => Effect.Effect<T>
   readonly updatePartDelta: (input: {
     sessionID: SessionID
@@ -632,14 +639,30 @@ const layer: Layer.Layer<
         return msg
       }).pipe(Effect.withSpan("Session.updateMessage"))
 
+    const normalizeCompaction = <T extends SessionV1.Part>(part: T): T => {
+      if (
+        part.type !== "tool" ||
+        part.state.status !== "completed" ||
+        part.state.compactionGroup === undefined ||
+        part.state.time.compacted === undefined
+      )
+        return part
+      const next = structuredClone(part) as T & SessionV1.ToolPart & { state: SessionV1.ToolStateCompleted }
+      delete next.state.time.compacted
+      return next
+    }
+
     const updatePart = <T extends SessionV1.Part>(part: T): Effect.Effect<T> =>
       Effect.gen(function* () {
+        // Native pruning owns time.compacted. Manual markers must not stop its
+        // backward scan when only a sparse set of outputs was selected.
+        const next = normalizeCompaction(part)
         yield* events.publish(SessionV1.Event.PartUpdated, {
-          sessionID: part.sessionID,
-          part: structuredClone(part),
+          sessionID: next.sessionID,
+          part: structuredClone(next),
           time: Date.now(),
         })
-        return part
+        return next
       }).pipe(Effect.withSpan("Session.updatePart"))
 
     const getPart: Interface["getPart"] = Effect.fn("Session.getPart")(function* (input) {
@@ -656,12 +679,28 @@ const layer: Layer.Layer<
         .get()
         .pipe(Effect.orDie)
       if (!row) return
-      return {
+      return normalizeCompaction({
         ...row.data,
         id: row.id,
         sessionID: row.session_id,
         messageID: row.message_id,
-      } as SessionV1.Part
+      } as SessionV1.Part)
+    })
+
+    const findPart: Interface["findPart"] = Effect.fn("Session.findPart")(function* (input) {
+      const row = yield* db
+        .select()
+        .from(PartTable)
+        .where(and(eq(PartTable.session_id, input.sessionID), eq(PartTable.id, input.partID)))
+        .get()
+        .pipe(Effect.orDie)
+      if (!row) return
+      return normalizeCompaction({
+        ...row.data,
+        id: row.id,
+        sessionID: row.session_id,
+        messageID: row.message_id,
+      } as SessionV1.Part)
     })
 
     const create = Effect.fn("Session.create")(function* (input?: {
@@ -829,7 +868,7 @@ const layer: Layer.Layer<
       if (input.limit) {
         return (yield* MessageV2.page({ sessionID: input.sessionID, limit: input.limit }).pipe(
           Effect.provideService(Database.Service, database),
-        )).items
+        )).items.map((message) => ({ ...message, parts: message.parts.map(normalizeCompaction) }))
       }
 
       const size = 50
@@ -847,7 +886,7 @@ const layer: Layer.Layer<
         if (!page.more || !page.cursor) break
         before = page.cursor
       }
-      return result.reverse()
+      return result.reverse().map((message) => ({ ...message, parts: message.parts.map(normalizeCompaction) }))
     })
 
     const removeMessage = Effect.fn("Session.removeMessage")(function* (input: {
@@ -929,6 +968,7 @@ const layer: Layer.Layer<
       removePart,
       updatePart,
       getPart,
+      findPart,
       updatePartDelta,
       findMessage,
     })
