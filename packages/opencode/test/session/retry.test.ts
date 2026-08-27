@@ -392,6 +392,19 @@ describe("session.retry.retryable", () => {
     expect(SessionRetry.retryable(error, retryProvider)).toEqual({ message: "Service unavailable" })
   })
 
+  test("retries a 503 whose body mentions the content policy service", () => {
+    const error = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
+      new SessionV1.APIError({
+        message: "Service unavailable",
+        isRetryable: false,
+        statusCode: 503,
+        responseBody: "The content policy service is temporarily unavailable",
+      }).toObject(),
+    )
+
+    expect(SessionRetry.retryable(error, retryProvider)).toEqual({ message: "Service unavailable" })
+  })
+
   test("does not retry 4xx errors when isRetryable is false", () => {
     const error = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
       new SessionV1.APIError({

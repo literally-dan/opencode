@@ -94,14 +94,12 @@ export function retryable(error: Err, provider: string) {
   // A classifier rejection is a verdict on the request, not a transport fault.
   // Every retry re-sends the same prompt for the same verdict.
   if (SessionV1.ContentFilterError.isInstance(error)) return undefined
-  if (
-    isRecord(error.data) &&
-    (matchesContentPolicy(error.data.message) || matchesContentPolicy(error.data.responseBody))
-  )
-    return undefined
+  const contentPolicy =
+    isRecord(error.data) && (matchesContentPolicy(error.data.message) || matchesContentPolicy(error.data.responseBody))
   if (SessionV1.APIError.isInstance(error)) {
     if (MessageV2.isPermanentTransportCode(error.data.metadata?.code)) return undefined
     const status = error.data.statusCode
+    if ((status === undefined || status < 500) && contentPolicy) return undefined
     // 5xx errors are transient server failures and should always be retried,
     // even when the provider SDK doesn't explicitly mark them as retryable.
     if (
@@ -159,6 +157,7 @@ export function retryable(error: Err, provider: string) {
     }
     return { message: error.data.message.includes("Overloaded") ? "Provider is overloaded" : error.data.message }
   }
+  if (contentPolicy) return undefined
 
   const message = isRecord(error.data) ? error.data.message : undefined
   if (typeof message !== "string") return undefined
