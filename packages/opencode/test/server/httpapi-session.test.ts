@@ -4,7 +4,7 @@ import { NodeHttpServer, NodeServices } from "@effect/platform-node"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { mkdir } from "node:fs/promises"
 import path from "node:path"
-import { Cause, Config, Effect, Exit, Layer } from "effect"
+import { Cause, Config, Deferred, Effect, Exit, Fiber, Layer } from "effect"
 import { HttpClient, HttpClientRequest, HttpClientResponse, HttpRouter, HttpServer } from "effect/unstable/http"
 import { layerWebSocketConstructorGlobal } from "effect/unstable/socket/Socket"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
@@ -19,6 +19,7 @@ import { Workspace } from "../../src/control-plane/workspace"
 import { InstanceBootstrap as InstanceBootstrapService } from "../../src/project/bootstrap-service"
 import { InstanceStore } from "../../src/project/instance-store"
 import { Project } from "../../src/project/project"
+import { Plugin } from "../../src/plugin"
 import { HttpApiApp } from "../../src/server/routes/instance/httpapi/server"
 import * as HttpSessionError from "../../src/server/routes/instance/httpapi/handlers/session-errors"
 import { ExperimentalPaths } from "../../src/server/routes/instance/httpapi/groups/experimental"
@@ -43,9 +44,32 @@ const noopBootstrapLayer = Layer.succeed(
   InstanceBootstrapService.Service,
   InstanceBootstrapService.Service.of({ run: Effect.void }),
 )
+const promptPreparationGates: Array<{
+  started: Deferred.Deferred<void>
+  release: Deferred.Deferred<void>
+}> = []
+const blockingPromptPreparation = Layer.succeed(
+  Plugin.Service,
+  Plugin.Service.of({
+    trigger: (name, _input, output) =>
+      Effect.gen(function* () {
+        if (name !== "chat.message") return output
+        const gate = promptPreparationGates.shift()
+        if (!gate) return output
+        yield* Deferred.succeed(gate.started, undefined)
+        yield* Deferred.await(gate.release)
+        return output
+      }),
+    list: () => Effect.succeed([]),
+    init: () => Effect.void,
+  }),
+)
 const appLayer = AppNodeBuilder.build(
   LayerNode.group([InstanceStore.node, Project.node, Session.node, Workspace.node, Database.node, Ripgrep.node]),
-  [[InstanceStore.bootstrapNode, noopBootstrapLayer]],
+  [
+    [InstanceStore.bootstrapNode, noopBootstrapLayer],
+    [Plugin.node, blockingPromptPreparation],
+  ],
 )
 const servedRoutes: Layer.Layer<never, Config.ConfigError, HttpServer.HttpServer> = HttpRouter.serve(
   HttpApiApp.routes,
@@ -230,6 +254,7 @@ function requestJson<T>(path: string, init?: RequestInit) {
 
 afterEach(async () => {
   Flag.OPENCODE_EXPERIMENTAL_WORKSPACES = originalWorkspaces
+  promptPreparationGates.length = 0
   await disposeAllInstances()
   await resetDatabase()
 })
@@ -425,6 +450,101 @@ describe("session HttpApi", () => {
         root: sessionDirectory,
       })
     }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+  )
+
+  it.instance("rejects an HTTP prompt when removal wins before persistence", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const session = yield* Session.use
+        .create({ title: "HTTP prompt removal race" })
+        .pipe(provideInstanceEffect(test.directory))
+      const messageID = MessageID.ascending()
+      const headers = { "x-opencode-directory": test.directory }
+      const gate = {
+        started: yield* Deferred.make<void>(),
+        release: yield* Deferred.make<void>(),
+      }
+      promptPreparationGates.push(gate)
+
+      return yield* Effect.gen(function* () {
+        const pending = yield* request(pathFor(SessionPaths.prompt, { sessionID: session.id }), {
+          method: "POST",
+          headers: { ...headers, "content-type": "application/json" },
+          body: JSON.stringify({
+            messageID,
+            noReply: true,
+            parts: [{ type: "text", text: "must not persist" }],
+          }),
+        }).pipe(Effect.forkChild)
+        yield* Deferred.await(gate.started).pipe(Effect.timeout("5 seconds"))
+
+        const removed = yield* request(pathFor(SessionPaths.remove, { sessionID: session.id }), {
+          method: "DELETE",
+          headers,
+        })
+        expect(removed.status).toBe(200)
+        yield* Deferred.succeed(gate.release, undefined)
+
+        const response = yield* Fiber.join(pending).pipe(Effect.timeout("5 seconds"))
+        expect(response.status).toBe(404)
+        expect(yield* responseJson(response)).toMatchObject({ name: "NotFoundError" })
+        const persisted = yield* Database.Service.use(({ db }) =>
+          db.select({ id: SessionMessageTable.id }).from(SessionMessageTable).all().pipe(Effect.orDie),
+        )
+        expect(persisted.some((row) => String(row.id) === messageID)).toBe(false)
+      }).pipe(
+        Effect.ensuring(
+          Deferred.succeed(gate.release, undefined).pipe(
+            Effect.andThen(Effect.sync(() => promptPreparationGates.splice(0))),
+            Effect.asVoid,
+          ),
+        ),
+      )
+    }),
+  )
+
+  it.live(
+    "maps ask model and provider failures to declared public errors",
+    () =>
+      Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        const config = testProviderConfig(llm.url)
+        const directory = yield* tmpdirScoped({ git: true, config })
+        const session = yield* createSession({ title: "ask errors" }).pipe(provideInstanceEffect(directory))
+        const url = `${pathFor(SessionPaths.ask, { sessionID: session.id })}?directory=${encodeURIComponent(directory)}`
+        const post = (modelID: string) =>
+          request(url, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              question: "what changed?",
+              model: { providerID: "test", modelID },
+            }),
+          })
+
+        const missing = yield* post("missing-model")
+        expect(missing.status).toBe(404)
+        expect(yield* responseJson(missing)).toMatchObject({ _tag: "ModelNotFoundError" })
+
+        yield* Effect.forEach([1, 2, 3], () => llm.error(503, { message: "upstream unavailable" }))
+        const upstream = yield* post("test-model")
+        expect(upstream.status).toBe(502)
+        expect(yield* responseJson(upstream)).toMatchObject({
+          _tag: "UpstreamError",
+          message: expect.stringContaining("upstream unavailable"),
+          status: 503,
+        })
+
+        yield* Effect.forEach([1, 2, 3], () => llm.error(503, { message: "Agent not found: provider unavailable" }))
+        const prefixed = yield* post("test-model")
+        expect(prefixed.status).toBe(502)
+        expect(yield* responseJson(prefixed)).toMatchObject({
+          _tag: "UpstreamError",
+          message: expect.stringContaining("Agent not found: provider unavailable"),
+          status: 503,
+        })
+      }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+    30_000,
   )
 
   it.instance(

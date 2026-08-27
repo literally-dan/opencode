@@ -2615,6 +2615,21 @@ export type SubtaskPartInput = {
   background?: boolean
 }
 
+export type ModelNotFoundError = {
+  _tag: "ModelNotFoundError"
+  providerID: string
+  modelID: string
+  suggestions: Array<string>
+  message: string
+}
+
+export type UpstreamError = {
+  _tag: "UpstreamError"
+  message: string
+  service?: string
+  status?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+}
+
 export type SessionBusyError = {
   _tag: "SessionBusyError"
   sessionID: string
@@ -10233,9 +10248,13 @@ export type SessionAskErrors = {
    */
   400: EffectHttpApiErrorBadRequest | InvalidRequestError
   /**
-   * NotFoundError
+   * NotFoundError | ModelNotFoundError
    */
-  404: NotFoundError
+  404: NotFoundError | ModelNotFoundError
+  /**
+   * UpstreamError
+   */
+  502: UpstreamError
 }
 
 export type SessionAskError = SessionAskErrors[keyof SessionAskErrors]

@@ -59,13 +59,13 @@ const layer = Layer.effect(
     const background = yield* BackgroundJob.Service
     const status = yield* SessionStatus.Service
     const events = yield* EventV2Bridge.Service
-    const lifecycle = yield* SynchronizedRef.make<Lifecycle>({ removing: new Set() })
 
     const state = yield* InstanceState.make(
       Effect.fn("SessionRunState.state")(function* () {
         const scope = yield* Scope.Scope
         const runners = new Map<SessionID, Runner.Runner<SessionV1.WithParts>>()
         const checkpoints = yield* SynchronizedRef.make(new Map<SessionID, Checkpoint>())
+        const lifecycle = yield* SynchronizedRef.make<Lifecycle>({ removing: new Set() })
         yield* Effect.addFinalizer(
           Effect.fnUntraced(function* () {
             yield* Effect.forEach(runners.values(), (runner) => runner.cancel, {
@@ -75,7 +75,7 @@ const layer = Layer.effect(
             runners.clear()
           }),
         )
-        return { runners, scope, checkpoints, generation: 0 }
+        return { runners, scope, checkpoints, lifecycle, generation: 0 }
       }),
     )
 
@@ -83,86 +83,99 @@ const layer = Layer.effect(
       sessionID: SessionID,
       onInterrupt: Effect.Effect<SessionV1.WithParts>,
     ) {
-      const data = yield* InstanceState.get(state)
-      const existing = data.runners.get(sessionID)
-      if (existing) return existing
-      const next = Runner.make<SessionV1.WithParts>(data.scope, {
-        onIdle: SynchronizedRef.modifyEffect(
-          lifecycle,
+      return yield* InstanceState.useEffect(
+        state,
+        Effect.fnUntraced(function* (data) {
+          const existing = data.runners.get(sessionID)
+          if (existing) return existing
+          const next = Runner.make<SessionV1.WithParts>(data.scope, {
+            onIdle: SynchronizedRef.modifyEffect(
+              data.lifecycle,
+              Effect.fnUntraced(function* (admission) {
+                const terminal =
+                  next.state._tag === "Finalizing" ||
+                  next.state._tag === "ShellFinalizing" ||
+                  next.state._tag === "Cancelling"
+                if (data.runners.get(sessionID) !== next || !terminal) return [undefined, admission] as const
+                data.runners.delete(sessionID)
+                yield* status.set(sessionID, { type: "idle" })
+                yield* SynchronizedRef.update(data.checkpoints, (checkpoints) => {
+                  const checkpoint = checkpoints.get(sessionID)
+                  if (!checkpoint || checkpoint.leases > 0) return checkpoints
+                  const next = new Map(checkpoints)
+                  next.delete(sessionID)
+                  return next
+                })
+                return [undefined, admission] as const
+              }),
+            ),
+            onBusy: status.set(sessionID, { type: "busy" }),
+            onInterrupt,
+          })
+          data.runners.set(sessionID, next)
+          return next
+        }),
+      )
+    })
+
+    const assertNotBusy = Effect.fn("SessionRunState.assertNotBusy")(function* (sessionID: SessionID) {
+      return yield* InstanceState.useEffect(
+        state,
+        Effect.fnUntraced(function* (data) {
+          const existing = data.runners.get(sessionID)
+          if (existing?.busy) yield* busyError(sessionID)
+        }),
+      )
+    })
+
+    const cancel = Effect.fn("SessionRunState.cancel")(function* (sessionID: SessionID) {
+      return yield* InstanceState.useEffect(
+        state,
+        Effect.fnUntraced(function* (data) {
+          yield* SynchronizedRef.modifyEffect(
+            data.lifecycle,
+            Effect.fnUntraced(function* (admission) {
+              yield* SynchronizedRef.update(data.checkpoints, (checkpoints) => {
+                if (!checkpoints.has(sessionID)) return checkpoints
+                const next = new Map(checkpoints)
+                next.delete(sessionID)
+                return next
+              })
+              return [undefined, admission] as const
+            }),
+          )
+          yield* cancelBackgroundJobs(background, sessionID)
+          const cancellation = yield* SynchronizedRef.modifyEffect(
+            data.lifecycle,
+            Effect.fnUntraced(function* (admission) {
+              const existing = data.runners.get(sessionID)
+              if (existing) return [Option.some(yield* existing.enqueueCancel), admission] as const
+              yield* status.set(sessionID, { type: "idle" })
+              return [Option.none(), admission] as const
+            }),
+          )
+          if (Option.isSome(cancellation)) yield* cancellation.value
+        }),
+      )
+    })
+
+    const markRemoving = Effect.fn("SessionRunState.markRemoving")(function* (sessionID: SessionID) {
+      return yield* InstanceState.useEffect(state, (data) =>
+        SynchronizedRef.modifyEffect(
+          data.lifecycle,
           Effect.fnUntraced(function* (admission) {
-            const terminal =
-              next.state._tag === "Finalizing" ||
-              next.state._tag === "ShellFinalizing" ||
-              next.state._tag === "Cancelling"
-            if (data.runners.get(sessionID) !== next || !terminal) return [undefined, admission] as const
-            data.runners.delete(sessionID)
-            yield* status.set(sessionID, { type: "idle" })
+            if (admission.removing.has(sessionID)) return [undefined, admission] as const
             yield* SynchronizedRef.update(data.checkpoints, (checkpoints) => {
-              const checkpoint = checkpoints.get(sessionID)
-              if (!checkpoint || checkpoint.leases > 0) return checkpoints
+              if (!checkpoints.has(sessionID)) return checkpoints
               const next = new Map(checkpoints)
               next.delete(sessionID)
               return next
             })
-            return [undefined, admission] as const
+            const removing = new Set(admission.removing)
+            removing.add(sessionID)
+            return [undefined, { removing }] as const
           }),
         ),
-        onBusy: status.set(sessionID, { type: "busy" }),
-        onInterrupt,
-      })
-      data.runners.set(sessionID, next)
-      return next
-    })
-
-    const assertNotBusy = Effect.fn("SessionRunState.assertNotBusy")(function* (sessionID: SessionID) {
-      const data = yield* InstanceState.get(state)
-      const existing = data.runners.get(sessionID)
-      if (existing?.busy) yield* busyError(sessionID)
-    })
-
-    const cancel = Effect.fn("SessionRunState.cancel")(function* (sessionID: SessionID) {
-      const data = yield* InstanceState.get(state)
-      yield* SynchronizedRef.modifyEffect(
-        lifecycle,
-        Effect.fnUntraced(function* (admission) {
-          yield* SynchronizedRef.update(data.checkpoints, (checkpoints) => {
-            if (!checkpoints.has(sessionID)) return checkpoints
-            const next = new Map(checkpoints)
-            next.delete(sessionID)
-            return next
-          })
-          return [undefined, admission] as const
-        }),
-      )
-      yield* cancelBackgroundJobs(background, sessionID)
-      const cancellation = yield* SynchronizedRef.modifyEffect(
-        lifecycle,
-        Effect.fnUntraced(function* (admission) {
-          const existing = data.runners.get(sessionID)
-          if (existing) return [Option.some(yield* existing.enqueueCancel), admission] as const
-          yield* status.set(sessionID, { type: "idle" })
-          return [Option.none(), admission] as const
-        }),
-      )
-      if (Option.isSome(cancellation)) yield* cancellation.value
-    })
-
-    const markRemoving = Effect.fn("SessionRunState.markRemoving")(function* (sessionID: SessionID) {
-      const data = yield* InstanceState.get(state)
-      yield* SynchronizedRef.modifyEffect(
-        lifecycle,
-        Effect.fnUntraced(function* (admission) {
-          if (admission.removing.has(sessionID)) return [undefined, admission] as const
-          yield* SynchronizedRef.update(data.checkpoints, (checkpoints) => {
-            if (!checkpoints.has(sessionID)) return checkpoints
-            const next = new Map(checkpoints)
-            next.delete(sessionID)
-            return next
-          })
-          const removing = new Set(admission.removing)
-          removing.add(sessionID)
-          return [undefined, { removing }] as const
-        }),
       )
     })
 
@@ -172,80 +185,82 @@ const layer = Layer.effect(
     })
 
     const checkpoint = Effect.fn("SessionRunState.checkpoint")(function* (sessionID: SessionID) {
-      const data = yield* InstanceState.get(state)
-      return yield* SynchronizedRef.modifyEffect(
-        lifecycle,
-        Effect.fnUntraced(function* (admission) {
-          if (admission.removing.has(sessionID)) return yield* removingError(sessionID)
-          const generation = yield* SynchronizedRef.modify(data.checkpoints, (checkpoints) => {
-            const current = checkpoints.get(sessionID)
-            if (current) return [current.generation, checkpoints] as const
-            const generation = data.generation + 1
-            data.generation = generation
-            return [generation, new Map(checkpoints).set(sessionID, { generation, leases: 0 })] as const
-          })
-          return [generation, admission] as const
-        }),
+      return yield* InstanceState.useEffect(state, (data) =>
+        SynchronizedRef.modifyEffect(
+          data.lifecycle,
+          Effect.fnUntraced(function* (admission) {
+            if (admission.removing.has(sessionID)) return yield* removingError(sessionID)
+            const generation = yield* SynchronizedRef.modify(data.checkpoints, (checkpoints) => {
+              const current = checkpoints.get(sessionID)
+              if (current) return [current.generation, checkpoints] as const
+              const generation = data.generation + 1
+              data.generation = generation
+              return [generation, new Map(checkpoints).set(sessionID, { generation, leases: 0 })] as const
+            })
+            return [generation, admission] as const
+          }),
+        ),
       )
     })
 
     const isCurrent = Effect.fn("SessionRunState.isCurrent")(function* (sessionID: SessionID, expected: number) {
-      const data = yield* InstanceState.get(state)
-      return yield* SynchronizedRef.modifyEffect(
-        lifecycle,
-        Effect.fnUntraced(function* (admission) {
-          const current = admission.removing.has(sessionID)
-            ? false
-            : (yield* SynchronizedRef.get(data.checkpoints)).get(sessionID)?.generation === expected
-          return [current, admission] as const
-        }),
+      return yield* InstanceState.useEffect(state, (data) =>
+        SynchronizedRef.modifyEffect(
+          data.lifecycle,
+          Effect.fnUntraced(function* (admission) {
+            const current = admission.removing.has(sessionID)
+              ? false
+              : (yield* SynchronizedRef.get(data.checkpoints)).get(sessionID)?.generation === expected
+            return [current, admission] as const
+          }),
+        ),
       )
     })
 
     const retain = Effect.fn("SessionRunState.retain")(function* (sessionID: SessionID, expected: number) {
-      const data = yield* InstanceState.get(state)
-      return yield* SynchronizedRef.modifyEffect(
-        lifecycle,
-        Effect.fnUntraced(function* (admission) {
-          if (admission.removing.has(sessionID)) return [Option.none(), admission] as const
-          const retained = yield* SynchronizedRef.modify(data.checkpoints, (checkpoints) => {
-            const current = checkpoints.get(sessionID)
-            if (current?.generation !== expected) return [Option.none(), checkpoints] as const
-            const released = { value: false }
-            const release = Effect.sync(() => {
-              if (released.value) return false
-              released.value = true
-              return true
-            }).pipe(
-              Effect.flatMap((active) =>
-                active
-                  ? SynchronizedRef.update(data.checkpoints, (latest) => {
-                      const held = latest.get(sessionID)
-                      if (held?.generation !== expected || held.leases === 0) return latest
-                      const next = new Map(latest)
-                      if (held.leases === 1 && !data.runners.get(sessionID)?.busy) {
-                        next.delete(sessionID)
+      return yield* InstanceState.useEffect(state, (data) =>
+        SynchronizedRef.modifyEffect(
+          data.lifecycle,
+          Effect.fnUntraced(function* (admission) {
+            if (admission.removing.has(sessionID)) return [Option.none(), admission] as const
+            const retained = yield* SynchronizedRef.modify(data.checkpoints, (checkpoints) => {
+              const current = checkpoints.get(sessionID)
+              if (current?.generation !== expected) return [Option.none(), checkpoints] as const
+              const released = { value: false }
+              const release = Effect.sync(() => {
+                if (released.value) return false
+                released.value = true
+                return true
+              }).pipe(
+                Effect.flatMap((active) =>
+                  active
+                    ? SynchronizedRef.update(data.checkpoints, (latest) => {
+                        const held = latest.get(sessionID)
+                        if (held?.generation !== expected || held.leases === 0) return latest
+                        const next = new Map(latest)
+                        if (held.leases === 1 && !data.runners.get(sessionID)?.busy) {
+                          next.delete(sessionID)
+                          return next
+                        }
+                        next.set(sessionID, { ...held, leases: held.leases - 1 })
                         return next
-                      }
-                      next.set(sessionID, { ...held, leases: held.leases - 1 })
-                      return next
-                    })
-                  : Effect.void,
-              ),
-            )
-            const next = new Map(checkpoints).set(sessionID, { ...current, leases: current.leases + 1 })
-            return [Option.some(release), next] as const
-          })
-          return [retained, admission] as const
-        }),
+                      })
+                    : Effect.void,
+                ),
+              )
+              const next = new Map(checkpoints).set(sessionID, { ...current, leases: current.leases + 1 })
+              return [Option.some(release), next] as const
+            })
+            return [retained, admission] as const
+          }),
+        ),
       )
     })
 
     const admit: Interface["admit"] = (requirements, effect) =>
-      Effect.gen(function* () {
-        const data = yield* InstanceState.get(state)
-        return yield* SynchronizedRef.modifyEffect(
-          lifecycle,
+      InstanceState.useEffect(state, (data) =>
+        SynchronizedRef.modifyEffect(
+          data.lifecycle,
           Effect.fnUntraced(function* (admission) {
             const rejected = requirements.some((requirement) => {
               if (admission.removing.has(requirement.sessionID)) return true
@@ -258,8 +273,8 @@ const layer = Layer.effect(
             if (rejected) return [Option.none(), admission] as const
             return [Option.some(yield* effect), admission] as const
           }),
-        )
-      })
+        ),
+      )
 
     const admitIfCurrent: Interface["admitIfCurrent"] = (sessionID, expected, effect) =>
       admit([{ sessionID, checkpoint: expected }], effect)

@@ -1039,21 +1039,28 @@ export function Prompt(props: PromptProps) {
       setStore("extmarkToPartIndex", new Map())
       dialog.setSize("large")
       const request = ++askRequest
+      const controller = new AbortController()
       let pending = true
       dialog.replace(
         () => <DialogAsk question={askQuestion} />,
         () => {
-          if (pending && askRequest === request) askRequest++
+          if (pending && askRequest === request) {
+            askRequest++
+            controller.abort()
+          }
         },
       )
       void sdk.client.session
-        .ask({
-          sessionID: props.sessionID,
-          question: askQuestion,
-          agent: agent.name,
-          model: selectedModel,
-          variant,
-        })
+        .ask(
+          {
+            sessionID: props.sessionID,
+            question: askQuestion,
+            agent: agent.name,
+            model: selectedModel,
+            variant,
+          },
+          { signal: controller.signal },
+        )
         .then((result) => {
           if (askRequest !== request) return
           if (result.error) throw result.error

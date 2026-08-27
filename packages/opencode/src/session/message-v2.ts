@@ -18,7 +18,14 @@ import {
 } from "@opencode-ai/core/v1/session"
 
 import { NamedError } from "@opencode-ai/core/util/error"
-import { APICallError, convertToModelMessages, LoadAPIKeyError, type ModelMessage, type UIMessage } from "ai"
+import {
+  APICallError,
+  convertToModelMessages,
+  LoadAPIKeyError,
+  RetryError,
+  type ModelMessage,
+  type UIMessage,
+} from "ai"
 import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { NotFoundError } from "@/storage/storage"
@@ -1105,13 +1112,14 @@ export function fromError(
   e: unknown,
   ctx: { providerID: ProviderV2.ID; aborted?: boolean },
 ): NonNullable<Assistant["error"]> {
-  const error = classify(e, ctx)
+  const source = RetryError.isInstance(e) ? e.lastError : e
+  const error = classify(source, ctx)
   // A cancelled request must never be retried. Abort can surface as a
   // transport-shaped failure instead of an interrupt when it races the read, so
   // rather than guarding each transport branch, refuse every retryable
   // classification once the turn is known to be aborted.
   if (ctx.aborted && APIError.isInstance(error) && error.data.isRetryable)
-    return new AbortedError({ message: error.data.message }, { cause: e }).toObject()
+    return new AbortedError({ message: error.data.message }, { cause: source }).toObject()
   return error
 }
 

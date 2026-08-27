@@ -20,7 +20,13 @@ import {
   WorkspaceRoutingQuery,
   WorkspaceRoutingQueryFields,
 } from "../middleware/workspace-routing"
-import { ApiNotFoundError, PermissionNotFoundError, SessionBusyError } from "../errors"
+import {
+  ApiNotFoundError,
+  ModelNotFoundError,
+  PermissionNotFoundError,
+  SessionBusyError,
+  UpstreamError,
+} from "../errors"
 import { described } from "./metadata"
 import { QueryBoolean } from "./query"
 import { ProviderV2 } from "@opencode-ai/core/provider"
@@ -347,12 +353,13 @@ export const SessionApi = HttpApi.make("session")
           query: WorkspaceRoutingQuery,
           payload: AskPayload,
           success: described(SessionPrompt.AskOutput, "Contextual answer"),
-          error: [HttpApiError.BadRequest, ApiNotFoundError],
+          error: [HttpApiError.BadRequest, ApiNotFoundError, ModelNotFoundError, UpstreamError],
         }).annotateMerge(
           OpenApi.annotations({
             identifier: "session.ask",
             summary: "Ask without changing history",
-            description: "Ask a one-turn question using the current session context without persisting the question or answer.",
+            description:
+              "Ask a one-turn question using the current session context without persisting the question or answer.",
           }),
         ),
         HttpApiEndpoint.post("command", SessionPaths.command, {

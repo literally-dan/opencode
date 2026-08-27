@@ -6,7 +6,7 @@ import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { eq } from "drizzle-orm"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { expect } from "bun:test"
-import { Cause, Deferred, Duration, Effect, Exit, Fiber, Layer, Stream } from "effect"
+import { Cause, Deferred, Duration, Effect, Exit, Fiber, Layer, Option, Stream } from "effect"
 import { LLMEvent, Usage } from "@opencode-ai/llm"
 import path from "path"
 import { fileURLToPath } from "url"
@@ -51,7 +51,13 @@ import { Truncate } from "@/tool/truncate"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { Format } from "../../src/format"
-import { TestInstance } from "../fixture/fixture"
+import {
+  disposeAllInstancesEffect,
+  provideInstanceEffect,
+  reloadInstance,
+  TestInstance,
+  tmpdirScoped,
+} from "../fixture/fixture"
 import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
 import { reply, TestLLMServer } from "../lib/llm-server"
 import { RuntimeFlags } from "@/effect/runtime-flags"
@@ -165,6 +171,27 @@ const blockingProcessor = Layer.succeed(
   }),
 )
 
+const promptPreparationGates: Array<{
+  started: Deferred.Deferred<void>
+  release: Deferred.Deferred<void>
+}> = []
+const blockingPromptPreparation = Layer.succeed(
+  Plugin.Service,
+  Plugin.Service.of({
+    trigger: (name, _input, output) => {
+      if (name !== "chat.message") return Effect.succeed(output)
+      const gate = promptPreparationGates.shift()
+      if (!gate) return Effect.succeed(output)
+      return Deferred.succeed(gate.started, undefined).pipe(
+        Effect.andThen(Deferred.await(gate.release)),
+        Effect.as(output),
+      )
+    },
+    list: () => Effect.succeed([]),
+    init: () => Effect.void,
+  }),
+)
+
 const runtimeFlags = RuntimeFlags.layer({ experimentalEventSystem: true })
 
 const testLLMServerNode = LayerNode.make({ service: TestLLMServer, layer: TestLLMServer.layer, deps: [] })
@@ -213,6 +240,7 @@ function makePrompt(input?: {
   mcpInstructions?: MCP.ServerInstructions[]
   processor?: "blocking"
   llm?: Layer.Layer<LLM.Service>
+  plugin?: Layer.Layer<Plugin.Service>
 }) {
   const replacements = [
     [SessionSummary.node, summary],
@@ -220,14 +248,25 @@ function makePrompt(input?: {
     [MCP.node, makeMcp(input?.mcpInstructions)],
     [RuntimeFlags.node, runtimeFlags],
   ] as const
+  const plugin = input?.plugin ? ([Plugin.node, input.plugin] as const) : undefined
   if (input?.processor === "blocking") {
-    return LayerNode.compile(promptRoot, [...replacements, [SessionProcessor.node, blockingProcessor]])
+    return LayerNode.compile(promptRoot, [
+      ...replacements,
+      ...(plugin ? [plugin] : []),
+      [SessionProcessor.node, blockingProcessor],
+    ])
   }
-  if (input?.llm) return LayerNode.compile(promptRoot, [...replacements, [LLM.node, input.llm]])
+  if (input?.llm)
+    return LayerNode.compile(promptRoot, [...replacements, ...(plugin ? [plugin] : []), [LLM.node, input.llm]])
+  if (plugin) return LayerNode.compile(promptRoot, [...replacements, plugin])
   return LayerNode.compile(promptRoot, replacements)
 }
 
-function makeHttp(input?: { mcpInstructions?: MCP.ServerInstructions[]; processor?: "blocking" }) {
+function makeHttp(input?: {
+  mcpInstructions?: MCP.ServerInstructions[]
+  processor?: "blocking"
+  plugin?: Layer.Layer<Plugin.Service>
+}) {
   const root = LayerNode.group([promptRoot, testLLMServerNode])
   const replacements = [
     [SessionSummary.node, summary],
@@ -235,9 +274,15 @@ function makeHttp(input?: { mcpInstructions?: MCP.ServerInstructions[]; processo
     [MCP.node, makeMcp(input?.mcpInstructions)],
     [RuntimeFlags.node, runtimeFlags],
   ] as const
+  const plugin = input?.plugin ? ([Plugin.node, input.plugin] as const) : undefined
   if (input?.processor === "blocking") {
-    return LayerNode.compile(root, [...replacements, [SessionProcessor.node, blockingProcessor]])
+    return LayerNode.compile(root, [
+      ...replacements,
+      ...(plugin ? [plugin] : []),
+      [SessionProcessor.node, blockingProcessor],
+    ])
   }
+  if (plugin) return LayerNode.compile(root, [...replacements, plugin])
   return LayerNode.compile(root, replacements)
 }
 
@@ -247,6 +292,11 @@ function makeHttpNoLLMServer(input?: { mcpInstructions?: MCP.ServerInstructions[
 
 const it = testEffect(makeHttp())
 const finishOnlyCalls = { value: 0 }
+const askCleanupGates: Array<{
+  started: Deferred.Deferred<void>
+  finalizing: Deferred.Deferred<void>
+  release: Deferred.Deferred<void>
+}> = []
 const finishOnly = testEffect(
   makePrompt({
     llm: Layer.succeed(
@@ -267,6 +317,67 @@ const finishOnly = testEffect(
 )
 const noLLMServer = testEffect(makeHttpNoLLMServer())
 const raceNoLLMServer = testEffect(makeHttpNoLLMServer({ processor: "blocking" }))
+const promptRemovalRace = testEffect(makePrompt({ plugin: blockingPromptPreparation }))
+const askTransform = testEffect(
+  makeHttp({
+    plugin: Layer.succeed(
+      Plugin.Service,
+      Plugin.Service.of({
+        trigger: (name, _input, output) =>
+          Effect.sync(() => {
+            if (name !== "experimental.chat.messages.transform") return output
+            const messages = (output as unknown as { messages: SessionV1.WithParts[] }).messages
+            const question = messages.flatMap((message) => message.parts).find((part) => part.type === "text")
+            if (question?.type === "text" && question.text === "untransformed question") {
+              question.text = "transformed question"
+            }
+            return output
+          }),
+        list: () => Effect.succeed([]),
+        init: () => Effect.void,
+      }),
+    ),
+  }),
+)
+const askProviderFailure = testEffect(
+  makePrompt({
+    llm: Layer.succeed(
+      LLM.Service,
+      LLM.Service.of({
+        stream: () =>
+          Stream.make(
+            LLMEvent.providerError({
+              message: JSON.stringify({
+                type: "error",
+                error: { code: "server_error", message: "midstream unavailable" },
+              }),
+            }),
+          ),
+      }),
+    ),
+  }),
+)
+const askCleanupRace = testEffect(
+  makePrompt({
+    llm: Layer.succeed(
+      LLM.Service,
+      LLM.Service.of({
+        stream: () => {
+          const gate = askCleanupGates.shift()
+          if (!gate) return Stream.never
+          return Stream.fromEffect(
+            Deferred.succeed(gate.started, undefined).pipe(
+              Effect.andThen(Effect.never),
+              Effect.ensuring(
+                Deferred.succeed(gate.finalizing, undefined).pipe(Effect.andThen(Deferred.await(gate.release))),
+              ),
+            ),
+          )
+        },
+      }),
+    ),
+  }),
+)
 const withMcpInstructions = testEffect(
   makeHttp({
     mcpInstructions: [
@@ -687,6 +798,118 @@ noLLMServer.instance("session removal tombstones before cancellation and rejects
   }),
 )
 
+promptRemovalRace.instance("normal prompt rejects with RemovingError when removal wins before persistence", () =>
+  Effect.gen(function* () {
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({})
+    const messageID = MessageID.ascending()
+    const started = yield* Deferred.make<void>()
+    const release = yield* Deferred.make<void>()
+    const gate = { started, release }
+    promptPreparationGates.push(gate)
+
+    yield* Effect.gen(function* () {
+      const pending = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          messageID,
+          agent: "build",
+          model: ref,
+          noReply: true,
+          parts: [{ type: "text", text: "removed before persistence" }],
+        })
+        .pipe(Effect.forkChild)
+      yield* Deferred.await(started)
+
+      yield* sessions.remove(chat.id)
+      expect(Exit.isFailure(yield* sessions.get(chat.id).pipe(Effect.exit))).toBe(true)
+      yield* Deferred.succeed(release, undefined)
+
+      const exit = yield* Fiber.await(pending)
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) {
+        expect(Cause.squash(exit.cause)).toBeInstanceOf(Session.RemovingError)
+        expect(Cause.squash(exit.cause)).toMatchObject({ _tag: "SessionRemovingError", sessionID: chat.id })
+      }
+    }).pipe(
+      Effect.ensuring(
+        Effect.all(
+          [
+            Deferred.succeed(release, undefined),
+            Effect.sync(() => {
+              const index = promptPreparationGates.indexOf(gate)
+              if (index >= 0) promptPreparationGates.splice(index, 1)
+            }),
+          ],
+          { discard: true },
+        ).pipe(Effect.ignore),
+      ),
+    )
+  }),
+)
+
+noLLMServer.instance("run-state removal tombstone clears when the same Instance reloads", () =>
+  Effect.gen(function* () {
+    const events = yield* EventV2Bridge.Service
+    const run = yield* SessionRunState.Service
+    const directory = yield* tmpdirScoped()
+    const sessionID = SessionID.make("session-run-state-reload")
+
+    yield* events.publish(Session.Event.Removing, { sessionID }).pipe(provideInstanceEffect(directory))
+    const removed = yield* run.checkpoint(sessionID).pipe(provideInstanceEffect(directory), Effect.exit)
+    expect(Exit.isFailure(removed)).toBe(true)
+    if (Exit.isFailure(removed)) expect(Cause.squash(removed.cause)).toBeInstanceOf(Session.RemovingError)
+
+    yield* reloadInstance({ directory })
+    expect(yield* run.checkpoint(sessionID).pipe(provideInstanceEffect(directory))).toBe(1)
+  }),
+)
+
+noLLMServer.instance("run-state removal tombstone clears after Instance disposal", () =>
+  Effect.gen(function* () {
+    const events = yield* EventV2Bridge.Service
+    const run = yield* SessionRunState.Service
+    const directory = yield* tmpdirScoped()
+    const sessionID = SessionID.make("session-run-state-dispose")
+
+    yield* events.publish(Session.Event.Removing, { sessionID }).pipe(provideInstanceEffect(directory))
+    const removed = yield* run.checkpoint(sessionID).pipe(provideInstanceEffect(directory), Effect.exit)
+    expect(Exit.isFailure(removed)).toBe(true)
+    if (Exit.isFailure(removed)) expect(Cause.squash(removed.cause)).toBeInstanceOf(Session.RemovingError)
+    yield* disposeAllInstancesEffect
+
+    expect(yield* run.checkpoint(sessionID).pipe(provideInstanceEffect(directory))).toBe(1)
+  }),
+)
+
+noLLMServer.instance("run-state admission locks are independent across Instances", () =>
+  Effect.gen(function* () {
+    const run = yield* SessionRunState.Service
+    const first = yield* tmpdirScoped()
+    const second = yield* tmpdirScoped()
+    const sessionID = SessionID.make("session-run-state-independent")
+    const started = yield* Deferred.make<void>()
+    const release = yield* Deferred.make<void>()
+
+    yield* Effect.gen(function* () {
+      const held = yield* run
+        .admit([{ sessionID }], Deferred.succeed(started, undefined).pipe(Effect.andThen(Deferred.await(release))))
+        .pipe(provideInstanceEffect(first), Effect.forkChild)
+      yield* Deferred.await(started)
+
+      const admitted = yield* awaitWithTimeout(
+        run.admit([{ sessionID }], Effect.succeed("independent")).pipe(provideInstanceEffect(second)),
+        "second Instance admission was serialized behind the first",
+      )
+      expect(admitted).toEqual(Option.some("independent"))
+
+      yield* Deferred.succeed(release, undefined)
+      yield* Fiber.join(held)
+    }).pipe(Effect.ensuring(Deferred.succeed(release, undefined).pipe(Effect.ignore)))
+  }),
+)
+
 noLLMServer.instance(
   "new subtask parts persist the background default and explicit foreground opt-out",
   () =>
@@ -853,6 +1076,125 @@ it.instance("ask uses session context without persisting the question or answer"
     expect(strings(hit?.body)).toContain("hi there")
     expect(strings(hit?.body)).toContain("What number did we establish?")
     expect(hit?.body.tools).toBeUndefined()
+  }),
+)
+
+askTransform.instance("ask transforms the ephemeral question before model serialization", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+    yield* llm.text("transformed")
+
+    expect(yield* prompt.ask({ sessionID: chat.id, question: "untransformed question" })).toEqual({
+      text: "transformed",
+    })
+    const hit = (yield* llm.hits)[0]
+    expect(strings(hit?.body)).toContain("transformed question")
+    expect(strings(hit?.body)).not.toContain("untransformed question")
+  }),
+)
+
+it.instance(
+  "cancel interrupts every active ask for the session",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
+      yield* llm.hang
+      yield* llm.hang
+
+      const first = yield* prompt.ask({ sessionID: chat.id, question: "first" }).pipe(Effect.forkChild)
+      const second = yield* prompt.ask({ sessionID: chat.id, question: "second" }).pipe(Effect.forkChild)
+      yield* awaitWithTimeout(llm.wait(2), "timed out waiting for active asks", "10 seconds")
+
+      yield* prompt.cancel(chat.id)
+      const [firstExit, secondExit] = yield* Effect.all([Fiber.await(first), Fiber.await(second)])
+
+      expect(Exit.isFailure(firstExit) && Cause.hasInterruptsOnly(firstExit.cause)).toBe(true)
+      expect(Exit.isFailure(secondExit) && Cause.hasInterruptsOnly(secondExit.cause)).toBe(true)
+    }),
+  30_000,
+)
+
+askCleanupRace.instance(
+  "stale ask cleanup preserves a replacement ask registration",
+  () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* writeConfig(test.directory, cfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Ask replacement cleanup" })
+      const first = {
+        started: yield* Deferred.make<void>(),
+        finalizing: yield* Deferred.make<void>(),
+        release: yield* Deferred.make<void>(),
+      }
+      const second = {
+        started: yield* Deferred.make<void>(),
+        finalizing: yield* Deferred.make<void>(),
+        release: yield* Deferred.make<void>(),
+      }
+      askCleanupGates.push(first)
+
+      return yield* Effect.gen(function* () {
+        const firstAsk = yield* prompt
+          .ask({ sessionID: chat.id, agent: "build", model: ref, question: "first" })
+          .pipe(Effect.forkChild)
+        yield* Deferred.await(first.started).pipe(Effect.timeout("5 seconds"))
+        yield* prompt.cancel(chat.id)
+        yield* Deferred.await(first.finalizing).pipe(Effect.timeout("5 seconds"))
+
+        askCleanupGates.push(second)
+        const secondAsk = yield* prompt
+          .ask({ sessionID: chat.id, agent: "build", model: ref, question: "second" })
+          .pipe(Effect.forkChild)
+        yield* Deferred.await(second.started).pipe(Effect.timeout("5 seconds"))
+        yield* Deferred.succeed(first.release, undefined)
+        const firstExit = yield* Fiber.await(firstAsk).pipe(Effect.timeout("5 seconds"))
+        expect(Exit.isFailure(firstExit) && Cause.hasInterruptsOnly(firstExit.cause)).toBe(true)
+
+        yield* Deferred.succeed(second.release, undefined)
+        yield* prompt.cancel(chat.id)
+        const secondExit = yield* Fiber.await(secondAsk).pipe(Effect.timeout("5 seconds"))
+        expect(Exit.isFailure(secondExit) && Cause.hasInterruptsOnly(secondExit.cause)).toBe(true)
+      }).pipe(
+        Effect.ensuring(
+          Effect.sync(() => askCleanupGates.splice(0)).pipe(
+            Effect.andThen(Deferred.succeed(first.release, undefined)),
+            Effect.andThen(Deferred.succeed(second.release, undefined)),
+            Effect.asVoid,
+          ),
+        ),
+      )
+    }),
+  30_000,
+)
+
+askProviderFailure.instance("ask preserves structured provider stream failures", () =>
+  Effect.gen(function* () {
+    const test = yield* TestInstance
+    yield* writeConfig(test.directory, cfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const chat = yield* sessions.create({ title: "Pinned" })
+
+    const exit = yield* prompt.ask({ sessionID: chat.id, question: "fail" }).pipe(Effect.exit)
+
+    expect(Exit.isFailure(exit)).toBe(true)
+    if (Exit.isSuccess(exit)) return
+    const error = Cause.squash(exit.cause)
+    expect(SessionV1.APIError.isInstance(error)).toBe(true)
+    if (!SessionV1.APIError.isInstance(error)) return
+    expect(error.data).toMatchObject({
+      message: "midstream unavailable",
+      isRetryable: true,
+    })
+    expect(error.data.responseBody).toContain("server_error")
   }),
 )
 

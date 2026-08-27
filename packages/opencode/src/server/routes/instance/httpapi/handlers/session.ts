@@ -14,6 +14,7 @@ import { SessionRunState } from "@/session/run-state"
 import { SessionStatus } from "@/session/status"
 import { SessionSummary } from "@/session/summary"
 import { Todo } from "@/session/todo"
+import { Provider } from "@/provider/provider"
 import { MessageID, PartID, SessionID } from "@/session/schema"
 import { NamedError } from "@opencode-ai/core/util/error"
 import { Cause, Effect, Option, Schema, Scope } from "effect"
@@ -37,7 +38,7 @@ import {
   SummarizePayload,
   UpdatePayload,
 } from "../groups/session"
-import { PermissionNotFoundError } from "../errors"
+import { ModelNotFoundError, PermissionNotFoundError, UpstreamError, notFound } from "../errors"
 import * as SessionError from "./session-errors"
 
 const tryParseJson = (text: string) =>
@@ -303,7 +304,13 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
           ...ctx.payload,
           sessionID: ctx.params.sessionID,
         })
-        .pipe(Effect.mapError(() => new HttpApiError.BadRequest({})))
+        .pipe(
+          Effect.mapError((error) =>
+            error instanceof Session.RemovingError
+              ? notFound(`Session not found: ${ctx.params.sessionID}`)
+              : new HttpApiError.BadRequest({}),
+          ),
+        )
       return HttpServerResponse.stream(Stream.make(JSON.stringify(message)).pipe(Stream.encodeText), {
         contentType: "application/json",
       })
@@ -334,9 +341,51 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       payload: typeof AskPayload.Type
     }) {
       yield* requireSession(ctx.params.sessionID)
-      return yield* promptSvc
-        .ask({ ...ctx.payload, sessionID: ctx.params.sessionID })
-        .pipe(Effect.mapError(() => new HttpApiError.BadRequest({})))
+      return yield* promptSvc.ask({ ...ctx.payload, sessionID: ctx.params.sessionID }).pipe(
+        Effect.matchCauseEffect({
+          onSuccess: (value) => Effect.succeed(value),
+          onFailure: (cause): Effect.Effect<never, HttpApiError.BadRequest | ModelNotFoundError | UpstreamError> => {
+            if (Cause.hasInterruptsOnly(cause)) return Effect.interrupt
+            const error = Cause.squash(cause)
+            if (Provider.ModelNotFoundError.isInstance(error)) {
+              return Effect.fail(
+                new ModelNotFoundError({
+                  providerID: error.providerID,
+                  modelID: error.modelID,
+                  suggestions: [...(error.suggestions ?? [])],
+                  message: error.message,
+                }),
+              )
+            }
+            const data = typeof error === "object" && error !== null && "data" in error ? error.data : undefined
+            const message =
+              typeof data === "object" && data !== null && "message" in data && typeof data.message === "string"
+                ? data.message
+                : error instanceof Error
+                  ? error.message
+                  : String(error)
+            if (SessionV1.APIError.isInstance(error)) {
+              return Effect.fail(
+                new UpstreamError({
+                  message,
+                  service: "model provider",
+                  status: error.data.statusCode,
+                }),
+              )
+            }
+            if (message.startsWith("Agent not found:")) {
+              return Effect.fail(new HttpApiError.BadRequest({}))
+            }
+            return Effect.fail(
+              new UpstreamError({
+                message,
+                service: "model provider",
+                status: undefined,
+              }),
+            )
+          },
+        }),
+      )
     })
 
     const command = Effect.fn("SessionHttpApi.command")(function* (ctx: {

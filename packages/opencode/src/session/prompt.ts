@@ -46,7 +46,7 @@ import { Truncate } from "@/tool/truncate"
 import { Image } from "@/image/image"
 import { decodeDataUrl } from "@/util/data-url"
 import { Process } from "@/util/process"
-import { Cause, Effect, Exit, Latch, Layer, Option, Scope, Context, Schema, Types } from "effect"
+import { Cause, Deferred, Effect, Exit, Latch, Layer, Option, Scope, Context, Schema, Types } from "effect"
 import { InstanceState } from "@/effect/instance-state"
 import { TaskTool, type TaskPromptOps } from "@/tool/task"
 import { SessionRunState } from "./run-state"
@@ -283,8 +283,8 @@ export type NotificationContinuation = Effect.Effect<SessionV1.WithParts | undef
 export interface Interface {
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
   readonly checkpoint: (sessionID: SessionID) => Effect.Effect<number>
-  readonly ask: (input: AskInput) => Effect.Effect<AskOutput>
-  readonly prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
+  readonly ask: (input: AskInput) => Effect.Effect<AskOutput, unknown>
+  readonly prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error | Session.RemovingError>
   readonly admitNotification: (
     input: PromptInput,
     checkpoint: number,
@@ -295,7 +295,7 @@ export interface Interface {
   ) => Effect.Effect<SessionV1.WithParts | undefined, Image.Error>
   readonly loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts>
   readonly shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError>
-  readonly command: (input: CommandInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
+  readonly command: (input: CommandInput) => Effect.Effect<SessionV1.WithParts, Image.Error | Session.RemovingError>
   readonly resolvePromptParts: (template: string) => Effect.Effect<PromptInput["parts"]>
 }
 
@@ -339,6 +339,7 @@ const layer = Layer.effect(
       reminder?: string
     }
     const contextStates = new Map<SessionID, ContextState>()
+    const activeAsks = new Map<SessionID, Set<Deferred.Deferred<void>>>()
     const contextState = (sessionID: SessionID) => {
       const hit = contextStates.get(sessionID)
       if (hit) return hit
@@ -368,6 +369,10 @@ const layer = Layer.effect(
     const cancel = Effect.fn("SessionPrompt.cancel")(function* (sessionID: SessionID) {
       yield* Effect.logInfo("cancel", { "session.id": sessionID })
       yield* state.cancel(sessionID)
+      const pending = activeAsks.get(sessionID)
+      activeAsks.delete(sessionID)
+      if (pending)
+        yield* Effect.forEach(pending, (deferred) => Deferred.succeed(deferred, undefined), { discard: true })
     })
 
     const resolvePromptParts = Effect.fn("SessionPrompt.resolvePromptParts")(function* (template: string) {
@@ -850,7 +855,7 @@ const layer = Layer.effect(
       return yield* provider.defaultModel().pipe(Effect.orDie)
     })
 
-    const ask = Effect.fn("SessionPrompt.ask")(function* (input: AskInput) {
+    const askImpl = Effect.fn("SessionPrompt.askImpl")(function* (input: AskInput) {
       const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
       const msgs = yield* MessageV2.filterCompactedEffect(input.sessionID).pipe(
         Effect.provideService(Database.Service, database),
@@ -858,10 +863,10 @@ const layer = Layer.effect(
       const previous = msgs.findLast((message) => message.info.role === "user")
       const agentName = input.agent ?? previous?.info.agent ?? session.agent
       const ag = agentName ? yield* agents.get(agentName) : yield* agents.defaultInfo()
-      if (!ag) throw new Error(`Agent not found: "${agentName}"`)
+      if (!ag) return yield* Effect.fail(new Error(`Agent not found: "${agentName}"`))
 
       const selected = input.model ?? (yield* currentModel(input.sessionID))
-      const model = yield* getModel(selected.providerID, selected.modelID, input.sessionID)
+      const model = yield* provider.getModel(selected.providerID, selected.modelID)
       const variant =
         input.variant ?? ("variant" in selected && typeof selected.variant === "string" ? selected.variant : undefined)
       const user: SessionV1.User = {
@@ -877,6 +882,18 @@ const layer = Layer.effect(
         },
       }
 
+      msgs.push({
+        info: user,
+        parts: [
+          {
+            id: PartID.ascending(),
+            messageID: user.id,
+            sessionID: input.sessionID,
+            type: "text",
+            text: input.question,
+          },
+        ],
+      })
       yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
       const [skills, env, instructions, mcpInstructions, modelMsgs] = yield* Effect.all([
         sys.skills(ag),
@@ -895,15 +912,35 @@ const layer = Layer.effect(
           model,
           sessionID: input.sessionID,
           retries: 2,
-          messages: [...modelMsgs, { role: "user", content: input.question }],
+          messages: modelMsgs,
         })
         .pipe(
-          Stream.filter(LLMEvent.is.textDelta),
-          Stream.map((event) => event.text),
+          Stream.mapEffect((event) => {
+            if (LLMEvent.is.providerError(event)) return Effect.fail(event.message)
+            return Effect.succeed(LLMEvent.is.textDelta(event) ? event.text : "")
+          }),
           Stream.mkString,
-          Effect.orDie,
+          Effect.mapError((error) => MessageV2.fromError(error, { providerID: model.providerID })),
         )
       return { text }
+    })
+
+    const ask = Effect.fn("SessionPrompt.ask")(function* (input: AskInput) {
+      const cancelled = yield* Deferred.make<void>()
+      const pending = activeAsks.get(input.sessionID) ?? new Set<Deferred.Deferred<void>>()
+      pending.add(cancelled)
+      activeAsks.set(input.sessionID, pending)
+      return yield* Effect.raceFirst(
+        askImpl(input),
+        Deferred.await(cancelled).pipe(Effect.flatMap(() => Effect.interrupt)),
+      ).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            pending.delete(cancelled)
+            if (pending.size === 0 && activeAsks.get(input.sessionID) === pending) activeAsks.delete(input.sessionID)
+          }),
+        ),
+      )
     })
 
     const prepareUserMessage = Effect.fn("SessionPrompt.prepareUserMessage")(function* (input: PromptInput) {
@@ -1344,19 +1381,25 @@ const layer = Layer.effect(
     })
 
     const savePrompt = Effect.fn("SessionPrompt.savePrompt")(function* (input: PromptInput) {
-      return yield* persistPrompt(yield* prepareUserMessage(input), input)
+      const prepared = yield* prepareUserMessage(input)
+      const admitted = yield* state.admit(
+        [{ sessionID: input.sessionID }],
+        Effect.gen(function* () {
+          yield* revert.cleanup(yield* sessions.get(input.sessionID).pipe(Effect.orDie))
+          return yield* persistPrompt(prepared, input)
+        }),
+      )
+      if (Option.isNone(admitted)) return yield* new Session.RemovingError({ sessionID: input.sessionID })
+      return admitted.value
     })
 
-    const prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error> = Effect.fn(
-      "SessionPrompt.prompt",
-    )(function* (input: PromptInput) {
-      const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
-      yield* revert.cleanup(session)
-      const message = yield* savePrompt(input)
+    const prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error | Session.RemovingError> =
+      Effect.fn("SessionPrompt.prompt")(function* (input: PromptInput) {
+        const message = yield* savePrompt(input)
 
-      if (input.noReply === true) return message
-      return yield* loop({ sessionID: input.sessionID })
-    })
+        if (input.noReply === true) return message
+        return yield* loop({ sessionID: input.sessionID })
+      })
 
     const lastAssistant = Effect.fnUntraced(function* (sessionID: SessionID) {
       const match = yield* sessions.findMessage(sessionID, (m) => m.info.role !== "user").pipe(Effect.orDie)
