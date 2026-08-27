@@ -18,3 +18,9 @@ Usage notes:
 6. The agent's outputs should generally be trusted
 7. Clearly tell the agent whether you expect it to write code or just to do research (search, file reads, web fetches, etc.), since it is not aware of the user's intent. Tell it how to verify its work if possible (e.g., relevant test commands).
 8. If the agent description mentions that it should be used proactively, then you should try your best to use it without the user having to ask for it first. Use your judgement.
+
+Background tasks:
+- Set background=true for independent work that does not block your next action. The call returns immediately so you can keep helping the user while the subagent runs.
+- Prefer background=true for parallel research, long-running verification, and independent implementation in files you will not touch.
+- Do not poll, sleep, or ask for status. Completion is delivered automatically into the conversation.
+- Keep working on non-overlapping tasks after launch. Do not duplicate the background agent's work or edit the same files.

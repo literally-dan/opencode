@@ -272,7 +272,9 @@ function compactionManifest(messages: SessionV1.WithParts[], currentMessageID: s
 
 export interface Interface {
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
+  readonly checkpoint: (sessionID: SessionID) => Effect.Effect<number>
   readonly prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
+  readonly notify: (input: PromptInput, checkpoint: number) => Effect.Effect<void, Image.Error>
   readonly loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts>
   readonly shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError>
   readonly command: (input: CommandInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
@@ -315,8 +317,10 @@ const layer = Layer.effect(
     const ops = Effect.fn("SessionPrompt.ops")(function* () {
       return {
         cancel: (sessionID: SessionID) => cancel(sessionID),
+        checkpoint: (sessionID: SessionID) => state.checkpoint(sessionID),
         resolvePromptParts: (template: string) => resolvePromptParts(template),
         prompt: (input: PromptInput) => prompt(input).pipe(Effect.catch(Effect.die)),
+        notify: (input: PromptInput, checkpoint: number) => notify(input, checkpoint).pipe(Effect.catch(Effect.die)),
       } satisfies TaskPromptOps
     })
 
@@ -803,7 +807,7 @@ const layer = Layer.effect(
       return yield* provider.defaultModel().pipe(Effect.orDie)
     })
 
-    const createUserMessage = Effect.fn("SessionPrompt.createUserMessage")(function* (input: PromptInput) {
+    const prepareUserMessage = Effect.fn("SessionPrompt.prepareUserMessage")(function* (input: PromptInput) {
       const agentName = input.agent
       const ag = agentName ? yield* agents.get(agentName) : yield* agents.defaultInfo()
       if (!ag) {
@@ -838,25 +842,6 @@ const layer = Layer.effect(
         },
         system: input.system,
         format: input.format,
-      }
-
-      const current = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
-      if (
-        current.agent !== info.agent ||
-        current.model?.providerID !== info.model.providerID ||
-        current.model?.id !== info.model.modelID ||
-        (current.model?.variant === "default" ? undefined : current.model?.variant) !== info.model.variant
-      ) {
-        yield* sessions.setAgentModel({
-          sessionID: input.sessionID,
-          agent: info.agent,
-          model: {
-            id: info.model.modelID,
-            providerID: info.model.providerID,
-            variant: info.model.variant ?? "default",
-          },
-          time: info.time.created,
-        })
       }
 
       yield* Effect.addFinalizer(() => instruction.clear(info.id))
@@ -1214,18 +1199,33 @@ const layer = Layer.effect(
         })
       }
 
-      yield* sessions.updateMessage(info)
-      for (const part of parts) yield* sessions.updatePart(part)
-
       return { info, parts }
     }, Effect.scoped)
 
-    const prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error> = Effect.fn(
-      "SessionPrompt.prompt",
-    )(function* (input: PromptInput) {
+    const persistPrompt = Effect.fn("SessionPrompt.persistPrompt")(function* (
+      message: SessionV1.WithParts & { info: SessionV1.User },
+      input: PromptInput,
+    ) {
       const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
-      yield* revert.cleanup(session)
-      const message = yield* createUserMessage(input)
+      if (
+        session.agent !== message.info.agent ||
+        session.model?.providerID !== message.info.model.providerID ||
+        session.model?.id !== message.info.model.modelID ||
+        (session.model?.variant === "default" ? undefined : session.model?.variant) !== message.info.model.variant
+      ) {
+        yield* sessions.setAgentModel({
+          sessionID: input.sessionID,
+          agent: message.info.agent,
+          model: {
+            id: message.info.model.modelID,
+            providerID: message.info.model.providerID,
+            variant: message.info.model.variant ?? "default",
+          },
+          time: message.info.time.created,
+        })
+      }
+      yield* sessions.updateMessage(message.info)
+      for (const part of message.parts) yield* sessions.updatePart(part)
       yield* sessions.touch(input.sessionID)
 
       const permissions: PermissionV1.Rule[] = []
@@ -1236,6 +1236,20 @@ const layer = Layer.effect(
         session.permission = permissions
         yield* sessions.setPermission({ sessionID: session.id, permission: permissions })
       }
+
+      return message
+    })
+
+    const savePrompt = Effect.fn("SessionPrompt.savePrompt")(function* (input: PromptInput) {
+      return yield* persistPrompt(yield* prepareUserMessage(input), input)
+    })
+
+    const prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error> = Effect.fn(
+      "SessionPrompt.prompt",
+    )(function* (input: PromptInput) {
+      const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
+      yield* revert.cleanup(session)
+      const message = yield* savePrompt(input)
 
       if (input.noReply === true) return message
       return yield* loop({ sessionID: input.sessionID })
@@ -1657,6 +1671,48 @@ const layer = Layer.effect(
       return yield* state.ensureRunning(input.sessionID, lastAssistant(input.sessionID), runLoop(input.sessionID))
     })
 
+    const runNotification = Effect.fn("SessionPrompt.runNotification")(function* (
+      message: SessionV1.WithParts,
+      checkpoint: number,
+    ) {
+      if (!(yield* state.isCurrent(message.info.sessionID, checkpoint))) return
+      const result = yield* state.ensureRunning(
+        message.info.sessionID,
+        lastAssistant(message.info.sessionID),
+        Effect.gen(function* () {
+          if (!(yield* state.isCurrent(message.info.sessionID, checkpoint))) return message
+          return yield* runLoop(message.info.sessionID)
+        }),
+      )
+      if (!(yield* state.isCurrent(message.info.sessionID, checkpoint))) return
+      return result
+    })
+
+    const notify: (input: PromptInput, checkpoint: number) => Effect.Effect<void, Image.Error> = Effect.fn(
+      "SessionPrompt.notify",
+    )(function* (input: PromptInput, checkpoint: number) {
+      if (!(yield* state.isCurrent(input.sessionID, checkpoint))) return
+      const message = yield* prepareUserMessage(input)
+      const admitted = yield* state.admitIfCurrent(
+        input.sessionID,
+        checkpoint,
+        Effect.gen(function* () {
+          if ((yield* sessions.get(input.sessionID).pipe(Effect.orDie)).revert) return false as const
+          return yield* persistPrompt(message, input)
+        }),
+      )
+      if (Option.isNone(admitted) || admitted.value === false || input.noReply === true) return
+
+      const result = yield* runNotification(admitted.value, checkpoint)
+      if (!result) return
+      if (result.info.role === "assistant" && result.info.parentID === admitted.value.info.id) return
+      const latest = MessageV2.latest(
+        yield* MessageV2.filterCompactedEffect(input.sessionID).pipe(Effect.provideService(Database.Service, database)),
+      )
+      if (latest.user?.id !== admitted.value.info.id) return
+      yield* runNotification(admitted.value, checkpoint).pipe(Effect.asVoid)
+    })
+
     const shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError> = Effect.fn(
       "SessionPrompt.shell",
     )(function* (input: ShellInput) {
@@ -1793,7 +1849,9 @@ const layer = Layer.effect(
 
     return Service.of({
       cancel,
+      checkpoint: state.checkpoint,
       prompt,
+      notify,
       loop,
       shell,
       command,

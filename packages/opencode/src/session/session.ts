@@ -10,6 +10,7 @@ import type { ProviderMetadata, Usage } from "@opencode-ai/llm"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import { Database } from "@opencode-ai/core/database/database"
 import { EventV2Bridge } from "@/event-v2-bridge"
+import { EventV2 } from "@opencode-ai/core/event"
 import { SessionV2 } from "@opencode-ai/core/session"
 import * as SessionExecutionLocal from "@opencode-ai/core/session/execution/local"
 import { locationServiceMapLayer } from "@opencode-ai/core/location-services"
@@ -324,6 +325,10 @@ export const Event = {
   Created: SessionV1.Event.Created,
   Updated: SessionV1.Event.Updated,
   Deleted: SessionV1.Event.Deleted,
+  Removing: EventV2.define({
+    type: "session.removing",
+    schema: { sessionID: SessionID },
+  }),
   Diff: SessionV1.Event.Diff,
   Error: SessionV1.Event.Error,
 }
@@ -405,6 +410,10 @@ export const getUsage = (input: { model: Provider.Model; usage: Usage; metadata?
 }
 
 export class BusyError extends Schema.TaggedErrorClass<BusyError>()("SessionBusyError", {
+  sessionID: SessionID,
+}) {}
+
+export class RemovingError extends Schema.TaggedErrorClass<RemovingError>()("SessionRemovingError", {
   sessionID: SessionID,
 }) {}
 
@@ -620,7 +629,10 @@ const layer: Layer.Layer<
           Effect.catchCause(() => Effect.succeed(false)),
         )
 
-        if (hasInstance) yield* cancelBackgroundJobs(background, sessionID)
+        if (hasInstance) {
+          yield* events.publish(Event.Removing, { sessionID })
+          yield* cancelBackgroundJobs(background, sessionID)
+        }
         const kids = yield* children(sessionID)
         for (const child of kids) {
           yield* remove(child.id)

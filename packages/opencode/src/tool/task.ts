@@ -1,6 +1,5 @@
 import * as Tool from "./tool"
 import DESCRIPTION from "./task.txt"
-import { ToolJsonSchema } from "./json-schema"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { BackgroundJob } from "@/background/job"
 import { Session } from "@/session/session"
@@ -18,8 +17,10 @@ import { Provider } from "@/provider/provider"
 
 export interface TaskPromptOps {
   cancel(sessionID: SessionID): Effect.Effect<void>
+  checkpoint(sessionID: SessionID): Effect.Effect<number>
   resolvePromptParts(template: string): Effect.Effect<SessionPrompt.PromptInput["parts"]>
   prompt(input: SessionPrompt.PromptInput): Effect.Effect<SessionV1.WithParts>
+  notify(input: SessionPrompt.PromptInput, checkpoint: number): Effect.Effect<void>
 }
 
 const id = "task"
@@ -32,13 +33,13 @@ const BACKGROUND_DESCRIPTION = [
 const BACKGROUND_STARTED = [
   "The task is working in the background. You will be notified automatically when it finishes.",
   "DO NOT sleep, poll for progress, ask the task for status, or duplicate this task's work — avoid working with the same files or topics it is using.",
-  "Work on non-overlapping tasks, or briefly tell the user what you launched and end your response.",
+  "Keep the main conversation moving with non-overlapping work. If there is nothing else to do, briefly tell the user what you launched and end your response.",
 ].join("\n")
 const BACKGROUND_UPDATED = [
   "Additional context sent to the running background task.",
   "The task is still working in the background. You will be notified automatically when it finishes.",
   "DO NOT sleep, poll for progress, ask the task for status, or duplicate this task's work — avoid working with the same files or topics it is using.",
-  "Work on non-overlapping tasks, or briefly tell the user what you sent and end your response.",
+  "Keep the main conversation moving with non-overlapping work. If there is nothing else to do, briefly tell the user what you sent and end your response.",
 ].join("\n")
 
 const BaseParameterFields = {
@@ -55,8 +56,6 @@ const BaseParameterFields = {
   }),
   command: Schema.optional(Schema.String).annotate({ description: "The command that triggered this task" }),
 }
-
-const BaseParameters = Schema.Struct(BaseParameterFields)
 
 export const Parameters = Schema.Struct({
   ...BaseParameterFields,
@@ -83,6 +82,20 @@ function renderOutput(input: {
   ].join("\n")
 }
 
+function childFailure(error: NonNullable<SessionV1.Assistant["error"]>, text: string) {
+  const detail = "message" in error.data && typeof error.data.message === "string" ? error.data.message : error.name
+  const advice = SessionV1.ContentFilterError.isInstance(error)
+    ? "The provider's safety classifier refused this turn. Resuming with the same instructions will be refused again — change the approach or report the blocker."
+    : undefined
+  return [
+    `The subagent stopped with ${error.name}: ${detail}`,
+    advice,
+    text && `Partial output before the failure:\n${text}`,
+  ]
+    .filter((part): part is string => !!part)
+    .join("\n\n")
+}
+
 export const TaskTool = Tool.define(
   id,
   Effect.gen(function* () {
@@ -100,11 +113,6 @@ export const TaskTool = Tool.define(
     ) {
       const cfg = yield* config.get()
       const runInBackground = params.background === true
-      if (runInBackground && !flags.experimentalBackgroundSubagents) {
-        return yield* Effect.fail(
-          new Error("Background subagents require OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true"),
-        )
-      }
 
       const parent = yield* sessions.get(ctx.sessionID)
       let current = parent
@@ -201,6 +209,7 @@ export const TaskTool = Tool.define(
 
       const ops = ctx.extra?.promptOps as TaskPromptOps
       if (!ops) return yield* Effect.fail(new Error("TaskTool requires promptOps in ctx.extra"))
+      const parentCheckpoint = yield* ops.checkpoint(ctx.sessionID)
 
       const runTask = Effect.fn("TaskTool.runTask")(function* () {
         const basicParts = yield* ops.resolvePromptParts(params.prompt)
@@ -229,18 +238,17 @@ export const TaskTool = Tool.define(
           agent: next.name,
           parts,
         })
+        const text = result.parts.findLast((item) => item.type === "text")?.text ?? ""
         if (result.info.role === "assistant" && result.info.error) {
-          const message =
-            "message" in result.info.error.data && typeof result.info.error.data.message === "string"
-              ? result.info.error.data.message
-              : result.info.error.name
-          return yield* Effect.fail(new Error(`Subagent failed (task_id: ${nextSession.id}): ${message}`))
+          return yield* Effect.fail(
+            new Error(`Subagent failed (task_id: ${nextSession.id}): ${childFailure(result.info.error, text)}`),
+          )
         }
         const failed = result.parts.findLast((item) => item.type === "tool" && item.state.status === "error")
         if (failed?.type === "tool" && failed.state.status === "error") {
           return yield* Effect.fail(new Error(`Subagent failed (task_id: ${nextSession.id}): ${failed.state.error}`))
         }
-        return result.parts.findLast((item) => item.type === "text")?.text ?? ""
+        return text
       })
 
       const inject = Effect.fn("TaskTool.injectBackgroundResult")(function* (
@@ -249,26 +257,29 @@ export const TaskTool = Tool.define(
       ) {
         const currentParent = yield* sessions.get(ctx.sessionID)
         yield* ops
-          .prompt({
-            sessionID: ctx.sessionID,
-            agent: currentParent.agent ?? ctx.agent,
-            variant,
-            parts: [
-              {
-                type: "text",
-                synthetic: true,
-                text: renderOutput({
-                  sessionID: nextSession.id,
-                  state,
-                  summary:
-                    state === "completed"
-                      ? `Background task completed: ${params.description}`
-                      : `Background task failed: ${params.description}`,
-                  text,
-                }),
-              },
-            ],
-          })
+          .notify(
+            {
+              sessionID: ctx.sessionID,
+              agent: currentParent.agent ?? ctx.agent,
+              variant,
+              parts: [
+                {
+                  type: "text",
+                  synthetic: true,
+                  text: renderOutput({
+                    sessionID: nextSession.id,
+                    state,
+                    summary:
+                      state === "completed"
+                        ? `Background task completed: ${params.description}`
+                        : `Background task failed: ${params.description}`,
+                    text,
+                  }),
+                },
+              ],
+            },
+            parentCheckpoint,
+          )
           .pipe(Effect.ignore, Effect.forkIn(scope, { startImmediately: true }))
       })
 
@@ -277,6 +288,11 @@ export const TaskTool = Tool.define(
           Effect.flatMap((result) => {
             if (result.info?.status === "completed") return inject("completed", result.info.output ?? "")
             if (result.info?.status === "error") return inject("error", result.info.error ?? "")
+            // Cancellation is still an outcome the caller has to react to.
+            // Staying silent leaves it waiting for a delivery that never comes.
+            // A cancel that targeted the caller too bumps its checkpoint, so
+            // `notify` drops this injection on admission.
+            if (result.info?.status === "cancelled") return inject("error", "Task cancelled")
             return Effect.void
           }),
           Effect.forkIn(scope, { startImmediately: true }),
@@ -378,11 +394,8 @@ export const TaskTool = Tool.define(
     })
 
     return {
-      description: flags.experimentalBackgroundSubagents
-        ? [DESCRIPTION, BACKGROUND_DESCRIPTION].join("\n\n")
-        : DESCRIPTION,
+      description: [DESCRIPTION, BACKGROUND_DESCRIPTION].join("\n\n"),
       parameters: Parameters,
-      jsonSchema: flags.experimentalBackgroundSubagents ? undefined : ToolJsonSchema.fromSchema(BaseParameters),
       execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context) =>
         run(params, ctx).pipe(Effect.orDie),
     }

@@ -21,7 +21,7 @@ import { Truncate } from "@/tool/truncate"
 import { ToolRegistry } from "@/tool/registry"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { disposeAllInstances } from "../fixture/fixture"
-import { testEffect } from "../lib/effect"
+import { pollWithTimeout, testEffect } from "../lib/effect"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 
@@ -56,7 +56,7 @@ const layer = (flags: Partial<RuntimeFlags.Info> = {}) =>
   )
 
 const it = testEffect(layer())
-const background = testEffect(layer({ experimentalBackgroundSubagents: true }))
+const background = testEffect(layer())
 
 function defer<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void
@@ -98,18 +98,21 @@ const seed = Effect.fn("TaskToolTest.seed")(function* (title = "Pinned") {
 
 function stubOps(opts?: {
   onPrompt?: (input: SessionPrompt.PromptInput) => void
+  onNotify?: (input: SessionPrompt.PromptInput) => void
   text?: string
   error?: NonNullable<SessionV1.Assistant["error"]>
   toolError?: string
 }): TaskPromptOps {
   return {
     cancel: () => Effect.void,
+    checkpoint: () => Effect.succeed(0),
     resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
     prompt: (input) =>
       Effect.sync(() => {
         opts?.onPrompt?.(input)
         return reply(input, opts?.text ?? "done", opts?.error, opts?.toolError)
       }),
+    notify: (input) => Effect.sync(() => opts?.onNotify?.(input)),
   }
 }
 
@@ -134,7 +137,7 @@ function reply(
       modelID: input.model?.modelID ?? ref.modelID,
       providerID: input.model?.providerID ?? ref.providerID,
       time: { created: Date.now() },
-      finish: "stop",
+      finish: error ? "content-filter" : "stop",
       error,
     },
     parts: [
@@ -323,7 +326,8 @@ describe("tool.task", () => {
       const failure = Cause.squash(exit.cause)
       expect(failure).toBeInstanceOf(Error)
       if (!(failure instanceof Error)) throw new Error("expected Error defect")
-      expect(failure.message).toBe(`Subagent failed (task_id: ${child?.id}): Network connection lost`)
+      expect(failure.message).toContain(`Subagent failed (task_id: ${child?.id})`)
+      expect(failure.message).toContain("Network connection lost")
     }),
   )
 
@@ -511,12 +515,14 @@ describe("tool.task", () => {
           Effect.sync(() => {
             cancelled.resolve(sessionID)
           }),
+        checkpoint: () => Effect.succeed(0),
         resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
         prompt: (input) =>
           Effect.promise(() => {
             ready.resolve(input)
             return cancelled.promise
           }).pipe(Effect.as(reply(input, "cancelled"))),
+        notify: () => Effect.void,
       }
 
       const fiber = yield* def
@@ -665,6 +671,90 @@ describe("tool.task", () => {
     { config: { subagent_depth: 2 } },
   )
 
+  it.instance("reports a classifier-rejected subagent turn as a failure", () =>
+    Effect.gen(function* () {
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+
+      const exit = yield* def
+        .execute(
+          {
+            description: "inspect bug",
+            prompt: "look into the cache key path",
+            subagent_type: "general",
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: {
+              promptOps: stubOps({
+                text: "",
+                error: new SessionV1.ContentFilterError({ message: "blocked by content filtering policy" }).toObject(),
+              }),
+            },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+        .pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      expect(String(exit)).toContain("ContentFilterError")
+      expect(String(exit)).toContain("safety classifier refused")
+    }),
+  )
+
+  background.instance("tells the parent when a background subagent is classifier-rejected", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const notified: SessionPrompt.PromptInput[] = []
+
+      const result = yield* def.execute(
+        {
+          description: "inspect bug",
+          prompt: "look into the cache key path",
+          subagent_type: "general",
+          background: true,
+        },
+        {
+          sessionID: chat.id,
+          messageID: assistant.id,
+          agent: "build",
+          abort: new AbortController().signal,
+          extra: {
+            promptOps: stubOps({
+              text: "partial thought",
+              error: new SessionV1.ContentFilterError({ message: "blocked by content filtering policy" }).toObject(),
+              onNotify: (input) => notified.push(input),
+            }),
+          },
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        },
+      )
+
+      const job = yield* jobs.wait({ id: result.metadata.sessionId, timeout: 5_000 })
+      expect(job.info?.status).toBe("error")
+      const injected = yield* pollWithTimeout(
+        Effect.sync(() => notified.at(0)),
+        "parent was never notified about the failed background task",
+      )
+      const text = injected.parts.flatMap((part) => (part.type === "text" ? [part.text] : [])).join("\n")
+      expect(text).toContain(`state="error"`)
+      expect(text).toContain("Background task failed")
+      expect(text).toContain("ContentFilterError")
+      expect(text).toContain("partial thought")
+    }),
+  )
+
   it.instance(
     "execute shapes child permissions for task, todowrite, and primary tools",
     () =>
@@ -733,37 +823,6 @@ describe("tool.task", () => {
     },
   )
 
-  it.instance("rejects background execution when the experiment is disabled", () =>
-    Effect.gen(function* () {
-      const { chat, assistant } = yield* seed()
-      const tool = yield* TaskTool
-      const def = yield* tool.init()
-
-      const exit = yield* def
-        .execute(
-          {
-            description: "inspect bug",
-            prompt: "look into the cache key path",
-            subagent_type: "general",
-            background: true,
-          },
-          {
-            sessionID: chat.id,
-            messageID: assistant.id,
-            agent: "build",
-            abort: new AbortController().signal,
-            extra: { promptOps: stubOps() },
-            messages: [],
-            metadata: () => Effect.void,
-            ask: () => Effect.void,
-          },
-        )
-        .pipe(Effect.exit)
-
-      expect(Exit.isFailure(exit)).toBe(true)
-    }),
-  )
-
   it.instance("promotes a running foreground task without restarting it", () =>
     Effect.gen(function* () {
       const jobs = yield* BackgroundJob.Service
@@ -772,22 +831,20 @@ describe("tool.task", () => {
       const def = yield* tool.init()
       const ready = yield* Deferred.make<void>()
       const done = yield* Deferred.make<void>()
-      const injected = yield* Deferred.make<SessionPrompt.PromptInput>()
+      const notified = yield* Deferred.make<{ input: SessionPrompt.PromptInput; checkpoint: number }>()
       let runs = 0
       const promptOps: TaskPromptOps = {
         cancel: () => Effect.void,
+        checkpoint: () => Effect.succeed(7),
         resolvePromptParts: (template) => Effect.succeed([{ type: "text" as const, text: template }]),
-        prompt: (input) => {
-          if (input.sessionID === chat.id) {
-            return Deferred.succeed(injected, input).pipe(Effect.as(reply(input, "injected")))
-          }
-          return Effect.gen(function* () {
+        prompt: (input) =>
+          Effect.gen(function* () {
             runs += 1
             yield* Deferred.succeed(ready, undefined)
             yield* Deferred.await(done)
             return reply(input, "background done")
-          })
-        },
+          }),
+        notify: (input, checkpoint) => Deferred.succeed(notified, { input, checkpoint }).pipe(Effect.asVoid),
       }
 
       const fiber = yield* def
@@ -825,7 +882,9 @@ describe("tool.task", () => {
 
       yield* Deferred.succeed(done, undefined)
       expect((yield* jobs.wait({ id: result.metadata.sessionId })).info?.output).toBe("background done")
-      expect((yield* Deferred.await(injected)).parts[0]?.type).toBe("text")
+      const notification = yield* Deferred.await(notified)
+      expect(notification.input.parts[0]?.type).toBe("text")
+      expect(notification.checkpoint).toBe(7)
       expect(runs).toBe(1)
     }),
   )
@@ -880,12 +939,8 @@ describe("tool.task", () => {
       const injected = defer<SessionPrompt.PromptInput>()
       let prompts = 0
       const promptOps: TaskPromptOps = {
-        ...stubOps(),
+        ...stubOps({ onNotify: (input) => injected.resolve(input) }),
         prompt: (input) => {
-          if (input.sessionID === chat.id) {
-            injected.resolve(input)
-            return Effect.succeed(reply(input, "done"))
-          }
           prompts++
           if (prompts === 1) return Effect.promise(() => first.promise).pipe(Effect.as(reply(input, "first done")))
           updated.resolve(input)
@@ -998,8 +1053,8 @@ describe("tool.task", () => {
           extra: {
             promptOps: {
               ...stubOps({ text: "background done" }),
-              prompt: (input) =>
-                input.sessionID === chat.id ? Effect.never : Effect.succeed(reply(input, "background done")),
+              prompt: (input) => Effect.succeed(reply(input, "background done")),
+              notify: () => Effect.never,
             } satisfies TaskPromptOps,
           },
           messages: [],

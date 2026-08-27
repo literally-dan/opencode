@@ -474,6 +474,247 @@ const boot = Effect.fn("test.boot")(function* (input?: { title?: string }) {
   return { prompt, run, sessions, chat }
 })
 
+noLLMServer.instance(
+  "idle run-state runners are recreated with the current interrupt handler",
+  () =>
+    Effect.gen(function* () {
+      const { prompt, run, chat } = yield* boot()
+      const message = (text: string) =>
+        prompt.prompt({
+          sessionID: chat.id,
+          agent: "build",
+          model: ref,
+          noReply: true,
+          parts: [{ type: "text", text }],
+        })
+      const first = yield* message("first")
+      const second = yield* message("second")
+
+      yield* run.ensureRunning(chat.id, Effect.succeed(first), Effect.succeed(first))
+      const ready = yield* Deferred.make<void>()
+      const fiber = yield* run
+        .ensureRunning(
+          chat.id,
+          Effect.succeed(second),
+          Deferred.succeed(ready, undefined).pipe(Effect.andThen(Effect.never)),
+        )
+        .pipe(Effect.forkChild)
+      yield* Deferred.await(ready)
+      yield* run.cancel(chat.id)
+
+      expect((yield* Fiber.join(fiber)).info.id).toBe(second.info.id)
+    }),
+  3_000,
+)
+
+noLLMServer.instance(
+  "a wake admitted during finalization is not removed by the idle callback",
+  () =>
+    Effect.gen(function* () {
+      const { prompt, run, chat } = yield* boot()
+      const message = (text: string) =>
+        prompt.prompt({
+          sessionID: chat.id,
+          agent: "build",
+          model: ref,
+          noReply: true,
+          parts: [{ type: "text", text }],
+        })
+      const first = yield* message("first")
+      const second = yield* message("second")
+      const third = yield* message("third")
+      const firstStarted = yield* Deferred.make<void>()
+      const finishFirst = yield* Deferred.make<void>()
+      const admissionHeld = yield* Deferred.make<void>()
+      const releaseAdmission = yield* Deferred.make<void>()
+      const secondStarted = yield* Deferred.make<void>()
+      const finishSecond = yield* Deferred.make<void>()
+      const thirdStarted = yield* Deferred.make<void>()
+
+      yield* Effect.gen(function* () {
+        const firstRun = yield* run
+          .ensureRunning(
+            chat.id,
+            Effect.succeed(first),
+            Deferred.succeed(firstStarted, undefined).pipe(
+              Effect.andThen(Deferred.await(finishFirst)),
+              Effect.as(first),
+            ),
+          )
+          .pipe(Effect.forkChild)
+        yield* Deferred.await(firstStarted)
+
+        const held = yield* run
+          .admit(
+            [{ sessionID: chat.id }],
+            Deferred.succeed(admissionHeld, undefined).pipe(Effect.andThen(Deferred.await(releaseAdmission))),
+          )
+          .pipe(Effect.forkChild)
+        yield* Deferred.await(admissionHeld)
+
+        const secondRun = yield* run
+          .ensureRunning(
+            chat.id,
+            Effect.succeed(second),
+            Deferred.succeed(secondStarted, undefined).pipe(
+              Effect.andThen(Deferred.await(finishSecond)),
+              Effect.as(second),
+            ),
+          )
+          .pipe(Effect.forkChild)
+        yield* Effect.yieldNow
+        yield* Deferred.succeed(finishFirst, undefined)
+        yield* Deferred.succeed(releaseAdmission, undefined)
+        yield* Fiber.join(held)
+        yield* Deferred.await(secondStarted).pipe(Effect.timeout("1 second"))
+
+        const thirdRun = yield* run
+          .ensureRunning(
+            chat.id,
+            Effect.succeed(third),
+            Deferred.succeed(thirdStarted, undefined).pipe(Effect.as(third)),
+          )
+          .pipe(Effect.forkChild)
+        yield* run.admit([{ sessionID: chat.id }], Effect.void)
+        yield* Effect.yieldNow
+        expect(yield* Deferred.isDone(thirdStarted)).toBe(false)
+
+        yield* Deferred.succeed(finishSecond, undefined)
+        expect((yield* Fiber.join(firstRun)).info.id).toBe(first.info.id)
+        expect((yield* Fiber.join(secondRun)).info.id).toBe(second.info.id)
+        expect((yield* Fiber.join(thirdRun)).info.id).toBe(third.info.id)
+      }).pipe(
+        Effect.ensuring(
+          Effect.all(
+            [
+              Deferred.succeed(finishFirst, undefined),
+              Deferred.succeed(releaseAdmission, undefined),
+              Deferred.succeed(finishSecond, undefined),
+            ],
+            { discard: true },
+          ).pipe(Effect.ignore),
+        ),
+      )
+    }),
+  30_000,
+)
+
+noLLMServer.instance("run-state checkpoints survive leases and never reuse a generation", () =>
+  Effect.gen(function* () {
+    const { run, chat } = yield* boot()
+    const first = yield* run.checkpoint(chat.id)
+    const leaseA = yield* run.retain(chat.id, first)
+    const leaseB = yield* run.retain(chat.id, first)
+    expect(Option.isSome(leaseA)).toBe(true)
+    expect(Option.isSome(leaseB)).toBe(true)
+    if (Option.isNone(leaseA) || Option.isNone(leaseB)) return
+
+    yield* leaseA.value
+    expect(yield* run.isCurrent(chat.id, first)).toBe(true)
+    yield* leaseB.value
+    expect(yield* run.isCurrent(chat.id, first)).toBe(false)
+    yield* leaseA.value
+
+    const second = yield* run.checkpoint(chat.id)
+    expect(second).not.toBe(first)
+  }),
+)
+
+noLLMServer.instance("session removal tombstones before cancellation and rejects later run-state admission", () =>
+  Effect.gen(function* () {
+    const { run, sessions, chat } = yield* boot()
+    const checkpoint = yield* run.checkpoint(chat.id)
+    const lease = yield* run.retain(chat.id, checkpoint)
+    const started = yield* Deferred.make<void>()
+    const cancelling = yield* Deferred.make<void>()
+    const releaseCancellation = yield* Deferred.make<void>()
+    expect(Option.isSome(lease)).toBe(true)
+
+    yield* Effect.gen(function* () {
+      const active = yield* run
+        .ensureRunning(
+          chat.id,
+          Effect.die("interrupt fallback admitted"),
+          Deferred.succeed(started, undefined).pipe(
+            Effect.andThen(Effect.never),
+            Effect.ensuring(
+              Deferred.succeed(cancelling, undefined).pipe(Effect.andThen(Deferred.await(releaseCancellation))),
+            ),
+          ),
+        )
+        .pipe(Effect.forkChild)
+      yield* Deferred.await(started)
+      const removal = yield* sessions.remove(chat.id).pipe(Effect.forkChild)
+      yield* Deferred.await(cancelling)
+
+      expect(yield* run.isCurrent(chat.id, checkpoint)).toBe(false)
+      if (Option.isSome(lease)) yield* lease.value
+
+      const admitted = { value: false }
+      expect(
+        Option.isNone(
+          yield* run.admit(
+            [{ sessionID: chat.id }],
+            Effect.sync(() => {
+              admitted.value = true
+            }),
+          ),
+        ),
+      ).toBe(true)
+      expect(admitted.value).toBe(false)
+
+      const checkpointExit = yield* run.checkpoint(chat.id).pipe(Effect.exit)
+      expect(Exit.isFailure(checkpointExit)).toBe(true)
+      if (Exit.isFailure(checkpointExit))
+        expect(Cause.squash(checkpointExit.cause)).toBeInstanceOf(Session.RemovingError)
+
+      const runExit = yield* run
+        .ensureRunning(chat.id, Effect.die("interrupt fallback admitted"), Effect.die("work admitted"))
+        .pipe(Effect.exit)
+      expect(Exit.isFailure(runExit)).toBe(true)
+      if (Exit.isFailure(runExit)) expect(Cause.squash(runExit.cause)).toBeInstanceOf(Session.RemovingError)
+
+      yield* Deferred.succeed(releaseCancellation, undefined)
+      yield* Fiber.join(removal)
+      yield* Fiber.await(active)
+    }).pipe(Effect.ensuring(Deferred.succeed(releaseCancellation, undefined).pipe(Effect.ignore)))
+  }),
+)
+
+noLLMServer.instance(
+  "new subtask parts persist the background default and explicit foreground opt-out",
+  () =>
+    Effect.gen(function* () {
+      const { prompt, chat } = yield* boot()
+      const create = (background?: boolean) =>
+        prompt.prompt({
+          sessionID: chat.id,
+          agent: "build",
+          model: ref,
+          noReply: true,
+          parts: [
+            {
+              type: "subtask",
+              prompt: "inspect the cache",
+              description: "inspect cache",
+              agent: "general",
+              model: ref,
+              ...(background === undefined ? {} : { background }),
+            },
+          ],
+        })
+
+      const implicit = yield* create()
+      const foreground = yield* create(false)
+      const implicitPart = (yield* MessageV2.parts(implicit.info.id)).find((part) => part.type === "subtask")
+      const foregroundPart = (yield* MessageV2.parts(foreground.info.id)).find((part) => part.type === "subtask")
+
+      expect(implicitPart?.type === "subtask" ? implicitPart.background : undefined).toBe(true)
+      expect(foregroundPart?.type === "subtask" ? foregroundPart.background : undefined).toBe(false)
+    }),
+  { config: cfg },
+)
+
 // Loop semantics
 
 noLLMServer.instance(
@@ -2331,6 +2572,97 @@ unix(
       }),
     ),
   30_000,
+)
+
+it.instance(
+  "notification admitted during a running turn is processed exactly once",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const { prompt, chat } = yield* boot()
+      const release = defer<void>()
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "initial" }],
+      })
+      yield* llm.hold("first", release.promise)
+      yield* llm.text("notification")
+
+      const running = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+      yield* llm.wait(1)
+      const notification = yield* prompt
+        .notify(
+          {
+            sessionID: chat.id,
+            agent: "build",
+            parts: [{ type: "text", text: "background done", synthetic: true }],
+          },
+          yield* prompt.checkpoint(chat.id),
+        )
+        .pipe(Effect.forkChild)
+      yield* pollWithTimeout(
+        MessageV2.filterCompactedEffect(chat.id).pipe(
+          Effect.map((messages) =>
+            messages.some((message) =>
+              message.parts.some((part) => part.type === "text" && part.text === "background done"),
+            )
+              ? true
+              : undefined,
+          ),
+        ),
+        "background notification was not admitted",
+      )
+
+      release.resolve()
+      yield* Fiber.join(running)
+      yield* Fiber.join(notification)
+
+      expect(yield* llm.calls).toBe(2)
+      const messages = yield* MessageV2.filterCompactedEffect(chat.id)
+      const user = messages.findLast((message) =>
+        message.parts.some((part) => part.type === "text" && part.text === "background done"),
+      )
+      const assistant = messages.findLast((message) => message.info.role === "assistant")
+      expect(assistant?.info.role === "assistant" ? assistant.info.parentID : undefined).toBe(user?.info.id)
+    }),
+  { config: cfg },
+  10_000,
+)
+
+it.instance(
+  "notification released after cancellation is not admitted",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const { prompt, chat } = yield* boot()
+      const checkpoint = yield* prompt.checkpoint(chat.id)
+      const release = yield* Deferred.make<void>()
+      yield* llm.text("unexpected")
+      const notification = yield* Deferred.await(release).pipe(
+        Effect.andThen(
+          prompt.notify(
+            {
+              sessionID: chat.id,
+              agent: "build",
+              parts: [{ type: "text", text: "background done", synthetic: true }],
+            },
+            checkpoint,
+          ),
+        ),
+        Effect.forkChild,
+      )
+
+      yield* prompt.cancel(chat.id)
+      yield* Deferred.succeed(release, undefined)
+      yield* Fiber.join(notification)
+
+      expect(yield* llm.calls).toBe(0)
+      expect(yield* MessageV2.filterCompactedEffect(chat.id)).toEqual([])
+    }),
+  { config: cfg },
+  10_000,
 )
 
 unixNoLLMServer(
