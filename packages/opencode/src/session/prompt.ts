@@ -9,6 +9,10 @@ import { SessionRevert } from "./revert"
 import { Session } from "./session"
 import { Agent } from "../agent/agent"
 import { Provider } from "@/provider/provider"
+import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
+import { estimateRequest, REQUEST_REMINDER_HEADROOM, usable } from "./overflow"
+import { charsCharger, compactionOf, eligibility, indexParts } from "./compaction-pruning"
+import { Superseded } from "./superseded"
 
 import { type Tool as AITool, tool, jsonSchema } from "ai"
 import type { JSONSchema7 } from "@ai-sdk/provider"
@@ -97,6 +101,173 @@ function isOrphanedInterruptedTool(part: SessionV1.ToolPart) {
   // cleanup() marks abandoned tool_use blocks this way after retries/aborts.
   // They are not pending work and must not trigger an assistant-prefill request.
   return part.state.status === "error" && part.state.metadata?.interrupted === true
+}
+
+// Two-stage context-pressure nudge. Native overflow compaction (whole-history
+// summarization) takes over at 100% of the usable budget and discards detail
+// wholesale, so we want the model to run a cheaper, surgical `compact_results`
+// pass with runway to spare before that cutover. A single large step can grow
+// context by well over 15%, so nudging only in the final stretch risks the
+// native pass preempting the model entirely. Start a gentle reminder at SOFT
+// (the loop dedupes it, so an ignored nudge stays cheap) and escalate to a
+// first-action imperative past HARD — where the model empirically starts acting
+// — while both stay below the 100% native cutover.
+const CONTEXT_PRESSURE_SOFT = 0.65
+const CONTEXT_PRESSURE_HARD = 0.85
+// Once nudging starts, aim below the trigger rather than at it. Without a gap
+// the model reclaims just enough to fall under SOFT, the next tool result puts
+// it straight back over, and the nudge fires every turn for the rest of the
+// session.
+const CONTEXT_PRESSURE_TARGET = 0.45
+const COMPACTION_MIN_RECLAIM_CHARS = 8_000
+// Manifest floor: only the heaviest parts are worth naming individually. Smaller
+// parts are swept in aggregate via the `select` fallback, so this is the single
+// source of truth for "big enough to list by id".
+const COMPACTION_MANIFEST_MIN_CHARS = 2_000
+
+// Context-pressure nudge: once usage crosses CONTEXT_PRESSURE_SOFT of the usable
+// window, remind the model to reclaim space with `compact_results`, listing the
+// heaviest compactable parts by id (or, when nothing clears the manifest floor,
+// pointing at a `select` sweep). Returns the pressure ratio alongside the text
+// so the caller can dedupe re-emission. Suppressed when compaction is disabled.
+// What the request about to be sent actually costs, rather than what the last
+// one cost. Provider usage arrives a round trip late, so steering off it means
+// a compaction is invisible until after the next response — the model gets
+// nudged again for pressure it already relieved, and growth from the tool
+// results in this very step is not counted at all.
+//
+// The char heuristic is calibrated against the last observed provider count for
+// a request we also estimated, which folds in tokenizer and per-message
+// overhead the heuristic cannot see.
+function liveContextTokens(input: {
+  system: string[]
+  messages: unknown[]
+  tools?: Record<string, AITool>
+  observed?: { estimated: number; actual: number }
+}) {
+  // Serialising the whole message array is the expensive part, so the raw
+  // estimate is returned alongside the calibrated one: the caller needs it to
+  // calibrate the next step and must not pay for a second pass to get it.
+  const estimated = estimateRequest(input)
+  const observed = input.observed
+  if (!observed || observed.estimated <= 0 || observed.actual <= 0) return { estimated, used: estimated }
+  // Clamped: a wild ratio means the previous request was not comparable (a
+  // native compaction landed between them, say), and scaling by it would be
+  // worse than not calibrating at all.
+  const ratio = Math.min(4, Math.max(0.25, observed.actual / observed.estimated))
+  return { estimated, used: Math.round(estimated * ratio) }
+}
+
+function contextPressureReminder(input: {
+  cfg: ConfigV1.Info
+  model: Provider.Model
+  used: number
+  messages: SessionV1.WithParts[]
+  currentMessageID: string
+  // Steps spent above the soft threshold without the model reclaiming anything.
+  ignored: number
+}) {
+  if (input.cfg.compaction?.auto === false) return undefined
+  const budget = usable({ cfg: input.cfg, model: input.model })
+  if (budget <= 0) return undefined
+  const pct = input.used / budget
+  if (pct < CONTEXT_PRESSURE_SOFT) return undefined
+  // The model only sees a part's `prt_…` id once it has been compacted, so a
+  // bare nudge isn't actionable on live context. List the heaviest still-live
+  // compactable parts with their ids so the model has something to pass.
+  const candidates = compactionManifest(input.messages, input.currentMessageID)
+  const urgent = pct >= CONTEXT_PRESSURE_HARD
+  // Nothing fresh worth reclaiming. Normally that means going quiet rather than
+  // nagging about content that would cost more to re-fold than it frees — but
+  // when pressure is critical and the context is now mostly notes, folding
+  // those notes into a span is the last move left before native compaction
+  // discards the lot wholesale.
+  if (candidates.chars < COMPACTION_MIN_RECLAIM_CHARS) {
+    if (!urgent || candidates.folded.chars < COMPACTION_MIN_RECLAIM_CHARS) return undefined
+    return {
+      pct,
+      text: [
+        "<system-reminder>",
+        `Context is ~${Math.round(pct * 100)}% of its usable budget and automatic whole-history compaction is imminent. Everything readily compactable has already been compacted once: ${candidates.folded.parts.toLocaleString()} parts now hold roughly ${candidates.folded.chars.toLocaleString()} characters of notes. Fold them together by calling \`compact_results\` again over a contiguous stretch of them with one coarser summary — call \`list_context\` for their \`prt_…\` ids. A second pass replaces the whole stretch with a single range marker, and the originals stay recoverable via \`read_part\`. Prefer the oldest, most settled stretch; keep recent work at full detail.`,
+        "</system-reminder>",
+      ].join("\n"),
+    }
+  }
+  const manifest = candidates.entries
+  // Ask for the whole gap down to the target, not just enough to clear the
+  // threshold, so one compaction buys many turns instead of one.
+  const deficit = Math.max(0, Math.round(input.used - budget * CONTEXT_PRESSURE_TARGET))
+  const goal = `Aim to reclaim roughly ${deficit.toLocaleString()} tokens (down to about ${Math.round(CONTEXT_PRESSURE_TARGET * 100)}%), not just enough to clear the threshold.`
+  // Escalate only when the model has been told and has not acted. A model busy
+  // with the user's request gets a reminder; one that has ignored several gets
+  // told to stop and do it first.
+  const lead = urgent
+    ? `Context is ~${Math.round(pct * 100)}% of its usable budget — very high, and automatic whole-history compaction (which discards detail wholesale) is imminent. As your FIRST action this turn,`
+    : input.ignored >= 2
+      ? `Context is ~${Math.round(pct * 100)}% of its usable budget and you have passed on ${input.ignored} previous reminders. Before doing anything else,`
+      : `Context is ~${Math.round(pct * 100)}% of its usable budget and climbing. Before it gets critical,`
+  // Empty manifest = context is dominated by many parts each below the floor.
+  // Still worth nudging: a `select` sweep reclaims them in aggregate, so fall
+  // back to a manifest-less instruction rather than going silent at high usage.
+  const body = manifest.length
+    ? [
+        `${lead} reclaim space by calling the \`compact_results\` tool with the \`prt_…\` ids below that you no longer need verbatim (their content is dropped but stays recoverable via \`read_part\`; you can call it again as more work settles). ${goal} Then continue with and complete the user's current request as normal — this reminder is housekeeping, not a replacement for the task.`,
+        "",
+        "Compactable parts in your context (compact the ones you're done with):",
+        ...manifest,
+      ]
+    : [
+        `${lead} reclaim space by calling the \`compact_results\` tool. Your context is spread across many smaller parts, so pass a \`select\` filter (for example \`{ "types": ["tool"], "keep_last": 3 }\`) or call \`list_context\` first to get their \`prt_…\` ids. Content is dropped but stays recoverable via \`read_part\`. ${goal} Then continue with and complete the user's current request as normal — this reminder is housekeeping, not a replacement for the task.`,
+      ]
+  return { pct, text: ["<system-reminder>", ...body, "</system-reminder>"].join("\n") }
+}
+
+// Reuses the tool's `eligibility` so the manifest can never advertise a part
+// the tool would refuse. Lists the largest compactable parts (>= the manifest
+// floor), largest-first, capped so the reminder stays small.
+function compactionManifest(messages: SessionV1.WithParts[], currentMessageID: string) {
+  const MAX_ENTRIES = 8
+  const candidates: { id: string; label: string; chars: number }[] = []
+  let chars = 0
+  // Already-folded notes, tracked separately so the nudge can offer a second
+  // pass once there is nothing fresh left but pressure is still critical.
+  const folded = { parts: 0, chars: 0 }
+  const charge = charsCharger()
+  const { located } = indexParts(messages, currentMessageID)
+  for (const { part, context } of located.values()) {
+    const e = eligibility(part, context)
+    if (!e.ok) continue
+    // Content that has already been folded once counts for neither the manifest
+    // nor the reclaim total. Re-compacting summaries erodes detail for very
+    // little space, so it stays a deliberate last resort instead of something
+    // the nudge keeps recommending once nothing fresh is left.
+    if (e.generation > 0) {
+      folded.parts++
+      folded.chars += charge(part, e.chars, context.role)
+      continue
+    }
+    chars += charge(part, e.chars, context.role)
+    if (e.chars < COMPACTION_MANIFEST_MIN_CHARS) continue
+    const label = (
+      e.kind === "tool"
+        ? (e.tool ?? "tool")
+        : e.kind === "text"
+          ? context.role === "user"
+            ? "user message"
+            : "assistant note"
+          : e.kind
+    )
+      .slice(0, 48)
+      .replace(/\s+/g, " ")
+    candidates.push({ id: part.id, label, chars: e.chars })
+    candidates.sort((a, b) => b.chars - a.chars)
+    if (candidates.length > MAX_ENTRIES) candidates.pop()
+  }
+  return {
+    chars,
+    folded,
+    entries: candidates.map((entry) => `- ${entry.id} (${entry.label}, ~${entry.chars.toLocaleString()} chars)`),
+  }
 }
 
 export interface Interface {
@@ -1083,6 +1254,18 @@ const layer = Layer.effect(
         const ctx = yield* InstanceState.context
         let structured: unknown
         let step = 0
+        // Tracks the step/pressure of the last emitted context-pressure nudge so
+        // it is not re-sent on every step while usage stays high (see below).
+        let pressureNudge:
+          | { step: number; checkedStep: number; pct: number; compactions: number; ignored: number }
+          | undefined
+        // Ratio between the last request's estimated and actual input tokens,
+        // used to correct the char heuristic for tokenizer and per-message
+        // overhead it cannot see.
+        let contextCalibration: { estimated: number; actual: number } | undefined
+        let lastEstimate: number | undefined
+        let lastRequestOverhead = REQUEST_REMINDER_HEADROOM
+        let autoCompactionAttempts = 0
         const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
 
         while (true) {
@@ -1094,6 +1277,13 @@ const layer = Layer.effect(
           )
 
           const { user: lastUser, assistant: lastAssistant, finished: lastFinished, tasks } = MessageV2.latest(msgs)
+          // Calibrate the char heuristic against what the provider actually
+          // charged for the request we estimated last step. Cache reads and
+          // writes count: they are input the model still had to be sent.
+          if (lastEstimate !== undefined && lastFinished) {
+            const actual = lastFinished.tokens.input + lastFinished.tokens.cache.read + lastFinished.tokens.cache.write
+            if (actual > 0) contextCalibration = { estimated: lastEstimate, actual }
+          }
 
           if (!lastUser) throw new Error("No user message found in stream. This should never happen.")
 
@@ -1147,24 +1337,63 @@ const layer = Layer.effect(
           }
 
           if (task?.type === "compaction") {
+            const owner = msgs.find((message) => message.info.id === task.messageID)
+            if (!owner || owner.info.role !== "user") {
+              throw new Error(`Compaction owner must be a user message: ${task.messageID}`)
+            }
+            autoCompactionAttempts++
             const result = yield* compaction.process({
               messages: msgs,
-              parentID: lastUser.id,
+              parentID: owner.info.id,
               sessionID,
               auto: task.auto,
               overflow: task.overflow,
+              attempt: autoCompactionAttempts,
+              requestOverhead: lastRequestOverhead,
             })
             if (result === "stop") break
             continue
           }
 
-          if (
-            lastFinished &&
-            lastFinished.summary !== true &&
-            (yield* compaction.isOverflow({ tokens: lastFinished.tokens, model }))
-          ) {
-            yield* compaction.create({ sessionID, agent: lastUser.agent, model: lastUser.model, auto: true })
-            continue
+          const recorded = yield* compaction.checkOverflow({
+            tokens: lastFinished?.tokens ?? {
+              input: 0,
+              output: 0,
+              reasoning: 0,
+              cache: { read: 0, write: 0 },
+            },
+            model,
+          })
+          if (recorded.status === "impossible") {
+            const error = new SessionV1.ContextOverflowError({ message: recorded.budget.message }).toObject()
+            const failed = yield* sessions.updateMessage({
+              id: MessageID.ascending(),
+              parentID: lastUser.id,
+              role: "assistant",
+              mode: lastUser.agent,
+              agent: lastUser.agent,
+              variant: lastUser.model.variant,
+              path: { cwd: ctx.directory, root: ctx.worktree },
+              cost: 0,
+              tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+              modelID: model.id,
+              providerID: model.providerID,
+              time: { created: Date.now(), completed: Date.now() },
+              sessionID,
+              finish: "error",
+              error,
+            })
+            yield* events.publish(Session.Event.Error, { sessionID, error: failed.error! })
+            break
+          }
+          if (lastFinished && lastFinished.summary !== true && recorded.overflow) {
+            const manuallyCompacted = msgs.some((message) =>
+              message.parts.some((part) => compactionOf(part)?.native === false),
+            )
+            if (!manuallyCompacted) {
+              yield* compaction.create({ sessionID, agent: lastUser.agent, model: lastUser.model, auto: true })
+              continue
+            }
           }
 
           const agent = yield* agents.get(lastUser.agent)
@@ -1269,6 +1498,84 @@ const layer = Layer.effect(
             ]
             const format = lastUser.format ?? { type: "text" as const }
             if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
+            // The reminder text is volatile (percentage + manifest ids change
+            // as usage climbs) so it must NOT go in the cached `system` prefix —
+            // that would bust the whole prompt cache on the most expensive
+            // (high-context) turns. Deliver it as an ephemeral trailing user
+            // message instead, keeping system + history cacheable.
+            // Suppress on the last step: MAX_STEPS disables tools and demands a
+            // text-only reply, and compaction only takes effect next turn — so a
+            // "call compact_results now" nudge would be both contradictory and
+            // useless there.
+            // Measure the request we are about to send, not the one we sent last
+            // time. Anything the model reclaimed this turn is already reflected,
+            // and so is everything this turn's tool results just added.
+            const suppressed =
+              isLastStep ||
+              flags.disableContextCompaction ||
+              Permission.evaluate("compact_results", "*", agent.permission, session.permission ?? []).action === "deny"
+            // Measuring serialises the whole history, so only pay for it when the
+            // answer can actually be used. Leaving `lastEstimate` unset also keeps
+            // the next step from calibrating a fresh usage figure against a stale
+            // estimate from several steps ago.
+            const live = suppressed
+              ? undefined
+              : liveContextTokens({ system, messages: modelMsgs, tools, observed: contextCalibration })
+            const folds = live
+              ? msgs.reduce(
+                  (total, message) =>
+                    total + message.parts.reduce((sum, part) => sum + (compactionOf(part)?.generation ?? 0), 0),
+                  0,
+                )
+              : 0
+            if (pressureNudge && step > pressureNudge.checkedStep) {
+              pressureNudge = {
+                ...pressureNudge,
+                checkedStep: step,
+                ignored: folds === pressureNudge.compactions ? pressureNudge.ignored + 1 : 0,
+                compactions: folds,
+              }
+            }
+            const pressure = live
+              ? contextPressureReminder({
+                  cfg: yield* config.get(),
+                  model,
+                  used: live.used + REQUEST_REMINDER_HEADROOM,
+                  messages: msgs,
+                  currentMessageID: msg.id,
+                  ignored: pressureNudge?.ignored ?? 0,
+                })
+              : undefined
+            // Re-emit only when pressure has climbed meaningfully or a few steps
+            // have passed, so an ignored nudge is not repeated on every step
+            // while usage stays high.
+            const pressureText =
+              pressure && (!pressureNudge || pressure.pct - pressureNudge.pct >= 0.03 || step - pressureNudge.step >= 3)
+                ? pressure.text
+                : undefined
+            if (pressure && pressureText) {
+              pressureNudge = {
+                step,
+                checkedStep: step,
+                pct: pressure.pct,
+                compactions: folds,
+                ignored: pressureNudge?.ignored ?? 0,
+              }
+            }
+            const requestMessages = [
+              ...modelMsgs,
+              ...(isLastStep ? [{ role: "assistant" as const, content: MAX_STEPS_PROMPT }] : []),
+              ...(pressureText ? [{ role: "user" as const, content: pressureText }] : []),
+            ]
+            lastEstimate = suppressed
+              ? undefined
+              : liveContextTokens({ system, messages: requestMessages, tools, observed: contextCalibration }).estimated
+            lastRequestOverhead = estimateRequest({
+              system,
+              messages: [],
+              tools,
+              reminderHeadroom: REQUEST_REMINDER_HEADROOM,
+            })
             const result = yield* handle.process({
               user: lastUser,
               agent,
@@ -1276,10 +1583,7 @@ const layer = Layer.effect(
               sessionID,
               parentSessionID: session.parentID,
               system,
-              messages: [
-                ...modelMsgs,
-                ...(isLastStep ? [{ role: "assistant" as const, content: MAX_STEPS_PROMPT }] : []),
-              ],
+              messages: requestMessages,
               tools,
               model,
               toolChoice: format.type === "json_schema" ? "required" : undefined,
@@ -1293,6 +1597,7 @@ const layer = Layer.effect(
             }
 
             const finished = handle.message.finish && !["tool-calls", "unknown"].includes(handle.message.finish)
+            if (result !== "compact") autoCompactionAttempts = 0
             if (finished && !handle.message.error) {
               // Surface any content-filter finish (e.g. Anthropic stop_reason:
               // refusal) as an error. These turns may have produced no visible
@@ -1335,6 +1640,12 @@ const layer = Layer.effect(
           continue
         }
 
+        // Stale file snapshots are collapsed unconditionally rather than only
+        // under pressure: a read the model has since invalidated is wrong, not
+        // merely expensive, and leaving it in context invites edits against
+        // content that no longer matches disk.
+        if (!flags.disableContextCompaction && (yield* config.get()).compaction?.auto !== false)
+          yield* Superseded.collapse({ sessionID, sessions, directory: ctx.directory }).pipe(Effect.ignore)
         yield* compaction.prune({ sessionID }).pipe(Effect.ignore, Effect.forkIn(scope))
         return yield* lastAssistant(sessionID)
       },

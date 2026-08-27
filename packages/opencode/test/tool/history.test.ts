@@ -2581,6 +2581,27 @@ describe("tool.list_context", () => {
     messages,
   })
 
+  it.instance("omits classifier-rejected parts from the context inventory", () =>
+    Effect.gen(function* () {
+      const { chat, assistantID, bashPart } = yield* seed()
+      const session = yield* Session.Service
+      const messages = yield* session.messages({ sessionID: chat.id })
+      const assistant = messages.find((message) => message.info.id === assistantID)
+      if (!assistant || assistant.info.role !== "assistant") throw new Error("seed shape changed")
+      yield* session.updateMessage({
+        ...assistant.info,
+        error: new SessionV1.ContentFilterError({ message: "blocked by classifier" }).toObject(),
+      })
+      const visible = MessageV2.filterCompacted(yield* session.messages({ sessionID: chat.id }))
+      const list = yield* (yield* ListContextTool).init()
+
+      const inventory = yield* list.execute({}, withMessages(chat.id, visible))
+
+      expect(inventory.output).not.toContain(bashPart.id)
+      expect(inventory.output).not.toContain("prod.local")
+    }),
+  )
+
   it.instance("charges a shared summary once rather than once per part", () =>
     Effect.gen(function* () {
       const { chat, bashPart, readPart } = yield* seed()

@@ -72,7 +72,7 @@ const tmpWithFiles = (files: Record<string, string>) =>
     return dir
   })
 
-function loaded(filepath: string): SessionV1.WithParts[] {
+function loaded(filepath: string, compaction?: Record<string, unknown>): SessionV1.WithParts[] {
   const sessionID = SessionID.make("session-loaded-1")
   const messageID = MessageID.make("msg_message-loaded-1")
 
@@ -104,6 +104,7 @@ function loaded(filepath: string): SessionV1.WithParts[] {
             title: "Read",
             metadata: { loaded: [filepath] },
             time: { start: 0, end: 1 },
+            ...compaction,
           },
         },
       ],
@@ -279,6 +280,34 @@ describe("Instruction.resolve", () => {
 
         const results = yield* svc.resolve(loaded(agents), filepath, id)
         expect(results).toEqual([])
+      }),
+    ),
+  )
+
+  it.live("re-delivers instructions whose carrying read has been compacted", () =>
+    withFiles({ "subdir/AGENTS.md": "# Subdir Instructions", "subdir/nested/file.ts": "const x = 1" }, (dir) =>
+      Effect.gen(function* () {
+        const svc = yield* Instruction.Service
+        const agents = path.join(dir, "subdir", "AGENTS.md")
+        const filepath = path.join(dir, "subdir", "nested", "file.ts")
+
+        // A compacted read no longer renders its payload, so it can no longer
+        // count as having delivered anything. Both native pruning and model
+        // compaction have to retract the claim, and they record it differently.
+        // A distinct message id per case: resolve records what it has already
+        // attached for a message, so reusing one would return [] the second time
+        // whatever the compaction state.
+        for (const [index, compaction] of [
+          { time: { start: 0, end: 1, compacted: 5 } },
+          { compactionGroup: "g1", compactionSummary: "folded", compactionGeneration: 1 },
+        ].entries()) {
+          const results = yield* svc.resolve(
+            loaded(agents, compaction),
+            filepath,
+            MessageID.make(`msg_message-claim-4${index}`),
+          )
+          expect(results.map((result) => result.filepath)).toEqual([agents])
+        }
       }),
     ),
   )

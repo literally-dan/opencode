@@ -12,7 +12,7 @@ import { Snapshot } from "@/snapshot"
 import { Session } from "./session"
 import { LLM } from "./llm"
 import { MessageV2 } from "./message-v2"
-import { isOverflow } from "./overflow"
+import { check as checkOverflow, estimateRequest, REQUEST_REMINDER_HEADROOM } from "./overflow"
 import { PartID } from "./schema"
 import type { SessionID } from "./schema"
 import { SessionRetry } from "./retry"
@@ -25,6 +25,7 @@ import { isRecord } from "@/util/record"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Database } from "@opencode-ai/core/database/database"
 import { Usage, type LLMEvent } from "@opencode-ai/llm"
+import { compactionOf } from "./compaction-pruning"
 
 const DOOM_LOOP_THRESHOLD = 3
 export type Result = "compact" | "stop" | "continue"
@@ -81,6 +82,7 @@ interface ProcessorContext extends Input {
   // first, otherwise the truncated output from the failed attempt stays in the
   // transcript alongside its replacement.
   attemptParts: SessionV1.Part["id"][]
+  request: LLM.StreamInput | undefined
 }
 
 type StreamEvent = LLMEvent
@@ -122,6 +124,7 @@ const layer = Layer.effect(
         reasoningMap: {},
         executed: false,
         attemptParts: [],
+        request: undefined,
       }
       let aborted = false
 
@@ -489,11 +492,53 @@ const layer = Layer.effect(
                 messageID: ctx.assistantMessage.parentID,
               })
               .pipe(Effect.ignore, Effect.forkIn(scope))
-            if (
-              !ctx.assistantMessage.summary &&
-              isOverflow({ cfg: yield* config.get(), tokens: usage.tokens, model: ctx.model })
-            ) {
-              ctx.needsCompaction = true
+            if (!ctx.assistantMessage.summary) {
+              const cfg = yield* config.get()
+              const overflow = checkOverflow({ cfg, tokens: usage.tokens, model: ctx.model })
+              if (overflow.status === "impossible") {
+                ctx.assistantMessage.error = new SessionV1.ContextOverflowError({
+                  message: overflow.budget.message,
+                }).toObject()
+                ctx.assistantMessage.finish = "error"
+                yield* session.updateMessage(ctx.assistantMessage)
+                yield* events.publish(Session.Event.Error, {
+                  sessionID: ctx.sessionID,
+                  error: ctx.assistantMessage.error,
+                })
+                return
+              }
+              if (overflow.overflow) {
+                const messages = MessageV2.filterCompacted(yield* session.messages({ sessionID: ctx.sessionID }))
+                const manuallyCompacted = messages.some((message) =>
+                  message.parts.some((part) => compactionOf(part)?.native === false),
+                )
+                const current = manuallyCompacted
+                  ? yield* MessageV2.toModelMessagesEffect(messages, ctx.model).pipe(
+                      Effect.map((messages) =>
+                        estimateRequest({
+                          system: ctx.request?.system ?? [],
+                          messages,
+                          tools: ctx.request?.tools,
+                          reminderHeadroom: REQUEST_REMINDER_HEADROOM,
+                        }),
+                      ),
+                      Effect.map((tokens) =>
+                        checkOverflow({
+                          cfg,
+                          tokens: {
+                            total: tokens,
+                            input: tokens,
+                            output: 0,
+                            reasoning: 0,
+                            cache: { read: 0, write: 0 },
+                          },
+                          model: ctx.model,
+                        }),
+                      ),
+                    )
+                  : overflow
+                if (current.overflow) ctx.needsCompaction = true
+              }
             }
             return
           }
@@ -646,6 +691,7 @@ const layer = Layer.effect(
           messageID: input.assistantMessage.id,
         })
         ctx.needsCompaction = false
+        ctx.request = streamInput
         ctx.shouldBreak = (yield* config.get()).experimental?.continue_loop_on_deny !== true
 
         return yield* Effect.gen(function* () {

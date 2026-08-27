@@ -9,6 +9,8 @@ import * as Stream from "effect/Stream"
 import { Config } from "@/config/config"
 import { LLM } from "../../src/session/llm"
 import { SessionCompaction } from "../../src/session/compaction"
+import { compactionLockReferences, withCompactionLock } from "../../src/session/compaction-pruning"
+import { estimateRequest, REQUEST_REMINDER_HEADROOM } from "../../src/session/overflow"
 import { Token } from "@/util/token"
 import { Plugin } from "../../src/plugin"
 import { provideTmpdirInstance, TestInstance } from "../fixture/fixture"
@@ -24,7 +26,7 @@ import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { Provider } from "@/provider/provider"
 import * as SessionProcessorModule from "../../src/session/processor"
 import { ProviderTest } from "../fake/provider"
-import { testEffect } from "../lib/effect"
+import { pollWithTimeout, testEffect } from "../lib/effect"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { TestConfig } from "../fixture/config"
 import { RuntimeFlags } from "@/effect/runtime-flags"
@@ -233,7 +235,7 @@ const compactionTestNode = LayerNode.group([
 ])
 const env = AppNodeBuilder.build(compactionTestNode, [
   [Provider.node, defaultProvider.layer],
-  [SessionProcessorModule.SessionProcessor.node, processorLayer("continue")],
+  [LLM.node, summaryLLMLayer()],
   [RuntimeFlags.node, RuntimeFlags.layer({ experimentalEventSystem: true })],
 ])
 
@@ -262,17 +264,17 @@ function compactionProcessLayer(options?: CompactionProcessOptions) {
     [RuntimeFlags.node, RuntimeFlags.layer({ experimentalEventSystem: true })],
     [SessionSummary.node, summary],
   ]
-  if (!options?.llm) {
+  if (options?.result) {
     return AppNodeBuilder.build(compactionTestNode, [
       ...replacements,
-      [SessionProcessorModule.SessionProcessor.node, processorLayer(options?.result ?? "continue")],
+      [SessionProcessorModule.SessionProcessor.node, processorLayer(options.result)],
       ...(options?.plugin ? ([[Plugin.node, options.plugin]] as const) : []),
       ...(options?.config ? ([[Config.node, options.config]] as const) : []),
     ])
   }
   return AppNodeBuilder.build(compactionTestNode, [
     ...replacements,
-    [LLM.node, options.llm],
+    [LLM.node, options?.llm ?? summaryLLMLayer()],
     ...(options?.plugin ? ([[Plugin.node, options.plugin]] as const) : []),
     ...(options?.config ? ([[Config.node, options.config]] as const) : []),
   ])
@@ -335,6 +337,15 @@ function reply(
       }),
     )
   }
+}
+
+function summaryLLMLayer() {
+  return Layer.succeed(
+    LLM.Service,
+    LLM.Service.of({
+      stream: reply("summary"),
+    }),
+  )
 }
 
 function plugin(ready: Deferred.Deferred<void>) {
@@ -561,6 +572,88 @@ describe("session.compaction.isOverflow", () => {
       },
     ),
   )
+
+  it.live(
+    "returns an explicit impossible status when reserved tokens consume the input limit",
+    provideTmpdirInstance(
+      () =>
+        Effect.gen(function* () {
+          const compact = yield* SessionCompaction.Service
+          const model = createModel({ context: 400_000, input: 200_000, output: 32_000 })
+          const tokens = { input: 10, output: 0, reasoning: 0, cache: { read: 0, write: 0 } }
+
+          const status = yield* compact.checkOverflow({ tokens, model })
+
+          expect(status.status).toBe("impossible")
+          expect(status.overflow).toBe(false)
+          if (status.status === "impossible") expect(status.budget.message).toContain("leaves no usable input space")
+          expect(yield* compact.isOverflow({ tokens, model })).toBe(false)
+        }),
+      { config: { compaction: { reserved: 200_000 } } },
+    ),
+  )
+
+  it.live(
+    "returns disabled before validating an impossible budget when auto compaction is off",
+    provideTmpdirInstance(
+      () =>
+        Effect.gen(function* () {
+          const compact = yield* SessionCompaction.Service
+          const model = createModel({ context: 400_000, input: 200_000, output: 32_000 })
+          const tokens = { input: 300_000, output: 0, reasoning: 0, cache: { read: 0, write: 0 } }
+
+          const status = yield* compact.checkOverflow({ tokens, model })
+
+          expect(status.status).toBe("disabled")
+          expect(status.overflow).toBe(false)
+        }),
+      { config: { compaction: { auto: false, reserved: 200_000 } } },
+    ),
+  )
+
+  it.live(
+    "uses the larger valid cache-inclusive count when provider totals conflict",
+    provideTmpdirInstance(() =>
+      Effect.gen(function* () {
+        const compact = yield* SessionCompaction.Service
+        const model = createModel({ context: 100_000, output: 20_000 })
+        const tokens = {
+          total: 1,
+          input: 50_000,
+          output: 5_000,
+          reasoning: 0,
+          cache: { read: 30_000, write: 0 },
+        }
+
+        const status = yield* compact.checkOverflow({ tokens, model })
+
+        expect(status.count).toBe(85_000)
+        expect(status.overflow).toBe(true)
+      }),
+    ),
+  )
+
+  it.live(
+    "includes reasoning when the provider total is missing or malformed",
+    provideTmpdirInstance(() =>
+      Effect.gen(function* () {
+        const compact = yield* SessionCompaction.Service
+        const model = createModel({ context: 100_000, output: 20_000 })
+        const tokens = {
+          total: Number.NaN,
+          input: -20,
+          output: 5_000,
+          reasoning: 10_000,
+          cache: { read: 80_000, write: Number.NaN },
+        }
+
+        const status = yield* compact.checkOverflow({ tokens, model })
+
+        expect(status.count).toBe(95_000)
+        expect(status.overflow).toBe(true)
+      }),
+    ),
+  )
 })
 
 describe("session.compaction.create", () => {
@@ -625,7 +718,87 @@ describe("session.compaction.create", () => {
 
 describe("session.compaction.prune", () => {
   it.live(
-    "compacts old completed tool output",
+    "reloads after overlapping manual compaction before pruning",
+    provideTmpdirInstance(
+      (dir) =>
+        Effect.gen(function* () {
+          const compact = yield* SessionCompaction.Service
+          const ssn = yield* SessionNs.Service
+          const info = yield* ssn.create({})
+          const user = yield* createUserMessage(info.id, "first")
+          const assistant = yield* createAssistantMessage(info.id, user.id, dir)
+          const part = yield* ssn.updatePart({
+            id: PartID.ascending(),
+            messageID: assistant.id,
+            sessionID: info.id,
+            type: "tool",
+            callID: "overlapping-manual-compaction",
+            tool: "bash",
+            state: {
+              status: "completed",
+              input: {},
+              output: "x".repeat(200_000),
+              title: "old output",
+              metadata: {},
+              time: { start: 1, end: 2 },
+            },
+          })
+          yield* createUserMessage(info.id, "second")
+          yield* createUserMessage(info.id, "third")
+          const entered = yield* Deferred.make<void>()
+          const apply = yield* Deferred.make<void>()
+          const persisted = yield* Deferred.make<void>()
+          const release = yield* Deferred.make<void>()
+          const manual = yield* withCompactionLock(
+            info.id,
+            undefined,
+            Effect.gen(function* () {
+              yield* Deferred.succeed(entered, undefined)
+              yield* Deferred.await(apply)
+              const latest = yield* ssn.findPart({ sessionID: info.id, partID: part.id })
+              if (latest?.type !== "tool" || latest.state.status !== "completed") throw new Error("tool part missing")
+              latest.state.compactionGroup = "manual-group"
+              latest.state.compactionSummary = "manual summary"
+              latest.state.compactionGeneration = 1
+              yield* ssn.updatePart(latest)
+              yield* Deferred.succeed(persisted, undefined)
+              yield* Deferred.await(release)
+            }),
+          ).pipe(Effect.forkScoped)
+          yield* Deferred.await(entered)
+          const pruning = yield* compact.prune({ sessionID: info.id }).pipe(Effect.forkScoped)
+          yield* pollWithTimeout(
+            Effect.sync(() => (compactionLockReferences(info.id) === 2 ? true : undefined)),
+            "native pruning did not enter the shared compaction lock",
+          )
+          expect(pruning.pollUnsafe()).toBeUndefined()
+
+          yield* Deferred.succeed(apply, undefined)
+          yield* Deferred.await(persisted)
+          yield* Deferred.succeed(release, undefined)
+          yield* Fiber.join(manual)
+          yield* Fiber.join(pruning)
+
+          const stored = yield* ssn.findPart({ sessionID: info.id, partID: part.id })
+          expect(stored).toMatchObject({
+            type: "tool",
+            state: {
+              status: "completed",
+              compactionGroup: "manual-group",
+              compactionSummary: "manual summary",
+              compactionGeneration: 1,
+            },
+          })
+          expect(
+            stored?.type === "tool" && stored.state.status === "completed" && stored.state.time.compacted,
+          ).toBeUndefined()
+        }),
+      { config: { compaction: { prune: true } } },
+    ),
+  )
+
+  it.live(
+    "skips manual output without consuming the native protection budget",
     provideTmpdirInstance(
       (dir) =>
         Effect.gen(function* () {
@@ -668,7 +841,7 @@ describe("session.compaction.prune", () => {
             finish: "end_turn",
           }
           yield* ssn.updateMessage(b)
-          yield* ssn.updatePart({
+          const old = yield* ssn.updatePart({
             id: PartID.ascending(),
             messageID: b.id,
             sessionID: info.id,
@@ -682,6 +855,57 @@ describe("session.compaction.prune", () => {
               title: "done",
               metadata: {},
               time: { start: Date.now(), end: Date.now() },
+            },
+          })
+          const protectedPart = yield* ssn.updatePart({
+            id: PartID.ascending(),
+            messageID: b.id,
+            sessionID: info.id,
+            type: "tool",
+            callID: crypto.randomUUID(),
+            tool: "bash",
+            state: {
+              status: "completed",
+              input: {},
+              output: "p".repeat(150_000),
+              title: "native protection budget",
+              metadata: {},
+              time: { start: Date.now(), end: Date.now() },
+            },
+          })
+          const legacy = yield* ssn.updatePart({
+            id: PartID.ascending(),
+            messageID: b.id,
+            sessionID: info.id,
+            type: "tool",
+            callID: crypto.randomUUID(),
+            tool: "read",
+            state: {
+              status: "completed",
+              input: {},
+              output: "l".repeat(200_000),
+              title: "legacy manual compaction",
+              metadata: {},
+              time: { start: Date.now(), end: Date.now(), compacted: Date.now() },
+              compactionSummary: "legacy settled output",
+            },
+          })
+          const manual = yield* ssn.updatePart({
+            id: PartID.ascending(),
+            messageID: b.id,
+            sessionID: info.id,
+            type: "tool",
+            callID: crypto.randomUUID(),
+            tool: "read",
+            state: {
+              status: "completed",
+              input: {},
+              output: "y".repeat(200_000),
+              title: "manually compacted",
+              metadata: {},
+              time: { start: Date.now(), end: Date.now() },
+              compactionGroup: crypto.randomUUID(),
+              compactionSummary: "settled read output",
             },
           })
           for (const text of ["second", "third"]) {
@@ -705,12 +929,39 @@ describe("session.compaction.prune", () => {
           yield* compact.prune({ sessionID: info.id })
 
           const msgs = yield* ssn.messages({ sessionID: info.id })
-          const part = msgs.flatMap((msg) => msg.parts).find((part) => part.type === "tool")
-          expect(part?.type).toBe("tool")
-          expect(part?.state.status).toBe("completed")
-          if (part?.type === "tool" && part.state.status === "completed") {
-            expect(part.state.time.compacted).toBeNumber()
-          }
+          const parts = msgs.flatMap((msg) => msg.parts)
+          const oldAfter = parts.find((part) => part.id === old.id)
+          const protectedAfter = parts.find((part) => part.id === protectedPart.id)
+          const legacyAfter = parts.find((part) => part.id === legacy.id)
+          const manualAfter = parts.find((part) => part.id === manual.id)
+          expect(oldAfter).toMatchObject({ type: "tool", state: { status: "completed" } })
+          if (oldAfter?.type !== "tool" || oldAfter.state.status !== "completed") return
+          expect(oldAfter.state.time.compacted).toBeNumber()
+          expect(
+            protectedAfter?.type === "tool" &&
+              protectedAfter.state.status === "completed" &&
+              protectedAfter.state.time.compacted,
+          ).toBeUndefined()
+          expect(
+            legacyAfter?.type === "tool" &&
+              legacyAfter.state.status === "completed" &&
+              legacyAfter.state.time.compacted,
+          ).toBeNumber()
+          expect(
+            legacyAfter?.type === "tool" &&
+              legacyAfter.state.status === "completed" &&
+              legacyAfter.state.compactionSummary,
+          ).toBe("legacy settled output")
+          expect(
+            manualAfter?.type === "tool" &&
+              manualAfter.state.status === "completed" &&
+              manualAfter.state.time.compacted,
+          ).toBeUndefined()
+          expect(
+            manualAfter?.type === "tool" &&
+              manualAfter.state.status === "completed" &&
+              manualAfter.state.compactionGroup,
+          ).toBe(manual.type === "tool" && manual.state.status === "completed" && manual.state.compactionGroup)
         }),
 
       {
@@ -718,6 +969,125 @@ describe("session.compaction.prune", () => {
           compaction: { prune: true },
         },
       },
+    ),
+  )
+
+  it.live(
+    "does not count retained tool input as native pruning savings",
+    provideTmpdirInstance(
+      (dir) =>
+        Effect.gen(function* () {
+          const ssn = yield* SessionNs.Service
+          const compact = yield* SessionCompaction.Service
+          const info = yield* ssn.create({})
+          const user = yield* createUserMessage(info.id, "first")
+          const assistant = yield* createAssistantMessage(info.id, user.id, dir)
+          const old = yield* ssn.updatePart({
+            id: PartID.ascending(),
+            messageID: assistant.id,
+            sessionID: info.id,
+            type: "tool",
+            callID: "old-output",
+            tool: "bash",
+            state: {
+              status: "completed",
+              input: {},
+              output: "o".repeat(120_000),
+              title: "old",
+              metadata: {},
+              time: { start: 1, end: 2 },
+            },
+          })
+          const large = yield* ssn.updatePart({
+            id: PartID.ascending(),
+            messageID: assistant.id,
+            sessionID: info.id,
+            type: "tool",
+            callID: "large-input",
+            tool: "edit",
+            state: {
+              status: "completed",
+              input: { patch: "i".repeat(180_000) },
+              output: "done",
+              title: "large input",
+              metadata: {},
+              time: { start: 3, end: 4 },
+            },
+          })
+          yield* createUserMessage(info.id, "second")
+          yield* createUserMessage(info.id, "third")
+
+          yield* compact.prune({ sessionID: info.id })
+
+          const parts = (yield* ssn.messages({ sessionID: info.id })).flatMap((message) => message.parts)
+          const stored = parts.find((part) => part.id === old.id)
+          const largeStored = parts.find((part) => part.id === large.id)
+          expect(
+            stored?.type === "tool" && stored.state.status === "completed" && stored.state.time.compacted,
+          ).toBeUndefined()
+          expect(
+            largeStored?.type === "tool" &&
+              largeStored.state.status === "completed" &&
+              largeStored.state.time.compacted,
+          ).toBeUndefined()
+        }),
+      { config: { compaction: { prune: true } } },
+    ),
+  )
+
+  it.live(
+    "does not prune external tool attachments that are absent from the provider projection",
+    provideTmpdirInstance(
+      (dir) =>
+        Effect.gen(function* () {
+          const ssn = yield* SessionNs.Service
+          const compact = yield* SessionCompaction.Service
+          const info = yield* ssn.create({})
+          const user = yield* createUserMessage(info.id, "first")
+          const assistant = yield* createAssistantMessage(info.id, user.id, dir)
+          const tool = yield* ssn.updatePart({
+            id: PartID.ascending(),
+            messageID: assistant.id,
+            sessionID: info.id,
+            type: "tool",
+            callID: "external-attachment",
+            tool: "read",
+            state: {
+              status: "completed",
+              input: { filePath: "huge.txt" },
+              output: "x",
+              title: "huge.txt",
+              metadata: {},
+              time: { start: 1, end: 2 },
+              attachments: [
+                {
+                  id: PartID.ascending(),
+                  messageID: assistant.id,
+                  sessionID: info.id,
+                  type: "file",
+                  mime: "application/octet-stream",
+                  filename: "huge.txt",
+                  url: `file:///${"a".repeat(200_000)}`,
+                },
+              ],
+            },
+          })
+          yield* createUserMessage(info.id, "second")
+          yield* createUserMessage(info.id, "third")
+          const beforeMessages = yield* ssn.messages({ sessionID: info.id })
+          const before = JSON.stringify(yield* MessageV2.toModelMessagesEffect(beforeMessages, defaultProvider.model))
+
+          yield* compact.prune({ sessionID: info.id })
+
+          const afterMessages = yield* ssn.messages({ sessionID: info.id })
+          const after = JSON.stringify(yield* MessageV2.toModelMessagesEffect(afterMessages, defaultProvider.model))
+          const stored = afterMessages.flatMap((message) => message.parts).find((part) => part.id === tool.id)
+          expect(after).toBe(before)
+          expect(
+            stored?.type === "tool" && stored.state.status === "completed" && stored.state.time.compacted,
+          ).toBeUndefined()
+        }),
+      { config: { compaction: { prune: true } } },
     ),
   )
 
@@ -848,8 +1218,10 @@ describe("session.compaction.process", () => {
       const events = yield* EventV2Bridge.Service
       const ssn = yield* SessionNs.Service
       const session = yield* ssn.create({})
-      const msg = yield* createUserMessage(session.id, "hello")
+      yield* createUserMessage(session.id, "h".repeat(10_000))
+      yield* createCompactionMarker(session.id)
       const msgs = yield* ssn.messages({ sessionID: session.id })
+      const parent = msgs.at(-1)!.info.id
       const done = yield* Deferred.make<void, Error>()
       const seen: string[] = []
       const unsub = yield* events.listen((evt) => {
@@ -863,7 +1235,7 @@ describe("session.compaction.process", () => {
       yield* Effect.addFinalizer(() => unsub)
 
       const result = yield* SessionCompaction.use.process({
-        parentID: msg.id,
+        parentID: parent,
         messages: msgs,
         sessionID: session.id,
         auto: false,
@@ -904,16 +1276,270 @@ describe("session.compaction.process", () => {
     }).pipe(withCompaction({ result: "compact" })),
   )
 
+  itCompaction.instance(
+    "rejects an empty summary without activating the compaction boundary",
+    () => {
+      const stub = llm()
+      stub.push(
+        Stream.make(
+          LLMEvent.stepFinish({ index: 0, reason: "stop", usage: basicUsage() }),
+          LLMEvent.finish({ reason: "stop", usage: basicUsage() }),
+        ),
+      )
+      return Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const session = yield* ssn.create({})
+        const original = yield* createUserMessage(session.id, "keep original history")
+        yield* createCompactionMarker(session.id)
+        const msgs = yield* ssn.messages({ sessionID: session.id })
+        const parent = msgs.at(-1)!.info.id
+
+        const result = yield* SessionCompaction.use.process({
+          parentID: parent,
+          messages: msgs,
+          sessionID: session.id,
+          auto: false,
+        })
+
+        const all = yield* ssn.messages({ sessionID: session.id })
+        const summary = all.find((message) => message.info.role === "assistant" && message.info.summary)
+        const filtered = MessageV2.filterCompacted(all)
+        expect(result).toBe("stop")
+        expect(summary?.info.role === "assistant" ? summary.info.error?.name : undefined).toBe("ContextOverflowError")
+        expect(filtered.map((message) => message.info.id)).toContain(original.id)
+      }).pipe(withCompaction({ llm: stub.llmLayer }))
+    },
+    { git: true },
+  )
+
+  itCompaction.instance(
+    "fails before generation when the summary request exceeds the compaction model",
+    () => {
+      const stub = llm()
+      let called = 0
+      stub.push((input) => {
+        called++
+        return reply("summary")(input)
+      })
+      const provider = ProviderTest.fake({ model: createModel({ context: 4_000, output: 1_000 }) })
+      return Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const session = yield* ssn.create({})
+        const user = yield* createUserMessage(session.id, "x".repeat(40_000))
+        const msgs = yield* ssn.messages({ sessionID: session.id })
+
+        const result = yield* SessionCompaction.use.process({
+          parentID: user.id,
+          messages: msgs,
+          sessionID: session.id,
+          auto: false,
+        })
+
+        const summary = (yield* ssn.messages({ sessionID: session.id })).find(
+          (message) => message.info.role === "assistant" && message.info.summary,
+        )
+        expect(result).toBe("stop")
+        expect(called).toBe(0)
+        expect(summary?.info.role === "assistant" ? JSON.stringify(summary.info.error) : "").toContain(
+          "too large to summarize safely",
+        )
+      }).pipe(withCompaction({ llm: stub.llmLayer, provider }))
+    },
+    { git: true },
+  )
+
+  itCompaction.instance(
+    "fails explicitly when preserve_recent_tokens consumes the usable budget",
+    () => {
+      const stub = llm()
+      let called = 0
+      stub.push((input) => {
+        called++
+        return reply("summary")(input)
+      })
+      return Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const session = yield* ssn.create({})
+        const user = yield* createUserMessage(session.id, "hello")
+        const msgs = yield* ssn.messages({ sessionID: session.id })
+
+        const result = yield* SessionCompaction.use.process({
+          parentID: user.id,
+          messages: msgs,
+          sessionID: session.id,
+          auto: true,
+        })
+
+        const summary = (yield* ssn.messages({ sessionID: session.id })).find(
+          (message) => message.info.role === "assistant" && message.info.summary,
+        )
+        expect(result).toBe("stop")
+        expect(called).toBe(0)
+        expect(summary?.info.role === "assistant" ? JSON.stringify(summary.info.error) : "").toContain("preserve")
+      }).pipe(withCompaction({ llm: stub.llmLayer, config: cfg({ preserve_recent_tokens: 68_000 }) }))
+    },
+    { git: true },
+  )
+
+  itCompaction.instance(
+    "includes system and tool schema overhead in post-compaction safety",
+    () => {
+      const stub = llm()
+      let called = 0
+      stub.push((input) => {
+        called++
+        return reply("summary")(input)
+      })
+      const requestOverhead = estimateRequest({
+        system: ["system instructions".repeat(1_000)],
+        messages: [],
+        tools: {
+          large_mcp_tool: {
+            description: "large MCP tool",
+            inputSchema: { type: "object", description: "s".repeat(300_000) },
+          },
+        },
+        reminderHeadroom: REQUEST_REMINDER_HEADROOM,
+      })
+      return Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const session = yield* ssn.create({})
+        const user = yield* createUserMessage(session.id, "hello")
+        const msgs = yield* ssn.messages({ sessionID: session.id })
+
+        const result = yield* SessionCompaction.use.process({
+          parentID: user.id,
+          messages: msgs,
+          sessionID: session.id,
+          auto: true,
+          requestOverhead,
+        })
+
+        const summary = (yield* ssn.messages({ sessionID: session.id })).find(
+          (message) => message.info.role === "assistant" && message.info.summary,
+        )
+        expect(result).toBe("stop")
+        expect(called).toBe(0)
+        expect(requestOverhead).toBeGreaterThan(68_000)
+        expect(summary?.info.role === "assistant" ? JSON.stringify(summary.info.error) : "").toContain(
+          "system instructions, tools, and reminder headroom",
+        )
+      }).pipe(withCompaction({ llm: stub.llmLayer }))
+    },
+    { git: true },
+  )
+
+  itCompaction.instance(
+    "stops when an oversized automatic summary does not reduce the projected context",
+    () => {
+      const stub = llm()
+      stub.push(reply("s".repeat(100_000)))
+      return Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const test = yield* TestInstance
+        const session = yield* ssn.create({})
+        yield* createUserMessage(session.id, "h".repeat(100_000))
+        const recent = yield* createUserMessage(session.id, "keep recent")
+        const assistant = yield* createAssistantMessage(session.id, recent.id, test.directory)
+        yield* ssn.updatePart({
+          id: PartID.ascending(),
+          messageID: assistant.id,
+          sessionID: session.id,
+          type: "tool",
+          callID: "large-tail",
+          tool: "read",
+          state: {
+            status: "completed",
+            input: { filePath: "large.txt" },
+            output: "t".repeat(220_000),
+            title: "large.txt",
+            metadata: {},
+            time: { start: 1, end: 2 },
+          },
+        })
+        yield* createCompactionMarker(session.id)
+        const msgs = yield* ssn.messages({ sessionID: session.id })
+        const marker = msgs.at(-1)!.info.id
+
+        const result = yield* SessionCompaction.use.process({
+          parentID: marker,
+          messages: msgs,
+          sessionID: session.id,
+          auto: true,
+        })
+
+        const all = yield* ssn.messages({ sessionID: session.id })
+        const generated = all.find((message) => message.info.role === "assistant" && message.info.summary)
+        expect(result).toBe("stop")
+        expect(generated?.info.role === "assistant" ? JSON.stringify(generated.info.error) : "").toMatch(
+          /did not reduce|still leaves/,
+        )
+        expect(all.filter((message) => message.info.role === "user")).toHaveLength(3)
+      }).pipe(
+        withCompaction({
+          llm: stub.llmLayer,
+          config: cfg({ tail_turns: 1, preserve_recent_tokens: 65_000 }),
+        }),
+      )
+    },
+    { git: true },
+  )
+
+  itCompaction.instance(
+    "rejects a growing manual summary without activating its compaction boundary",
+    () => {
+      const stub = llm()
+      stub.push(reply("s".repeat(10_000)))
+      return Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const session = yield* ssn.create({})
+        const original = yield* createUserMessage(session.id, "tiny")
+        yield* createCompactionMarker(session.id)
+        const msgs = yield* ssn.messages({ sessionID: session.id })
+
+        const result = yield* SessionCompaction.use.process({
+          parentID: msgs.at(-1)!.info.id,
+          messages: msgs,
+          sessionID: session.id,
+          auto: false,
+        })
+
+        const all = yield* ssn.messages({ sessionID: session.id })
+        const generated = all.find((message) => message.info.role === "assistant" && message.info.summary)
+        const boundary = all
+          .flatMap((message) => message.parts)
+          .find((part): part is SessionV1.CompactionPart => part.type === "compaction")
+        expect(result).toBe("stop")
+        expect(generated?.info.role === "assistant" ? generated.info.error?.name : undefined).toBe(
+          "ContextOverflowError",
+        )
+        expect(generated?.info.role === "assistant" ? JSON.stringify(generated.info.error) : "").toContain(
+          "did not reduce",
+        )
+        expect(boundary?.tail_start_id).toBeUndefined()
+        expect(MessageV2.filterCompacted(all.toReversed()).map((message) => message.info.id)).toContain(original.id)
+        expect(
+          all.some(
+            (message) =>
+              message.info.role === "assistant" && message.info.summary && message.info.finish && !message.info.error,
+          ),
+        ).toBe(false)
+      }).pipe(withCompaction({ llm: stub.llmLayer }))
+    },
+    { git: true },
+  )
+
   it.instance(
     "adds synthetic continue prompt when auto is enabled",
     Effect.gen(function* () {
       const ssn = yield* SessionNs.Service
       const session = yield* ssn.create({})
-      const msg = yield* createUserMessage(session.id, "hello")
+      yield* createUserMessage(session.id, "h".repeat(10_000))
+      yield* createCompactionMarker(session.id)
       const msgs = yield* ssn.messages({ sessionID: session.id })
 
       const result = yield* SessionCompaction.use.process({
-        parentID: msg.id,
+        parentID: msgs.at(-1)!.info.id,
         messages: msgs,
         sessionID: session.id,
         auto: true,
@@ -940,7 +1566,7 @@ describe("session.compaction.process", () => {
     Effect.gen(function* () {
       const ssn = yield* SessionNs.Service
       const session = yield* ssn.create({})
-      yield* createUserMessage(session.id, "first")
+      yield* createUserMessage(session.id, "f".repeat(10_000))
       const keep = yield* createUserMessage(session.id, "second")
       yield* createUserMessage(session.id, "third")
       yield* createSummaryCompaction(session.id)
@@ -966,7 +1592,7 @@ describe("session.compaction.process", () => {
     Effect.gen(function* () {
       const ssn = yield* SessionNs.Service
       const session = yield* ssn.create({})
-      yield* createUserMessage(session.id, "first")
+      yield* createUserMessage(session.id, "f".repeat(10_000))
       yield* createUserMessage(session.id, "x".repeat(2_000))
       const keep = yield* createUserMessage(session.id, "tiny")
       yield* createSummaryCompaction(session.id)
@@ -1061,7 +1687,7 @@ describe("session.compaction.process", () => {
         const test = yield* TestInstance
         const ssn = yield* SessionNs.Service
         const session = yield* ssn.create({})
-        yield* createUserMessage(session.id, "older")
+        yield* createUserMessage(session.id, "o".repeat(10_000))
         const recent = yield* createUserMessage(session.id, "recent turn")
         const large = yield* createAssistantMessage(session.id, recent.id, test.directory)
         yield* ssn.updatePart({
@@ -1107,11 +1733,12 @@ describe("session.compaction.process", () => {
     Effect.gen(function* () {
       const ssn = yield* SessionNs.Service
       const session = yield* ssn.create({})
-      const msg = yield* createUserMessage(session.id, "hello")
+      yield* createUserMessage(session.id, "h".repeat(10_000))
+      yield* createCompactionMarker(session.id)
       const msgs = yield* ssn.messages({ sessionID: session.id })
 
       const result = yield* SessionCompaction.use.process({
-        parentID: msg.id,
+        parentID: msgs.at(-1)!.info.id,
         messages: msgs,
         sessionID: session.id,
         auto: true,
@@ -1134,42 +1761,61 @@ describe("session.compaction.process", () => {
     }).pipe(withCompaction({ plugin: autocontinue(false) })),
   )
 
-  it.instance(
+  itCompaction.instance(
     "replays the prior user turn on overflow when earlier context exists",
-    Effect.gen(function* () {
-      const ssn = yield* SessionNs.Service
-      const session = yield* ssn.create({})
-      yield* createUserMessage(session.id, "root")
-      const replay = yield* createUserMessage(session.id, "image")
-      yield* ssn.updatePart({
-        id: PartID.ascending(),
-        messageID: replay.id,
-        sessionID: session.id,
-        type: "file",
-        mime: "image/png",
-        filename: "cat.png",
-        url: "https://example.com/cat.png",
-      })
-      const msg = yield* createUserMessage(session.id, "current")
-      const msgs = yield* ssn.messages({ sessionID: session.id })
+    () => {
+      const stub = llm()
+      let request = ""
+      stub.push(
+        reply("summary", (input) => {
+          request = JSON.stringify(input.messages)
+        }),
+      )
+      return Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const session = yield* ssn.create({})
+        const root = yield* createUserMessage(session.id, "root")
+        const assistant = yield* createAssistantMessage(session.id, root.id, (yield* TestInstance).directory)
+        yield* ssn.updatePart({
+          id: PartID.ascending(),
+          messageID: assistant.id,
+          sessionID: session.id,
+          type: "text",
+          text: `FINAL_PRE_REPLAY_ASSISTANT_MESSAGE${"x".repeat(10_000)}`,
+        })
+        const replay = yield* createUserMessage(session.id, "image")
+        yield* ssn.updatePart({
+          id: PartID.ascending(),
+          messageID: replay.id,
+          sessionID: session.id,
+          type: "file",
+          mime: "image/png",
+          filename: "cat.png",
+          url: "https://example.com/cat.png",
+        })
+        yield* createCompactionMarker(session.id)
+        const msgs = yield* ssn.messages({ sessionID: session.id })
 
-      const result = yield* SessionCompaction.use.process({
-        parentID: msg.id,
-        messages: msgs,
-        sessionID: session.id,
-        auto: true,
-        overflow: true,
-      })
+        const result = yield* SessionCompaction.use.process({
+          parentID: msgs.at(-1)!.info.id,
+          messages: msgs,
+          sessionID: session.id,
+          auto: true,
+          overflow: true,
+        })
 
-      const last = (yield* ssn.messages({ sessionID: session.id })).at(-1)
+        const last = (yield* ssn.messages({ sessionID: session.id })).at(-1)
 
-      expect(result).toBe("continue")
-      expect(last?.info.role).toBe("user")
-      expect(last?.parts.some((part) => part.type === "file")).toBe(false)
-      expect(
-        last?.parts.some((part) => part.type === "text" && part.text.includes("Attached image/png: cat.png")),
-      ).toBe(true)
-    }),
+        expect(result).toBe("continue")
+        expect(last?.info.role).toBe("user")
+        expect(last?.parts.some((part) => part.type === "file")).toBe(false)
+        expect(
+          last?.parts.some((part) => part.type === "text" && part.text.includes("Attached image/png: cat.png")),
+        ).toBe(true)
+        expect(request).toContain("FINAL_PRE_REPLAY_ASSISTANT_MESSAGE")
+      }).pipe(withCompaction({ llm: stub.llmLayer }))
+    },
+    { git: true },
   )
 
   it.instance(
@@ -1177,12 +1823,12 @@ describe("session.compaction.process", () => {
     Effect.gen(function* () {
       const ssn = yield* SessionNs.Service
       const session = yield* ssn.create({})
-      yield* createUserMessage(session.id, "earlier")
-      const msg = yield* createUserMessage(session.id, "current")
+      yield* createUserMessage(session.id, `current${"x".repeat(10_000)}`)
+      yield* createCompactionMarker(session.id)
       const msgs = yield* ssn.messages({ sessionID: session.id })
 
       const result = yield* SessionCompaction.use.process({
-        parentID: msg.id,
+        parentID: msgs.at(-1)!.info.id,
         messages: msgs,
         sessionID: session.id,
         auto: true,
@@ -1297,6 +1943,46 @@ describe("session.compaction.process", () => {
   )
 
   itCompaction.instance(
+    "finalizes the summary assistant when interrupted after persistence",
+    () => {
+      const stub = llm()
+      let ready: Deferred.Deferred<void> | undefined
+      stub.push(() => {
+        Deferred.doneUnsafe(ready!, Effect.void)
+        return Stream.never
+      })
+      return Effect.gen(function* () {
+        ready = yield* Deferred.make<void>()
+        const ssn = yield* SessionNs.Service
+        const session = yield* ssn.create({})
+        const msg = yield* createUserMessage(session.id, "hello")
+        const msgs = yield* ssn.messages({ sessionID: session.id })
+        const fiber = yield* SessionCompaction.use
+          .process({
+            parentID: msg.id,
+            messages: msgs,
+            sessionID: session.id,
+            auto: false,
+          })
+          .pipe(Effect.forkChild)
+
+        yield* Deferred.await(ready).pipe(Effect.timeout("1 second"))
+        yield* Fiber.interrupt(fiber)
+
+        const summary = (yield* ssn.messages({ sessionID: session.id })).find(
+          (message) => message.info.role === "assistant" && message.info.summary,
+        )
+        expect(summary?.info.role).toBe("assistant")
+        if (summary?.info.role !== "assistant") return
+        expect(summary.info.finish).toBe("error")
+        expect(summary.info.error?.name).toBe("MessageAbortedError")
+        expect(summary.info.time.completed).toBeNumber()
+      }).pipe(withCompaction({ llm: stub.llmLayer }))
+    },
+    { git: true },
+  )
+
+  itCompaction.instance(
     "silently drops reasoning-delta arriving without prior reasoning-start",
     () => {
       // Regression: PR initially auto-created a reasoning Part for orphan deltas (no preceding
@@ -1385,7 +2071,7 @@ describe("session.compaction.process", () => {
       return Effect.gen(function* () {
         const ssn = yield* SessionNs.Service
         const session = yield* ssn.create({})
-        yield* createUserMessage(session.id, "older context")
+        yield* createUserMessage(session.id, `older context${"x".repeat(10_000)}`)
         yield* createUserMessage(session.id, "keep this turn")
         yield* createUserMessage(session.id, "and this one too")
         yield* createCompactionMarker(session.id)
@@ -1437,7 +2123,7 @@ describe("session.compaction.process", () => {
       return Effect.gen(function* () {
         const ssn = yield* SessionNs.Service
         const session = yield* ssn.create({})
-        yield* createUserMessage(session.id, "older context")
+        yield* createUserMessage(session.id, `older context${"x".repeat(10_000)}`)
         yield* createUserMessage(session.id, "keep this turn")
         yield* createCompactionMarker(session.id)
 
@@ -1446,7 +2132,7 @@ describe("session.compaction.process", () => {
         expect(parent).toBeTruthy()
         yield* SessionCompaction.use.process({ parentID: parent!, messages: msgs, sessionID: session.id, auto: false })
 
-        yield* createUserMessage(session.id, "latest turn")
+        yield* createUserMessage(session.id, `latest turn${"x".repeat(10_000)}`)
         yield* createCompactionMarker(session.id)
 
         msgs = MessageV2.filterCompacted(yield* MessageV2.stream(session.id))
@@ -1577,6 +2263,193 @@ describe("session.compaction.process", () => {
     { git: true },
   )
 
+  itCompaction.instance(
+    "omits classifier-rejected output from native compaction model input",
+    () => {
+      const stub = llm()
+      let captured = ""
+      stub.push(
+        reply("native summary", (input) => {
+          captured = JSON.stringify(input.messages)
+        }),
+      )
+
+      return Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const test = yield* TestInstance
+        const session = yield* ssn.create({})
+        const rejectedUser = yield* createUserMessage(session.id, "rejected request")
+        const rejected = yield* createAssistantMessage(session.id, rejectedUser.id, test.directory)
+        yield* ssn.updateMessage({
+          ...rejected,
+          error: new SessionV1.ContentFilterError({ message: "blocked by classifier" }).toObject(),
+        })
+        yield* ssn.updatePart({
+          id: PartID.ascending(),
+          messageID: rejected.id,
+          sessionID: session.id,
+          type: "text",
+          text: `CLASSIFIER_REJECTED_TEXT_${"x".repeat(6_000)}`,
+        })
+        yield* ssn.updatePart({
+          id: PartID.ascending(),
+          messageID: rejected.id,
+          sessionID: session.id,
+          type: "tool",
+          callID: "rejected-tool",
+          tool: "read",
+          state: {
+            status: "completed",
+            input: { filePath: "CLASSIFIER_REJECTED_INPUT" },
+            output: "CLASSIFIER_REJECTED_TOOL_OUTPUT",
+            title: "rejected",
+            metadata: {},
+            time: { start: 1, end: 2 },
+          },
+        })
+        const interruptedUser = yield* createUserMessage(session.id, "interrupted request")
+        const interrupted = yield* createAssistantMessage(session.id, interruptedUser.id, test.directory)
+        yield* ssn.updateMessage({
+          ...interrupted,
+          error: new SessionV1.AbortedError({ message: "interrupted" }).toObject(),
+        })
+        yield* ssn.updatePart({
+          id: PartID.ascending(),
+          messageID: interrupted.id,
+          sessionID: session.id,
+          type: "tool",
+          callID: "completed-before-interrupt",
+          tool: "read",
+          state: {
+            status: "completed",
+            input: { filePath: "kept.txt" },
+            output: `LEGITIMATE_TOOL_RESULT_${"y".repeat(5_000)}`,
+            title: "kept",
+            metadata: {},
+            time: { start: 3, end: 4 },
+          },
+        })
+        yield* createCompactionMarker(session.id)
+        const messages = yield* ssn.messages({ sessionID: session.id })
+
+        yield* SessionCompaction.use.process({
+          parentID: messages.at(-1)!.info.id,
+          messages,
+          sessionID: session.id,
+          auto: false,
+        })
+
+        expect(captured).toContain(MessageV2.CONTENT_FILTER_NOTE)
+        expect(captured).toContain("LEGITIMATE_TOOL_RESULT")
+        expect(captured).not.toContain("CLASSIFIER_REJECTED_TEXT")
+        expect(captured).not.toContain("CLASSIFIER_REJECTED_INPUT")
+        expect(captured).not.toContain("CLASSIFIER_REJECTED_TOOL_OUTPUT")
+      }).pipe(withCompaction({ llm: stub.llmLayer, config: cfg({ tail_turns: 0 }) }))
+    },
+    { git: true },
+  )
+
+  itCompaction.instance(
+    "serializes manual compaction summaries without expanding original parts",
+    () => {
+      const stub = llm()
+      const longSummary = `LONG_SUMMARY_START${"u".repeat(3_400)}LONG_SUMMARY_END`
+      const mixedSummary = "settled assistant text and tool result"
+      let captured = ""
+      stub.push(
+        reply("native summary", (input) => {
+          captured = JSON.stringify(input.messages)
+        }),
+      )
+
+      return Effect.gen(function* () {
+        const ssn = yield* SessionNs.Service
+        const test = yield* TestInstance
+        const session = yield* ssn.create({})
+        const user = yield* createUserMessage(session.id, "ORIGINAL_USER_SECRET")
+        const userMessage = (yield* ssn.messages({ sessionID: session.id })).find(
+          (message) => message.info.id === user.id,
+        )!
+        const userPart = userMessage.parts.find((part): part is SessionV1.TextPart => part.type === "text")!
+        yield* ssn.updatePart({
+          ...userPart,
+          compacted: Date.now(),
+          compactionGroup: "cross-role-group",
+          compactionSummary: longSummary,
+        })
+        const assistant = yield* createAssistantMessage(session.id, user.id, test.directory)
+        yield* ssn.updatePart({
+          id: PartID.ascending(),
+          messageID: assistant.id,
+          sessionID: session.id,
+          type: "text",
+          text: "ORIGINAL_REASONING_SECRET",
+          time: { start: 1, end: 2 },
+          compacted: Date.now(),
+          compactionGroup: "assistant-mixed-group",
+          compactionSummary: mixedSummary,
+        })
+        yield* ssn.updatePart({
+          id: PartID.ascending(),
+          messageID: assistant.id,
+          sessionID: session.id,
+          type: "tool",
+          callID: "manual-tool",
+          tool: "read",
+          state: {
+            status: "completed",
+            input: { secret: "ORIGINAL_INPUT_SECRET" },
+            output: "ORIGINAL_OUTPUT_SECRET",
+            title: "manual",
+            metadata: {},
+            time: { start: 1, end: 2 },
+            compactionGroup: "assistant-mixed-group",
+            compactionSummary: mixedSummary,
+          },
+        })
+        yield* ssn.updatePart({
+          id: PartID.ascending(),
+          messageID: assistant.id,
+          sessionID: session.id,
+          type: "tool",
+          callID: "manual-tool-without-summary",
+          tool: "read",
+          state: {
+            status: "completed",
+            input: { secret: "UNSUMMARIZED_INPUT_SECRET" },
+            output: "UNSUMMARIZED_OUTPUT_SECRET",
+            title: "manual marker",
+            metadata: {},
+            time: { start: 1, end: 2 },
+            compactionGroup: "marker-only-group",
+          },
+        })
+        yield* createCompactionMarker(session.id)
+        const msgs = yield* ssn.messages({ sessionID: session.id })
+
+        yield* SessionCompaction.use.process({
+          parentID: msgs.at(-1)!.info.id,
+          messages: msgs,
+          sessionID: session.id,
+          auto: false,
+        })
+
+        expect(captured).toContain("LONG_SUMMARY_START")
+        expect(captured).toContain("LONG_SUMMARY_END")
+        expect(captured.split(mixedSummary)).toHaveLength(3)
+        expect(captured).toContain("[Assistant]: [Compacted")
+        expect(captured).toContain("[Tool]: [Compacted")
+        expect(captured).not.toContain("ORIGINAL_USER_SECRET")
+        expect(captured).not.toContain("ORIGINAL_REASONING_SECRET")
+        expect(captured).not.toContain("ORIGINAL_INPUT_SECRET")
+        expect(captured).not.toContain("ORIGINAL_OUTPUT_SECRET")
+        expect(captured).not.toContain("UNSUMMARIZED_INPUT_SECRET")
+        expect(captured).not.toContain("UNSUMMARIZED_OUTPUT_SECRET")
+      }).pipe(withCompaction({ llm: stub.llmLayer, config: cfg({ tail_turns: 0 }) }))
+    },
+    { git: true },
+  )
+
   itCompaction.instance("keeps recent pre-compaction turns across repeated compactions", () => {
     const stub = llm()
     stub.push(reply("summary one"))
@@ -1585,8 +2458,8 @@ describe("session.compaction.process", () => {
     return Effect.gen(function* () {
       const ssn = yield* SessionNs.Service
       const session = yield* ssn.create({})
-      const u1 = yield* createUserMessage(session.id, "one")
-      const u2 = yield* createUserMessage(session.id, "two")
+      const u1 = yield* createUserMessage(session.id, `one${"x".repeat(10_000)}`)
+      const u2 = yield* createUserMessage(session.id, `two${"x".repeat(10_000)}`)
       const u3 = yield* createUserMessage(session.id, "three")
       yield* createCompactionMarker(session.id)
 
@@ -1623,7 +2496,7 @@ describe("session.compaction.process", () => {
       const ssn = yield* SessionNs.Service
       const test = yield* TestInstance
       const session = yield* ssn.create({})
-      yield* createUserMessage(session.id, "older")
+      yield* createUserMessage(session.id, "o".repeat(10_000))
       const keep = yield* createUserMessage(session.id, "keep this turn")
       const keepReply = yield* createAssistantMessage(session.id, keep.id, test.directory)
       yield* ssn.updatePart({

@@ -14,7 +14,14 @@ import { NotFoundError } from "@/storage/storage"
 
 import { Effect, Layer, Context } from "effect"
 import { InstanceState } from "@/effect/instance-state"
-import { isOverflow as overflow, usable } from "./overflow"
+import {
+  budget,
+  check as checkOverflow,
+  estimateRequest,
+  isOverflow as overflow,
+  REQUEST_REMINDER_HEADROOM,
+  usable,
+} from "./overflow"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { EventV2Bridge } from "@/event-v2-bridge"
@@ -22,15 +29,26 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { buildPrompt } from "@opencode-ai/core/session/compaction"
 import { SessionCompactionEvent } from "@opencode-ai/schema/session-compaction-event"
+import {
+  compactionInput,
+  compactionOf,
+  isManualToolCompaction,
+  projectionChannel,
+  projectionChannelKey,
+  withCompactionLock,
+} from "./compaction-pruning"
 
 export const Event = SessionCompactionEvent
 
 export const PRUNE_MINIMUM = 20_000
 export const PRUNE_PROTECT = 40_000
 const TOOL_OUTPUT_MAX_CHARS = 2_000
+const COMPACTION_SUMMARY_MAX_CHARS = 4_000
 const PRUNE_PROTECTED_TOOLS = ["skill"]
+const DEFAULT_TAIL_TURNS = 2
 const MIN_PRESERVE_RECENT_TOKENS = 2_000
-const MAX_PRESERVE_RECENT_TOKENS = 15_000
+const MAX_PRESERVE_RECENT_TOKENS = 8_000
+const MAX_AUTO_COMPACTION_ATTEMPTS = 3
 type Turn = {
   start: number
   end: number
@@ -45,43 +63,78 @@ type Tail = {
 type CompletedCompaction = {
   userIndex: number
   assistantIndex: number
-  summary: string | undefined
+  summary: string
 }
 
 const truncate = (value: string) =>
   value.length <= TOOL_OUTPUT_MAX_CHARS ? value : `${value.slice(0, TOOL_OUTPUT_MAX_CHARS)}\n[truncated]`
 
-const serialize = (message: SessionV1.WithParts) => {
-  if (message.info.role === "user") {
-    const text = message.parts
-      .filter((part): part is SessionV1.TextPart => part.type === "text" && !part.ignored)
-      .map((part) => part.text)
-      .filter(Boolean)
-      .join("\n")
-    const files = message.parts.flatMap((part) =>
-      part.type === "file" ? [`[Attached ${part.mime}: ${part.filename ?? "file"}]`] : [],
-    )
-    return [...(text ? [`[User]: ${text}`] : []), ...files].join("\n")
+const truncateSummary = (value: string) =>
+  value.length <= COMPACTION_SUMMARY_MAX_CHARS ? value : `${value.slice(0, COMPACTION_SUMMARY_MAX_CHARS)}\n[truncated]`
+
+function serializer() {
+  const seen = new Set<string>()
+  const current = (part: SessionV1.Part, label: string, role: SessionV1.Info["role"]) => {
+    const record = compactionOf(part)
+    if (!record) return undefined
+    const key = projectionChannelKey(record.group ?? part.id, projectionChannel(part, role))
+    if (seen.has(key)) return `${label}: [Compacted ${part.id}]`
+    seen.add(key)
+    const content = record.summary ? truncateSummary(compactionInput(part).trim()) : ""
+    return `${label}: [Compacted ${part.id}]${content ? `\n${content}` : ""}`
   }
-  return message.parts
-    .flatMap((part) => {
-      if (part.type === "text") return part.text ? [`[Assistant]: ${part.text}`] : []
-      if (part.type === "reasoning") return part.text ? [`[Assistant reasoning]: ${part.text}`] : []
-      if (part.type !== "tool") return []
-      const call = `[Assistant tool call]: ${part.tool}(${JSON.stringify(part.state.input)})`
-      if (part.state.status === "completed") {
-        const attachments = (part.state.attachments ?? []).map(
-          (item) => `[Attached ${item.mime}: ${item.filename ?? "file"}]`,
-        )
-        const output = part.state.time.compacted
-          ? "[Old tool result content cleared]"
-          : truncate([part.state.output, ...attachments].join("\n"))
-        return [call, `[Tool result]: ${output}`]
-      }
-      if (part.state.status === "error") return [call, `[Tool error]: ${part.state.error}`]
-      return [call]
-    })
-    .join("\n")
+
+  return (stored: SessionV1.WithParts) => {
+    const message = MessageV2.projectErroredTurns([stored])[0]!
+    if (
+      message.info.role === "assistant" &&
+      message.info.error &&
+      SessionV1.ContentFilterError.isInstance(message.info.error)
+    )
+      return `[Assistant]: ${MessageV2.CONTENT_FILTER_NOTE}`
+    if (message.info.role === "user") {
+      return message.parts
+        .flatMap((part) => {
+          if (part.type === "text") {
+            if (part.ignored) return []
+            const compacted = current(part, "[User]", message.info.role)
+            return compacted ? [compacted] : part.text ? [`[User]: ${part.text}`] : []
+          }
+          if (part.type !== "file") return []
+          const compacted = current(part, "[User attachment]", message.info.role)
+          return compacted ? [compacted] : [`[Attached ${part.mime}: ${part.filename ?? "file"}]`]
+        })
+        .join("\n")
+    }
+    return message.parts
+      .flatMap((part) => {
+        if (part.type === "text") {
+          const compacted = current(part, "[Assistant]", message.info.role)
+          return compacted ? [compacted] : part.text ? [`[Assistant]: ${part.text}`] : []
+        }
+        if (part.type === "reasoning") {
+          const compacted = current(part, "[Assistant reasoning]", message.info.role)
+          return compacted ? [compacted] : part.text ? [`[Assistant reasoning]: ${part.text}`] : []
+        }
+        if (part.type === "file") {
+          const compacted = current(part, "[Assistant]", message.info.role)
+          return compacted ? [compacted] : [`[Attached ${part.mime}: ${part.filename ?? "file"}]`]
+        }
+        if (part.type !== "tool") return []
+        const compacted = current(part, "[Tool]", message.info.role)
+        if (compacted) return [compacted]
+        const call = `[Assistant tool call]: ${part.tool}(${JSON.stringify(part.state.input)})`
+        if (part.state.status === "completed") {
+          const attachments = (part.state.attachments ?? []).map(
+            (item) => `[Attached ${item.mime}: ${item.filename ?? "file"}]`,
+          )
+          return [call, `[Tool result]: ${truncate([part.state.output, ...attachments].join("\n"))}`]
+        }
+        if (part.state.status === "error") return [call, `[Tool error]: ${part.state.error}`]
+        return [call]
+      })
+      .join("\n")
+  }
 }
 
 function summaryText(message: SessionV1.WithParts) {
@@ -108,7 +161,9 @@ function completedCompactions(messages: SessionV1.WithParts[]) {
     if (!msg.info.summary || !msg.info.finish || msg.info.error) return []
     const userIndex = users.get(msg.info.parentID)
     if (userIndex === undefined) return []
-    return [{ userIndex, assistantIndex, summary: summaryText(msg) }]
+    const summary = summaryText(msg)
+    if (!summary) return []
+    return [{ userIndex, assistantIndex, summary }]
   })
 }
 
@@ -163,6 +218,10 @@ function splitTurn(input: {
 }
 
 export interface Interface {
+  readonly checkOverflow: (input: {
+    tokens: SessionV1.Assistant["tokens"]
+    model: Provider.Model
+  }) => Effect.Effect<ReturnType<typeof checkOverflow>>
   readonly isOverflow: (input: {
     tokens: SessionV1.Assistant["tokens"]
     model: Provider.Model
@@ -174,6 +233,8 @@ export interface Interface {
     sessionID: SessionID
     auto: boolean
     overflow?: boolean
+    attempt?: number
+    requestOverhead?: number
   }) => Effect.Effect<"continue" | "stop">
   readonly create: (input: {
     sessionID: SessionID
@@ -212,22 +273,42 @@ const layer = Layer.effect(
       })
     })
 
+    const overflowStatus = Effect.fn("SessionCompaction.checkOverflow")(function* (input: {
+      tokens: SessionV1.Assistant["tokens"]
+      model: Provider.Model
+    }) {
+      return checkOverflow({
+        cfg: yield* config.get(),
+        tokens: input.tokens,
+        model: input.model,
+        outputTokenMax: flags.outputTokenMax,
+      })
+    })
+
+    const projection = Effect.fnUntraced(function* (input: { messages: SessionV1.WithParts[]; model: Provider.Model }) {
+      const msgs = yield* MessageV2.toModelMessagesEffect(input.messages, input.model)
+      return JSON.stringify(msgs)
+    })
+
     const estimate = Effect.fn("SessionCompaction.estimate")(function* (input: {
       messages: SessionV1.WithParts[]
       model: Provider.Model
     }) {
-      const msgs = yield* MessageV2.toModelMessagesEffect(input.messages, input.model)
-      return Token.estimate(JSON.stringify(msgs))
+      return Token.estimate(yield* projection(input))
     })
 
     const select = Effect.fn("SessionCompaction.select")(function* (input: {
       messages: SessionV1.WithParts[]
       cfg: ConfigV1.Info
       model: Provider.Model
+      requestOverhead: number
     }) {
-      const limit = input.cfg.compaction?.tail_turns
-      if (limit !== undefined && limit <= 0) return { head: input.messages, tail_start_id: undefined }
-      const budget = preserveRecentBudget({ cfg: input.cfg, model: input.model })
+      const limit = input.cfg.compaction?.tail_turns ?? DEFAULT_TAIL_TURNS
+      if (limit <= 0) return { head: input.messages, tail_start_id: undefined }
+      const budget = Math.min(
+        preserveRecentBudget({ cfg: input.cfg, model: input.model }),
+        Math.max(0, usable(input) - input.requestOverhead),
+      )
       const all = turns(input.messages)
       if (!all.length) return { head: input.messages, tail_start_id: undefined }
       const recent = limit === undefined ? all : all.slice(-limit)
@@ -273,47 +354,81 @@ const layer = Layer.effect(
     const prune = Effect.fn("SessionCompaction.prune")(function* (input: { sessionID: SessionID }) {
       const cfg = yield* config.get()
       if (!cfg.compaction?.prune) return
-      yield* Effect.logInfo("pruning")
+      return yield* withCompactionLock(
+        input.sessionID,
+        undefined,
+        Effect.gen(function* () {
+          yield* Effect.logInfo("pruning")
 
-      const msgs = yield* session
-        .messages({ sessionID: input.sessionID })
-        .pipe(Effect.catchIf(NotFoundError.isInstance, () => Effect.succeed(undefined)))
-      if (!msgs) return
+          const msgs = yield* session
+            .messages({ sessionID: input.sessionID })
+            .pipe(Effect.catchIf(NotFoundError.isInstance, () => Effect.succeed(undefined)))
+          if (!msgs) return
+          const current = msgs.findLast((msg) => msg.info.role === "user")
+          if (!current || current.info.role !== "user") return
+          const model = yield* provider
+            .getModel(current.info.model.providerID, current.info.model.modelID)
+            .pipe(Effect.orDie)
+          const projectedBefore = yield* projection({ messages: msgs, model })
 
-      let total = 0
-      let pruned = 0
-      const toPrune: SessionV1.ToolPart[] = []
-      let turns = 0
+          let total = 0
+          let pruned = 0
+          const toPrune: SessionV1.ToolPart[] = []
+          const projections = new Map<MessageID, string>()
+          let turns = 0
 
-      loop: for (let msgIndex = msgs.length - 1; msgIndex >= 0; msgIndex--) {
-        const msg = msgs[msgIndex]
-        if (msg.info.role === "user") turns++
-        if (turns < 2) continue
-        if (msg.info.role === "assistant" && msg.info.summary) break loop
-        for (let partIndex = msg.parts.length - 1; partIndex >= 0; partIndex--) {
-          const part = msg.parts[partIndex]
-          if (part.type !== "tool") continue
-          if (part.state.status !== "completed") continue
-          if (PRUNE_PROTECTED_TOOLS.includes(part.tool)) continue
-          if (part.state.time.compacted) break loop
-          const estimate = Token.estimate(part.state.output)
-          total += estimate
-          if (total <= PRUNE_PROTECT) continue
-          pruned += estimate
-          toPrune.push(part)
-        }
-      }
-
-      yield* Effect.logInfo("found", { pruned, total })
-      if (pruned > PRUNE_MINIMUM) {
-        for (const part of toPrune) {
-          if (part.state.status === "completed") {
-            part.state.time.compacted = Date.now()
-            yield* session.updatePart(part)
+          loop: for (let msgIndex = msgs.length - 1; msgIndex >= 0; msgIndex--) {
+            const msg = msgs[msgIndex]
+            if (msg.info.role === "user") turns++
+            if (turns < 2) continue
+            if (msg.info.role === "assistant" && msg.info.summary) break loop
+            for (let partIndex = msg.parts.length - 1; partIndex >= 0; partIndex--) {
+              const part = msg.parts[partIndex]
+              if (part.type !== "tool") continue
+              if (part.state.status !== "completed") continue
+              if (PRUNE_PROTECTED_TOOLS.includes(part.tool)) continue
+              if (isManualToolCompaction(part)) continue
+              if (part.state.time.compacted !== undefined) break loop
+              const cached = projections.get(msg.info.id)
+              const original = cached ?? (yield* projection({ messages: [msg], model }))
+              if (cached === undefined) projections.set(msg.info.id, original)
+              const next = structuredClone(msg)
+              const candidate = next.parts.find((item) => item.id === part.id)
+              if (candidate?.type !== "tool" || candidate.state.status !== "completed") continue
+              candidate.state.time.compacted = Date.now()
+              const replacement = yield* projection({ messages: [next], model })
+              if (replacement.length >= original.length) continue
+              const size = Token.estimate(original) - Token.estimate(replacement)
+              if (size <= 0) continue
+              total += size
+              if (total <= PRUNE_PROTECT) continue
+              pruned += size
+              toPrune.push(part)
+            }
           }
-        }
-        yield* Effect.logInfo("pruned", { count: toPrune.length })
-      }
+
+          yield* Effect.logInfo("found", { pruned, total })
+          if (pruned <= PRUNE_MINIMUM) return
+          const projected = structuredClone(msgs)
+          const selected = new Set(toPrune.map((part) => part.id))
+          for (const msg of projected) {
+            for (const part of msg.parts) {
+              if (part.type !== "tool" || part.state.status !== "completed" || !selected.has(part.id)) continue
+              part.state.time.compacted = Date.now()
+            }
+          }
+          const projectedAfter = yield* projection({ messages: projected, model })
+          const savings = Token.estimate(projectedBefore) - Token.estimate(projectedAfter)
+          if (projectedAfter.length >= projectedBefore.length || savings <= PRUNE_MINIMUM) return
+          for (const part of toPrune) {
+            if (part.state.status === "completed") {
+              part.state.time.compacted = Date.now()
+              yield* session.updatePart(part)
+            }
+          }
+          yield* Effect.logInfo("pruned", { count: toPrune.length, savings })
+        }),
+      )
     })
 
     const processCompaction = Effect.fn("SessionCompaction.process")(function* (input: {
@@ -322,6 +437,8 @@ const layer = Layer.effect(
       sessionID: SessionID
       auto: boolean
       overflow?: boolean
+      attempt?: number
+      requestOverhead?: number
     }) {
       const parent = input.messages.findLast((m) => m.info.id === input.parentID)
       if (!parent || parent.info.role !== "user") {
@@ -356,18 +473,42 @@ const layer = Layer.effect(
       }
 
       const agent = yield* agents.get("compaction")
+      const contextModel = yield* provider
+        .getModel(userMessage.model.providerID, userMessage.model.modelID)
+        .pipe(Effect.orDie)
       const model = agent.model
         ? yield* provider.getModel(agent.model.providerID, agent.model.modelID).pipe(Effect.orDie)
-        : yield* provider.getModel(userMessage.model.providerID, userMessage.model.modelID).pipe(Effect.orDie)
+        : contextModel
       const cfg = yield* config.get()
-      const history = compactionPart && messages.at(-1)?.info.id === input.parentID ? messages.slice(0, -1) : messages
+      const projectedBefore = yield* estimate({ messages: input.messages, model: contextModel })
+      const observed = input.messages.findLast(
+        (message) => message.info.role === "assistant" && message.info.finish && !message.info.summary,
+      )
+      const observedTokens =
+        observed?.info.role === "assistant"
+          ? checkOverflow({
+              cfg,
+              tokens: observed.info.tokens,
+              model: contextModel,
+              outputTokenMax: flags.outputTokenMax,
+            }).count
+          : 0
+      const requestOverhead = Math.max(
+        REQUEST_REMINDER_HEADROOM,
+        input.requestOverhead ?? 0,
+        observedTokens - projectedBefore,
+      )
+      const parentIndex = messages.findIndex((message) => message.info.id === input.parentID)
+      const history = compactionPart && parentIndex >= 0 ? messages.slice(0, parentIndex) : messages
       const prior = completedCompactions(history)
       const hidden = new Set(prior.flatMap((item) => [item.userIndex, item.assistantIndex]))
       const previousSummary = prior.at(-1)?.summary
+      const visible = history.filter((_, index) => !hidden.has(index))
       const selected = yield* select({
-        messages: history.filter((_, index) => !hidden.has(index)),
+        messages: visible,
         cfg,
-        model,
+        model: contextModel,
+        requestOverhead,
       })
       // Allow plugins to inject context or replace compaction prompt.
       const compacting = yield* plugin.trigger(
@@ -375,8 +516,9 @@ const layer = Layer.effect(
         { sessionID: input.sessionID },
         { context: [], prompt: undefined },
       )
-      const msgs = structuredClone(selected.head)
+      const msgs = structuredClone(MessageV2.projectErroredTurns(selected.head))
       yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
+      const serialize = serializer()
       const conversation = msgs.map(serialize).filter(Boolean).join("\n\n")
       const nextPrompt =
         compacting.prompt ??
@@ -389,6 +531,12 @@ const layer = Layer.effect(
         ]
           .filter(Boolean)
           .join("\n\n")
+      const request = [
+        nextPrompt,
+        ...(compacting.prompt ? ["The following is the conversation history:", conversation] : []),
+      ]
+        .filter(Boolean)
+        .join("\n\n")
       const ctx = yield* InstanceState.context
       const msg: SessionV1.Assistant = {
         id: MessageID.ascending(),
@@ -417,143 +565,224 @@ const layer = Layer.effect(
         },
       }
       yield* session.updateMessage(msg)
-      const processor = yield* processors.create({
-        assistantMessage: msg,
-        sessionID: input.sessionID,
-        model,
-      })
-      const result = yield* processor.process({
-        user: userMessage,
-        agent,
-        sessionID: input.sessionID,
-        tools: {},
-        system: [],
-        messages: [
-          {
-            role: "user",
-            content: [
-              {
-                type: "text",
-                text: [
-                  nextPrompt,
-                  ...(compacting.prompt ? ["The following is the conversation history:", conversation] : []),
-                ]
-                  .filter(Boolean)
-                  .join("\n\n"),
-              },
-            ],
-          },
-        ],
-        model,
-      })
-
-      if (result === "compact") {
-        processor.message.error = new SessionV1.ContextOverflowError({
-          message: replay
-            ? "Conversation history too large to compact - exceeds model context limit"
-            : "Session too large to compact - context exceeds model limit even after stripping media",
-        }).toObject()
-        processor.message.finish = "error"
-        yield* session.updateMessage(processor.message)
-        return "stop"
-      }
-
-      if (compactionPart && selected.tail_start_id && compactionPart.tail_start_id !== selected.tail_start_id) {
-        yield* session.updatePart({
-          ...compactionPart,
-          tail_start_id: selected.tail_start_id,
+      return yield* Effect.gen(function* () {
+        const fail = Effect.fnUntraced(function* (message: string, target: SessionV1.Assistant = msg) {
+          target.error = new SessionV1.ContextOverflowError({ message }).toObject()
+          target.finish = "error"
+          target.time.completed = Date.now()
+          yield* session.updateMessage(target)
+          yield* events
+            .publish(Session.Event.Error, { sessionID: input.sessionID, error: target.error })
+            .pipe(Effect.orDie)
+          return "stop" as const
         })
-      }
+        const contextBudget = budget({ cfg, model: contextModel, outputTokenMax: flags.outputTokenMax })
+        if (contextBudget.status === "impossible") return yield* fail(contextBudget.message)
+        const contextAvailable =
+          contextBudget.status === "available" ? Math.max(0, contextBudget.tokens - requestOverhead) : 0
+        if (contextBudget.status === "available" && contextAvailable === 0) {
+          return yield* fail(
+            `Compaction cannot leave enough room for the current request's system instructions, tools, and reminder headroom (${requestOverhead} estimated tokens in a ${contextBudget.tokens} token usable budget). Reduce configured tools or choose a larger-context model.`,
+          )
+        }
+        if (
+          contextBudget.status === "available" &&
+          cfg.compaction?.preserve_recent_tokens !== undefined &&
+          cfg.compaction.preserve_recent_tokens >= contextAvailable
+        ) {
+          return yield* fail(
+            `Compaction cannot preserve ${cfg.compaction.preserve_recent_tokens} recent tokens after reserving ${requestOverhead} tokens for fixed request overhead within the model's ${contextBudget.tokens} token usable budget. Lower compaction.preserve_recent_tokens.`,
+          )
+        }
+        if (input.auto && (input.attempt ?? 1) > MAX_AUTO_COMPACTION_ATTEMPTS) {
+          return yield* fail(
+            `Automatic compaction stopped after ${MAX_AUTO_COMPACTION_ATTEMPTS} attempts without reaching a safe context size. Shorten the latest prompt or compact large content manually.`,
+          )
+        }
+        const summaryBudget = budget({ cfg, model, outputTokenMax: flags.outputTokenMax })
+        if (summaryBudget.status === "impossible") return yield* fail(summaryBudget.message)
+        const requestTokens = estimateRequest({ system: [], messages: [{ role: "user", content: request }] })
+        if (summaryBudget.status === "available" && requestTokens >= summaryBudget.tokens) {
+          return yield* fail(
+            `Conversation history is too large to summarize safely: the compaction request needs about ${requestTokens} tokens but the compaction model has ${summaryBudget.tokens} usable tokens. Compact large content manually or choose a compaction model with a larger context window.`,
+          )
+        }
+        const before = projectedBefore + requestOverhead
+        const processor = yield* processors.create({
+          assistantMessage: msg,
+          sessionID: input.sessionID,
+          model,
+        })
+        const result = yield* processor.process({
+          user: userMessage,
+          agent,
+          sessionID: input.sessionID,
+          tools: {},
+          system: [],
+          messages: [
+            {
+              role: "user",
+              content: [
+                {
+                  type: "text",
+                  text: request,
+                },
+              ],
+            },
+          ],
+          model,
+        })
 
-      if (result === "continue" && input.auto) {
-        if (replay) {
-          const original = replay.info
-          const replayMsg = yield* session.updateMessage({
-            id: MessageID.ascending(),
-            role: "user",
-            sessionID: input.sessionID,
-            time: { created: Date.now() },
-            agent: original.agent,
-            model: original.model,
-            format: original.format,
-            tools: original.tools,
-            system: original.system,
-          })
-          for (const part of replay.parts) {
-            if (part.type === "compaction") continue
-            const replayPart =
-              part.type === "file" && MessageV2.isMedia(part.mime)
-                ? { type: "text" as const, text: `[Attached ${part.mime}: ${part.filename ?? "file"}]` }
-                : part
-            yield* session.updatePart({
-              ...replayPart,
-              id: PartID.ascending(),
-              messageID: replayMsg.id,
-              sessionID: input.sessionID,
-            })
+        if (result === "compact") {
+          return yield* fail(
+            replay
+              ? "Conversation history too large to compact - exceeds model context limit"
+              : "Session too large to compact - context exceeds model limit even after stripping media",
+            processor.message,
+          )
+        }
+
+        const all = yield* session.messages({ sessionID: input.sessionID }).pipe(Effect.orDie)
+        const completed = all.find((item) => item.info.id === processor.message.id)
+        if (
+          result === "continue" &&
+          (!completed || completed.info.role !== "assistant" || !completed.info.finish || !summaryText(completed))
+        ) {
+          return yield* fail(
+            "Compaction failed because the model did not return a completed non-empty summary. No history was discarded.",
+            processor.message,
+          )
+        }
+
+        if (result === "continue") {
+          const projected = structuredClone(all)
+          if (compactionPart && selected.tail_start_id) {
+            const boundary = projected.flatMap((message) => message.parts).find((part) => part.id === compactionPart.id)
+            if (boundary?.type === "compaction") boundary.tail_start_id = selected.tail_start_id
+          }
+          const after =
+            (yield* estimate({ messages: MessageV2.filterCompacted(projected.toReversed()), model: contextModel })) +
+            requestOverhead
+          if (after >= before) {
+            return yield* fail(
+              `Compaction did not reduce the current context (${before} tokens before, ${after} after). Shorten the generated summary or keep more original history.`,
+              processor.message,
+            )
+          }
+          if (input.auto && contextBudget.status === "available" && after >= contextBudget.tokens) {
+            return yield* fail(
+              `Automatic compaction still leaves about ${after} tokens in a ${contextBudget.tokens} token usable budget. Reduce compaction.preserve_recent_tokens, shorten the latest prompt, or compact large content manually.`,
+              processor.message,
+            )
           }
         }
 
-        if (!replay) {
-          const info = yield* provider.getProvider(userMessage.model.providerID)
-          if (
-            (yield* plugin.trigger(
-              "experimental.compaction.autocontinue",
-              {
-                sessionID: input.sessionID,
-                agent: userMessage.agent,
-                model: yield* provider
-                  .getModel(userMessage.model.providerID, userMessage.model.modelID)
-                  .pipe(Effect.orDie),
-                provider: {
-                  source: info.source,
-                  info,
-                  options: info.options,
-                },
-                message: userMessage,
-                overflow: input.overflow === true,
-              },
-              { enabled: true },
-            )).enabled
-          ) {
-            const continueMsg = yield* session.updateMessage({
+        if (compactionPart && selected.tail_start_id && compactionPart.tail_start_id !== selected.tail_start_id) {
+          yield* session.updatePart({
+            ...compactionPart,
+            tail_start_id: selected.tail_start_id,
+          })
+        }
+
+        if (result === "continue" && input.auto) {
+          if (replay) {
+            const original = replay.info
+            const replayMsg = yield* session.updateMessage({
               id: MessageID.ascending(),
               role: "user",
               sessionID: input.sessionID,
               time: { created: Date.now() },
-              agent: userMessage.agent,
-              model: userMessage.model,
+              agent: original.agent,
+              model: original.model,
+              format: original.format,
+              tools: original.tools,
+              system: original.system,
             })
-            const text =
-              (input.overflow
-                ? "The previous request exceeded the provider's size limit due to large media attachments. The conversation was compacted and media files were removed from context. If the user was asking about attached images or files, explain that the attachments were too large to process and suggest they try again with smaller or fewer files.\n\n"
-                : "") +
-              "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed."
-            yield* session.updatePart({
-              id: PartID.ascending(),
-              messageID: continueMsg.id,
-              sessionID: input.sessionID,
-              type: "text",
-              // Internal marker for auto-compaction followups so provider plugins
-              // can distinguish them from manual post-compaction user prompts.
-              // This is not a stable plugin contract and may change or disappear.
-              metadata: { compaction_continue: true },
-              synthetic: true,
-              text,
-              time: {
-                start: Date.now(),
-                end: Date.now(),
-              },
-            })
+            for (const part of replay.parts) {
+              if (part.type === "compaction") continue
+              const replayPart =
+                part.type === "file" && MessageV2.isMedia(part.mime)
+                  ? { type: "text" as const, text: `[Attached ${part.mime}: ${part.filename ?? "file"}]` }
+                  : part
+              yield* session.updatePart({
+                ...replayPart,
+                id: PartID.ascending(),
+                messageID: replayMsg.id,
+                sessionID: input.sessionID,
+              })
+            }
+          }
+
+          if (!replay) {
+            const info = yield* provider.getProvider(userMessage.model.providerID)
+            if (
+              (yield* plugin.trigger(
+                "experimental.compaction.autocontinue",
+                {
+                  sessionID: input.sessionID,
+                  agent: userMessage.agent,
+                  model: yield* provider
+                    .getModel(userMessage.model.providerID, userMessage.model.modelID)
+                    .pipe(Effect.orDie),
+                  provider: {
+                    source: info.source,
+                    info,
+                    options: info.options,
+                  },
+                  message: userMessage,
+                  overflow: input.overflow === true,
+                },
+                { enabled: true },
+              )).enabled
+            ) {
+              const continueMsg = yield* session.updateMessage({
+                id: MessageID.ascending(),
+                role: "user",
+                sessionID: input.sessionID,
+                time: { created: Date.now() },
+                agent: userMessage.agent,
+                model: userMessage.model,
+              })
+              const text =
+                (input.overflow
+                  ? "The previous request exceeded the provider's size limit due to large media attachments. The conversation was compacted and media files were removed from context. If the user was asking about attached images or files, explain that the attachments were too large to process and suggest they try again with smaller or fewer files.\n\n"
+                  : "") +
+                "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed."
+              yield* session.updatePart({
+                id: PartID.ascending(),
+                messageID: continueMsg.id,
+                sessionID: input.sessionID,
+                type: "text",
+                // Internal marker for auto-compaction followups so provider plugins
+                // can distinguish them from manual post-compaction user prompts.
+                // This is not a stable plugin contract and may change or disappear.
+                metadata: { compaction_continue: true },
+                synthetic: true,
+                text,
+                time: {
+                  start: Date.now(),
+                  end: Date.now(),
+                },
+              })
+            }
           }
         }
-      }
 
-      if (processor.message.error) return "stop"
-      if (result === "continue") {
-        yield* events.publish(Event.Compacted, { sessionID: input.sessionID })
-      }
-      return result
+        if (processor.message.error) return "stop"
+        if (result === "continue") {
+          yield* events.publish(Event.Compacted, { sessionID: input.sessionID })
+        }
+        return result
+      }).pipe(
+        Effect.onInterrupt(() =>
+          Effect.gen(function* () {
+            msg.error ??= new SessionV1.AbortedError({ message: "Compaction interrupted" }).toObject()
+            msg.finish = "error"
+            msg.time.completed ??= Date.now()
+            yield* session.updateMessage(msg)
+          }),
+        ),
+      )
     })
 
     const create = Effect.fn("SessionCompaction.create")(function* (input: {
@@ -582,6 +811,7 @@ const layer = Layer.effect(
     })
 
     return Service.of({
+      checkOverflow: overflowStatus,
       isOverflow,
       prune,
       process: processCompaction,
