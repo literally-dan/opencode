@@ -1,4 +1,4 @@
-import { Effect, Stream } from "effect"
+import { Cause, Effect, Exit, Fiber, Stream } from "effect"
 import os from "os"
 import { createWriteStream } from "node:fs"
 import * as Tool from "./tool"
@@ -25,6 +25,7 @@ import { BashArity } from "@/permission/arity"
 export { Parameters } from "./shell/prompt"
 
 const MAX_METADATA_LENGTH = 30_000
+const METADATA_THROTTLE_MS = 50
 const CWD = new Set(["cd", "chdir", "popd", "pushd", "push-location", "set-location"])
 const FILES = new Set([
   ...CWD,
@@ -397,7 +398,7 @@ export const ShellTool = Tool.define(
         if (cmd && (FILES.has(cmd) || (shellKind === "cmd" && CMD_FILES.has(cmd)))) {
           for (const arg of pathArgs(command, ps, shellKind === "cmd")) {
             const resolved = yield* argPath(arg, cwd, ps, shell)
-            yield* Effect.logInfo("resolved path", { arg, resolved })
+            yield* Effect.logDebug("resolved path", { arg, resolved })
             if (!resolved || containsPath(resolved, instance)) continue
             const dir = (yield* fs.isDir(resolved)) ? resolved : path.dirname(resolved)
             scan.dirs.add(dir)
@@ -446,6 +447,23 @@ export const ShellTool = Tool.define(
       let cut = false
       let expired = false
       let aborted = false
+      let readError: unknown
+      // Metadata updates persist and publish the entire live preview. Keep
+      // one scoped writer so burst output cannot overlap writes or create a
+      // transaction per process chunk.
+      let metadataDirty = false
+      let lastMetadataOutput = ""
+      const flushLiveMetadata = Effect.fnUntraced(function* () {
+        if (!metadataDirty) return
+        const output = last
+        metadataDirty = false
+        yield* ctx.metadata({
+          metadata: {
+            output,
+          },
+        })
+        lastMetadataOutput = output
+      })
 
       const closeSink = Effect.fnUntraced(function* () {
         const stream = sink
@@ -483,7 +501,7 @@ export const ShellTool = Tool.define(
           yield* Effect.addFinalizer(closeSink)
           const handle = yield* spawner.spawn(cmd(input.shell, input.command, input.cwd, input.env))
 
-          yield* Effect.forkScoped(
+          const outputFiber = yield* Effect.forkScoped(
             Stream.runForEach(Stream.decodeText(handle.all), (chunk) => {
               const size = Buffer.byteLength(chunk, "utf-8")
               list.push({ text: chunk, size })
@@ -511,23 +529,18 @@ export const ShellTool = Tool.define(
                         full = ""
                       }),
                     ),
-                    Effect.andThen(
-                      ctx.metadata({
-                        metadata: {
-                          output: last,
-                        },
-                      }),
-                    ),
+                    Effect.andThen(Effect.sync(() => void (metadataDirty = true))),
                   )
                 }
               }
 
-              return ctx.metadata({
-                metadata: {
-                  output: last,
-                },
-              })
+              metadataDirty = true
+              return Effect.void
             }),
+          )
+
+          yield* Effect.forkScoped(
+            flushLiveMetadata().pipe(Effect.delay(`${METADATA_THROTTLE_MS} millis`), Effect.forever),
           )
 
           const abort = Effect.callback<void>((resume) => {
@@ -554,6 +567,12 @@ export const ShellTool = Tool.define(
             yield* handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.orDie)
           }
 
+          // Joining surfaces a reader failure — a stdout stream error, or a
+          // truncation-file write that could not complete. Reporting it beats the
+          // previous silent drop, but it must not discard the output already
+          // collected, so record it for <shell_metadata> instead of dying.
+          const drained = yield* Fiber.join(outputFiber).pipe(Effect.exit)
+          if (Exit.isFailure(drained)) readError = Cause.squash(drained.cause)
           return exit.kind === "exit" ? exit.code : null
         }),
       ).pipe(Effect.orDie)
@@ -565,6 +584,11 @@ export const ShellTool = Tool.define(
         )
       }
       if (aborted) meta.push("User aborted the command")
+      if (readError !== undefined) {
+        meta.push(
+          `shell tool could not read the rest of the output: ${readError instanceof Error ? readError.message : String(readError)}`,
+        )
+      }
       const raw = list.map((item) => item.text).join("")
       const end = tail(raw, limits.maxLines, limits.maxBytes)
       if (end.cut) cut = true
@@ -582,10 +606,18 @@ export const ShellTool = Tool.define(
       if (meta.length > 0) {
         output += "\n\n<shell_metadata>\n" + meta.join("\n") + "\n</shell_metadata>"
       }
+      const metadataOutput = last || preview(output)
+      if (lastMetadataOutput !== metadataOutput) {
+        yield* ctx.metadata({
+          metadata: {
+            output: metadataOutput,
+          },
+        })
+      }
       return {
         title: input.command,
         metadata: {
-          output: last || preview(output),
+          output: metadataOutput,
           exit: code,
           truncated: cut,
           ...(cut && file ? { outputPath: file } : {}),
