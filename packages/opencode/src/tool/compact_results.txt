@@ -19,3 +19,5 @@ PARAMETERS
 - summary: one required shared note of at most 4,000 characters. It is rendered once for the visible group, not repeated for every marker.
 
 Get ids from `list_context`, a compacted placeholder, or `search_session_history`. Current/in-flight parts, native session summaries, provider-executed tool results, ambiguous duplicate ids, and unsafe prior groups are protected. A single-member prior group may be refolded when the new note is shorter. The verbatim content stays on disk and recovers via `read_part`. Takes effect next step, not this one.
+
+When a context-pressure reminder asks you to compact, call `list_context` in the current turn and use only ids returned by that call. Never copy `prt_…` or `msg_…` strings from prior messages or tool output.

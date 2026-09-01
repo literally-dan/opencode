@@ -18,6 +18,7 @@ import {
   withCompactionLock,
 } from "@/session/compaction-pruning"
 import type { Located } from "@/session/compaction-pruning"
+import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { Cause, Effect, Exit, Schema } from "effect"
 
 const id = "compact_results"
@@ -84,7 +85,7 @@ export const CompactResultsTool = Tool.define(
               const messages = yield* sessions.messages({ sessionID: ctx.sessionID })
               const { located, ambiguous } = indexParts(messages, ctx.messageID)
               const roles = new Map(messages.map((message) => [message.info.id, message.info.role]))
-              const selected = params.select ? resolveSelection(params.select, located) : []
+              const selected = params.select ? resolveSelection(params.select, messages, located, ambiguous, roles) : []
               const ids = [...new Set([...(params.part_ids ?? []), ...selected])]
               if (ids.length > COMPACTION_MAX_PARTS)
                 return invalidResult(
@@ -263,7 +264,13 @@ export const CompactResultsTool = Tool.define(
 
 // Resolve a `select` filter into a chronological list of part ids. Part ids are
 // ascending, so a plain string sort/compare is chronological order.
-function resolveSelection(sel: Schema.Schema.Type<typeof Selector>, located: Map<string, Located>) {
+function resolveSelection(
+  sel: Schema.Schema.Type<typeof Selector>,
+  messages: SessionV1.WithParts[],
+  located: Map<string, Located>,
+  ambiguous: ReadonlySet<string>,
+  roles: ReadonlyMap<string, SessionV1.Info["role"]>,
+) {
   const matched = [...located.values()]
     .flatMap(({ part, context }) => {
       const e = eligibility(part, context)
@@ -276,9 +283,23 @@ function resolveSelection(sel: Schema.Schema.Type<typeof Selector>, located: Map
       return [part.id]
     })
     .sort()
+  const selected = new Set(matched)
+  const unsafe = unsafeCompactionGroups(
+    messages.flatMap((message) => message.parts),
+    selected,
+    ambiguous,
+    roles,
+  )
+  const actionable = matched.filter((partID) => {
+    const found = located.get(partID)
+    if (!found) return false
+    const group = compactionOf(found.part)?.group
+    if (!group) return true
+    return !unsafe.has(projectionChannelKey(group, projectionChannel(found.part, found.context.role)))
+  })
   if (sel.keep_last !== undefined && sel.keep_last > 0)
-    return matched.slice(0, Math.max(0, matched.length - sel.keep_last))
-  return matched
+    return actionable.slice(0, Math.max(0, actionable.length - sel.keep_last))
+  return actionable
 }
 
 function validateInput(params: Schema.Schema.Type<typeof Parameters>) {

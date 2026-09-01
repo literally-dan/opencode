@@ -37,6 +37,9 @@ export type MessageContext = {
   live?: boolean
 }
 
+export type ContextManagementReceiptKind = "list_context" | "compact_results" | "compact_bulk"
+export type ContextManagementReceiptPart = SessionV1.ToolPart & { state: SessionV1.ToolStateCompleted }
+
 const PART_ID = /^prt_[0-9a-f]{12}[0-9A-Za-z]{14}$/
 export const COMPACTION_SUMMARY_MAX_CHARS = 4_000
 export const COMPACTION_MAX_PARTS = 200
@@ -48,6 +51,45 @@ const COMPACTION_REFERENCE =
   "The full summary is carried by this group's later compaction-summary for the same channel."
 const ESTIMATED_GROUP = "00000000-0000-0000-0000-000000000000"
 const compactionLocks = new Map<string, { semaphore: Semaphore.Semaphore; references: number }>()
+
+export function contextManagementReceiptKind(part: SessionV1.Part): ContextManagementReceiptKind | undefined {
+  if (part.type !== "tool" || part.state.status !== "completed" || part.metadata?.providerExecuted) return
+  if (part.tool === "list_context" || part.tool === "compact_results" || part.tool === "compact_bulk") return part.tool
+}
+
+export function isContextManagementReceipt(part: SessionV1.Part): part is ContextManagementReceiptPart {
+  return contextManagementReceiptKind(part) !== undefined
+}
+
+export function isFullContextManagementReceipt(part: SessionV1.Part): part is ContextManagementReceiptPart {
+  return isContextManagementReceipt(part) && !isManualToolCompaction(part) && part.state.time.compacted === undefined
+}
+
+export function isCollapsedContextManagementReceipt(part: SessionV1.Part): part is ContextManagementReceiptPart {
+  return isContextManagementReceipt(part) && !isManualToolCompaction(part) && part.state.time.compacted !== undefined
+}
+
+export function hasDurableProviderCompletion(message: SessionV1.WithParts) {
+  return message.info.role === "assistant" && message.parts.some((part) => part.type === "step-finish")
+}
+
+export function contextManagementReceiptSummary(part: SessionV1.Part) {
+  if (!isContextManagementReceipt(part)) return
+  const kind = contextManagementReceiptKind(part)
+  if (!kind) return
+  const metadata = part.state.metadata
+  const metric = (key: string) => {
+    const value: unknown = metadata[key]
+    return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? String(value) : "unknown"
+  }
+  const details =
+    kind === "list_context"
+      ? `total parts=${metric("total")}; compactable parts=${metric("compactable")}; estimated reclaimable characters=${metric("charsCompactable")}`
+      : kind === "compact_results"
+        ? `compacted parts=${metric("compacted")}; skipped parts=${metric("skipped")}; net characters freed=${metric("charsFreed")}`
+        : `compacted parts=${metric("compacted")}; skipped parts=${metric("skipped")}; net characters freed=${metric("charsFreed")}; summarizer calls=${metric("summarizerCalls")}`
+  return `Context-management receipt ${part.id} (${kind}): ${details}. Use read_part with part_id="${part.id}" to recover the original full result.`
+}
 
 function acquireCompactionLock(sessionID: string) {
   const hit = compactionLocks.get(sessionID)
@@ -191,13 +233,16 @@ export function compactionOf(part: SessionV1.Part) {
   if (part.type === "tool") {
     if (part.state.status !== "completed") return undefined
     if (part.state.compactionGroup === undefined && part.state.time.compacted === undefined) return undefined
+    const manual = isManualToolCompaction(part)
+    const administrative = isCollapsedContextManagementReceipt(part)
     return {
       group: part.state.compactionGroup,
-      summary: part.state.compactionSummary,
+      summary: manual ? part.state.compactionSummary : contextManagementReceiptSummary(part),
       generation: Math.max(part.state.compactionGeneration ?? 1, 1),
-      // Native age-based pruning sets only `time.compacted`; it carries no
-      // group, so it renders as its own single-part run.
-      native: part.state.compactionGroup === undefined,
+      // `false` remains the manual-compaction signal used by overflow handling.
+      // Administrative receipts keep a distinct undefined state while their
+      // structured metadata supplies the projected summary.
+      native: administrative ? undefined : !manual,
     }
   }
   if (part.type === "text" || part.type === "reasoning" || part.type === "file") {
@@ -277,7 +322,7 @@ export function renderedChars(
       continue
     }
     if (!existing.group) {
-      total += compactedRenderedChars([part], existing.summary, existing.native)
+      total += compactedRenderedChars([part], existing.summary, existing.native === true)
       continue
     }
     const role = roleByMessage?.get(part.messageID) ?? inferredRole(part)
@@ -491,6 +536,8 @@ export function unsafeCompactionGroups(
 // or still in active use (the live request and the tail turns).
 export function eligibility(part: SessionV1.Part, context: MessageContext): Eligible | Ineligible {
   if (!isCanonicalPartID(part.id)) return { ok: false, reason: "has a malformed part id" }
+  if (isContextManagementReceipt(part))
+    return { ok: false, reason: "is a context-management receipt that collapses automatically after one request" }
   if (context.current) return { ok: false, reason: "belongs to the current assistant message" }
   if (context.live) return { ok: false, reason: "belongs to the live request or a tail turn still in use" }
   const existing = compactionOf(part)

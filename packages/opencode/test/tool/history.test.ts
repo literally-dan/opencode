@@ -1005,7 +1005,7 @@ describe("tool.compact_results", () => {
     }),
   )
 
-  it.instance("accepts 200 selector matches and rejects 201 before mutation", () =>
+  it.instance("enforces the 200-part limit after filtering unsafe selector matches", () =>
     Effect.gen(function* () {
       const { chat } = yield* seed()
       const sessions = yield* Session.Service
@@ -1051,15 +1051,28 @@ describe("tool.compact_results", () => {
         { summary: "test summary", select: { types: ["tool"] } },
         context(currentParts),
       )
+      currentParts = parts(202)
+      const group = crypto.randomUUID()
+      for (const part of currentParts.slice(-2)) {
+        if (part.type !== "tool" || part.state.status !== "completed") throw new Error("part shape changed")
+        part.state.compactionGroup = group
+        part.state.compactionSummary = "prior shared summary"
+        part.state.compactionGeneration = 1
+      }
+      const filtered = yield* def.execute(
+        { summary: "test summary", select: { types: ["tool"] } },
+        context(currentParts),
+      )
       currentParts = parts(201)
       const rejected = yield* def.execute(
         { summary: "test summary", select: { types: ["tool"] } },
         context(currentParts),
       )
       expect(accepted.metadata).toMatchObject({ compacted: 200 })
+      expect(filtered.metadata).toMatchObject({ compacted: 200, skipped: 0 })
       expect(rejected.metadata).toMatchObject({ compacted: 0 })
       expect(rejected.output).toContain("at most 200")
-      expect(writes).toBe(200)
+      expect(writes).toBe(400)
     }),
   )
 
@@ -1281,6 +1294,57 @@ describe("tool.compact_results", () => {
       const read = yield* session.findPart({ sessionID: chat.id, partID: readPart.id })
       expect(bash && isCompacted(bash)).toBe(true)
       expect(read && isCompacted(read)).toBe(false)
+    }),
+  )
+
+  it.instance("select keep_last counts only actionable matches", () =>
+    Effect.gen(function* () {
+      const { chat, bashPart, readPart } = yield* seed()
+      const session = yield* Session.Service
+      const messages = structuredClone(yield* session.messages({ sessionID: chat.id }))
+      const assistant = messages.find((message) => message.info.role === "assistant")
+      if (!assistant) throw new Error("seed shape changed")
+      const group = crypto.randomUUID()
+      const grouped = Array.from({ length: 2 }, () => {
+        const part = structuredClone(readPart)
+        if (part.type !== "tool" || part.state.status !== "completed") throw new Error("seed shape changed")
+        part.id = PartID.ascending()
+        part.callID = crypto.randomUUID()
+        part.state.compactionGroup = group
+        part.state.compactionSummary = "prior shared summary"
+        part.state.compactionGeneration = 1
+        return part
+      })
+      assistant.parts.push(...grouped)
+      const writes: string[] = []
+      const def = yield* CompactResultsTool.pipe(
+        Effect.provide(
+          Layer.mock(Session.Service, {
+            messages: () => Effect.succeed(messages),
+            updatePart: (part) =>
+              Effect.sync(() => {
+                writes.push(part.id)
+                return part
+              }),
+          }),
+        ),
+        Effect.flatMap(Tool.init),
+      )
+
+      const selected = yield* def.execute(
+        { summary: "test summary", select: { types: ["tool"], keep_last: 1 } },
+        withMessages(chat.id, messages),
+      )
+      const explicit = yield* def.execute(
+        { summary: "test summary", part_ids: [grouped[0].id] },
+        withMessages(chat.id, messages),
+      )
+
+      expect(selected.metadata).toMatchObject({ compacted: 1, skipped: 0 })
+      expect(writes).toEqual([bashPart.id])
+      expect(explicit.metadata).toMatchObject({ compacted: 0, skipped: 1 })
+      expect(explicit.output).toContain(grouped[0].id)
+      expect(explicit.output).toContain("select every physical member")
     }),
   )
 

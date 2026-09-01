@@ -10,6 +10,14 @@ import { SessionID, MessageID, PartID } from "../../src/session/schema"
 import { Question } from "../../src/question"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
+import {
+  compactionOf,
+  contextManagementReceiptKind,
+  contextManagementReceiptSummary,
+  eligibility,
+  isCollapsedContextManagementReceipt,
+  isFullContextManagementReceipt,
+} from "../../src/session/compaction-pruning"
 
 const sessionID = SessionID.make("session")
 const providerID = ProviderV2.ID.make("test")
@@ -812,6 +820,137 @@ describe("session.message-v2.toModelMessage", () => {
     ])
   })
 
+  test("projects collapsed context-management receipts from structured metadata", async () => {
+    const assistantID = MessageID.ascending()
+    const cases = [
+      {
+        tool: "list_context" as const,
+        metadata: { total: 12, compactable: 7, charsCompactable: 34_567 },
+        details: "total parts=12; compactable parts=7; estimated reclaimable characters=34567",
+      },
+      {
+        tool: "compact_results" as const,
+        metadata: { compacted: 4, skipped: 2, charsFreed: 12_345 },
+        details: "compacted parts=4; skipped parts=2; net characters freed=12345",
+      },
+      {
+        tool: "compact_bulk" as const,
+        metadata: { compacted: 9, skipped: 3, charsFreed: 98_765, summarizerCalls: 2 },
+        details: "compacted parts=9; skipped parts=3; net characters freed=98765; summarizer calls=2",
+      },
+    ]
+
+    for (const item of cases) {
+      const state: SessionV1.ToolStateCompleted = {
+        status: "completed",
+        input: { keep: "original input" },
+        output: `FULL_${item.tool}_OUTPUT`,
+        title: item.tool,
+        metadata: item.metadata,
+        time: { start: 0, end: 1, compacted: 2 },
+      }
+      const part = {
+        id: PartID.ascending(),
+        sessionID,
+        messageID: assistantID,
+        type: "tool",
+        tool: item.tool,
+        callID: `call-${item.tool}`,
+        state,
+      } satisfies SessionV1.ToolPart
+      const expected = `Context-management receipt ${part.id} (${item.tool}): ${item.details}. Use read_part with part_id="${part.id}" to recover the original full result.`
+      const input = [{ info: assistantInfo(assistantID, "m-user"), parts: [part] }]
+      const first = await MessageV2.toModelMessages(input, model)
+      const second = await MessageV2.toModelMessages(input, model)
+      const serialized = JSON.stringify(first)
+
+      expect(contextManagementReceiptSummary(part)).toBe(expected)
+      expect(first).toStrictEqual(second)
+      expect(serialized).toContain(item.details)
+      expect(serialized).toContain(part.id)
+      expect(serialized).toContain("read_part")
+      expect(serialized).toContain("original input")
+      expect(serialized).toContain(`call-${item.tool}`)
+      expect(serialized).not.toContain(`FULL_${item.tool}_OUTPUT`)
+      expect(state.output).toBe(`FULL_${item.tool}_OUTPUT`)
+    }
+  })
+
+  test("classifies receipts for automatic collapse without suppressing overflow handling", () => {
+    const state: SessionV1.ToolStateCompleted = {
+      status: "completed",
+      input: {},
+      output: "full inventory",
+      title: "inventory",
+      metadata: { total: 1, compactable: 0, charsCompactable: 0 },
+      time: { start: 0, end: 1, compacted: undefined },
+    }
+    const part = {
+      id: PartID.ascending(),
+      sessionID,
+      messageID: MessageID.ascending(),
+      type: "tool",
+      tool: "list_context",
+      callID: "call-list-context",
+      state,
+    } satisfies SessionV1.ToolPart
+
+    expect(contextManagementReceiptKind(part)).toBe("list_context")
+    expect(isFullContextManagementReceipt(part)).toBe(true)
+    expect(
+      eligibility(part, { role: "assistant", current: false, live: false }),
+    ).toStrictEqual({
+      ok: false,
+      reason: "is a context-management receipt that collapses automatically after one request",
+    })
+    state.time.compacted = 2
+    expect(isFullContextManagementReceipt(part)).toBe(false)
+    expect(isCollapsedContextManagementReceipt(part)).toBe(true)
+    expect(compactionOf(part)?.native).toBeUndefined()
+    const manuallyCompacted = [part].some((candidate) => compactionOf(candidate)?.native === false)
+    expect(manuallyCompacted).toBe(false)
+
+    const native = structuredClone(part)
+    native.tool = "bash"
+    expect(compactionOf(native)?.native).toBe(true)
+
+    const manual = structuredClone(native)
+    delete manual.state.time.compacted
+    manual.state.compactionGroup = "manual-group"
+    manual.state.compactionSummary = "manual summary"
+    expect(compactionOf(manual)?.native).toBe(false)
+  })
+
+  test("keeps a model-authored summary on a manually compacted context receipt", async () => {
+    const assistantID = MessageID.ascending()
+    const part: SessionV1.ToolPart = {
+      id: PartID.ascending(),
+      sessionID,
+      messageID: assistantID,
+      type: "tool",
+      tool: "compact_results",
+      callID: "call-manual-receipt",
+      state: {
+        status: "completed",
+        input: {},
+        output: "full manual receipt",
+        title: "manual receipt",
+        metadata: { compacted: 1, skipped: 0, charsFreed: 100 },
+        time: { start: 0, end: 1 },
+        compactionGroup: "manual-receipt-group",
+        compactionSummary: "model-authored receipt summary",
+        compactionGeneration: 1,
+      },
+    }
+
+    const serialized = JSON.stringify(
+      await MessageV2.toModelMessages([{ info: assistantInfo(assistantID, "m-user"), parts: [part] }], model),
+    )
+    expect(serialized).toContain("model-authored receipt summary")
+    expect(serialized).not.toContain("Context-management receipt")
+    expect(serialized).not.toContain("full manual receipt")
+  })
+
   test("replaces compacted assistant text with a covering summary block", async () => {
     const userID = "m-user"
     const assistantID = "m-assistant"
@@ -1259,7 +1398,7 @@ describe("session.message-v2.toModelMessage", () => {
     expect(serialized.split('"type":"tool-result"')).toHaveLength(3)
   })
 
-  test("preserves provider-executed tool replay despite stale compaction markers", async () => {
+  test("preserves provider-executed context tool replay despite stale compaction markers", async () => {
     const assistantID = "m-assistant"
     const input: SessionV1.WithParts[] = [
       {
@@ -1268,7 +1407,7 @@ describe("session.message-v2.toModelMessage", () => {
           {
             ...basePart(assistantID, "provider-tool"),
             type: "tool",
-            tool: "web_search",
+            tool: "list_context",
             callID: "provider-call",
             metadata: { providerExecuted: true, openai: { itemId: "provider-item" } },
             state: {
@@ -1276,8 +1415,8 @@ describe("session.message-v2.toModelMessage", () => {
               input: { query: "original provider query" },
               output: "original provider result",
               title: "",
-              metadata: {},
-              time: { start: 0, end: 1 },
+              metadata: { total: 10, compactable: 5, charsCompactable: 2_000 },
+              time: { start: 0, end: 1, compacted: 1 },
               compactionGroup: "stale-group",
               compactionGeneration: 1,
               compactionSummary: "must not replace provider state",

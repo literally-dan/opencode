@@ -292,6 +292,7 @@ function makeHttpNoLLMServer(input?: { mcpInstructions?: MCP.ServerInstructions[
 
 const it = testEffect(makeHttp())
 const finishOnlyCalls = { value: 0 }
+const cachePrefixRequests: LLM.StreamInput[] = []
 const askCleanupGates: Array<{
   started: Deferred.Deferred<void>
   finalizing: Deferred.Deferred<void>
@@ -310,6 +311,19 @@ const finishOnly = testEffect(
               usage: new Usage({ inputTokens: 1, outputTokens: 0, totalTokens: 1 }),
             }),
           )
+        },
+      }),
+    ),
+  }),
+)
+const cachePrefix = testEffect(
+  makePrompt({
+    llm: Layer.succeed(
+      LLM.Service,
+      LLM.Service.of({
+        stream: (input) => {
+          cachePrefixRequests.push(input)
+          return Stream.never
         },
       }),
     ),
@@ -1198,13 +1212,15 @@ askProviderFailure.instance("ask preserves structured provider stream failures",
   }),
 )
 
-it.instance("bounds context-pressure manifests and appends them after cacheable history", () =>
+it.instance("requires current inventory and ignores id-like strings from history", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig(providerCfg)
     const { prompt, sessions, chat } = yield* boot()
     const seeded = yield* seed(chat.id, { finish: "stop" })
-    // More candidates than the manifest will list, so its entry cap and its
-    // total size cap are both genuinely exercised rather than trivially met.
+    const foreignPartID = "prt_04c866191001ZOVMkrtXfsS5QE"
+    const foreignMessageID = "msg_04c863eb1001JckWhyFN4e592C"
+    // Enough candidates to exceed the pressure threshold while exercising the
+    // reminder's resistance to untrusted labels and id-like output text.
     for (let index = 0; index < 12; index++)
       yield* sessions.updatePart({
         id: PartID.ascending(),
@@ -1216,7 +1232,10 @@ it.instance("bounds context-pressure manifests and appends them after cacheable 
         state: {
           status: "completed",
           input: {},
-          output: "large settled output ".repeat(2_500),
+          output:
+            index === 0
+              ? `${"large settled output ".repeat(2_500)}\nforeign ${foreignPartID} message ${foreignMessageID}`
+              : "large settled output ".repeat(2_500),
           title: "done",
           metadata: {},
           time: { start: 1, end: 2 },
@@ -1234,10 +1253,142 @@ it.instance("bounds context-pressure manifests and appends them after cacheable 
     expect(reminder).toBeString()
     expect(reminder!.length).toBeLessThan(3_000)
     expect(reminder).not.toContain("UNTRUSTED_LABEL")
+    expect(reminder).toContain("calling `list_context` first")
+    expect(reminder).toContain("Use only `prt_…` ids returned by that current `list_context` call")
+    expect(reminder).not.toContain(foreignPartID)
+    expect(reminder).not.toContain(foreignMessageID)
+    expect(reminder).not.toMatch(/\n- prt_[A-Za-z0-9]+/)
     const messages = hit?.body.messages
     expect(Array.isArray(messages)).toBe(true)
     expect((messages as { role?: unknown }[]).at(-1)?.role).toBe("user")
     expect(strings((messages as unknown[]).at(-1)).some((value) => value.includes("<system-reminder>"))).toBe(true)
+    yield* Fiber.interrupt(fiber)
+  }),
+  { timeout: 15_000 },
+)
+
+cachePrefix.instance("limits caching before grouped receipts and a final-step instruction", () =>
+  Effect.gen(function* () {
+    cachePrefixRequests.splice(0)
+    const test = yield* TestInstance
+    yield* writeConfig(test.directory, {
+      ...cfg,
+      agent: { build: { steps: 1 } },
+    })
+    const { prompt, sessions, chat } = yield* boot()
+    const seeded = yield* seed(chat.id, { finish: "stop" })
+    yield* Effect.forEach(
+      ["context-call-1", "context-call-2"],
+      (callID) =>
+        sessions.updatePart({
+          id: PartID.ascending(),
+          messageID: seeded.assistant.id,
+          sessionID: chat.id,
+          type: "tool",
+          callID,
+          tool: "list_context",
+          state: {
+            status: "completed",
+            input: {},
+            output: `Context inventory from ${callID}`,
+            title: "Context inventory",
+            metadata: { total: 1, compactable: 1, charsCompactable: 1_000 },
+            time: { start: 1, end: 2 },
+          },
+        }),
+      { discard: true },
+    )
+    yield* user(chat.id, "inspect context")
+
+    const fiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+    yield* pollWithTimeout(
+      Effect.sync(() => (cachePrefixRequests.length >= 1 ? true : undefined)),
+      "cache-prefix request was not prepared",
+    )
+
+    expect(cachePrefixRequests).toHaveLength(1)
+    const receipts = (yield* sessions.messages({ sessionID: chat.id }))
+      .flatMap((message) => message.parts)
+      .filter((part): part is SessionV1.ToolPart => part.type === "tool" && part.tool === "list_context")
+    expect(receipts).toHaveLength(2)
+    expect(receipts.map((part) => part.state.status)).toEqual(["completed", "completed"])
+    expect(
+      receipts.map((part) => (part.state.status === "completed" ? part.state.time.compacted : undefined)),
+    ).toEqual([undefined, undefined])
+    const request = cachePrefixRequests[0]!
+    expect(request.cachePrefixLimit).toBeNumber()
+    const limit = request.cachePrefixLimit ?? -1
+    expect(limit).toBeLessThan(request.messages.length - 1)
+    const boundary = request.messages[limit]
+    expect(boundary?.role).toBe("assistant")
+    const callIDs =
+      boundary?.role === "assistant" && Array.isArray(boundary.content)
+        ? boundary.content.flatMap((part) => (part.type === "tool-call" ? [part.toolCallId] : []))
+        : []
+    expect(callIDs).toEqual(["context-call-1", "context-call-2"])
+    expect(request.messages.at(-1)?.role).toBe("assistant")
+    yield* Fiber.interrupt(fiber)
+  }),
+)
+
+cachePrefix.instance("limits caching before an unconsumed receipt and pressure reminder", () =>
+  Effect.gen(function* () {
+    cachePrefixRequests.splice(0)
+    const test = yield* TestInstance
+    yield* writeConfig(test.directory, cfg)
+    const { prompt, sessions, chat } = yield* boot()
+    const seeded = yield* seed(chat.id, { finish: "stop" })
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: seeded.assistant.id,
+      sessionID: chat.id,
+      type: "tool",
+      callID: "pressure-source",
+      tool: "read",
+      state: {
+        status: "completed",
+        input: {},
+        output: "settled output ".repeat(18_000),
+        title: "done",
+        metadata: {},
+        time: { start: 1, end: 2 },
+      },
+    })
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: seeded.assistant.id,
+      sessionID: chat.id,
+      type: "tool",
+      callID: "unconsumed-context",
+      tool: "list_context",
+      state: {
+        status: "completed",
+        input: {},
+        output: "Context inventory for interrupted request",
+        title: "Context inventory",
+        metadata: { total: 1, compactable: 1, charsCompactable: 100_000 },
+        time: { start: 1, end: 2 },
+      },
+    })
+    yield* user(chat.id, "continue")
+    const fiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+    yield* pollWithTimeout(
+      Effect.sync(() => (cachePrefixRequests.length >= 1 ? true : undefined)),
+      "cache-prefix request was not prepared",
+    )
+
+    expect(cachePrefixRequests).toHaveLength(1)
+    const request = cachePrefixRequests[0]!
+    expect(request.cachePrefixLimit).toBeNumber()
+    const limit = request.cachePrefixLimit ?? -1
+    expect(limit).toBeLessThan(request.messages.length - 1)
+    expect(request.messages.at(-1)?.role).toBe("user")
+    const boundary = request.messages[limit]
+    const callIDs =
+      boundary?.role === "assistant" && Array.isArray(boundary.content)
+        ? boundary.content.flatMap((part) => (part.type === "tool-call" ? [part.toolCallId] : []))
+        : []
+    expect(callIDs).toContain("unconsumed-context")
     yield* Fiber.interrupt(fiber)
   }),
 )
@@ -1473,6 +1624,120 @@ it.instance("does not repeat a reminder when no actionable compaction candidate 
     expect(hits).toHaveLength(4)
     expect(first).toContain("Before it gets critical")
     expect(repeated).toBeUndefined()
+  }),
+)
+
+it.instance("does not feed context-management receipts back into pressure reminders", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const { prompt, sessions, chat } = yield* boot()
+    const seeded = yield* seed(chat.id, { finish: "stop" })
+    const selected = yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: seeded.assistant.id,
+      sessionID: chat.id,
+      type: "tool",
+      callID: "feedback-selected",
+      tool: "read",
+      state: {
+        status: "completed",
+        input: {},
+        output: "selected output ".repeat(5_000),
+        title: "done",
+        metadata: {},
+        time: { start: 1, end: 2 },
+      },
+    })
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: seeded.assistant.id,
+      sessionID: chat.id,
+      type: "tool",
+      callID: "feedback-retained",
+      tool: "read",
+      state: {
+        status: "completed",
+        input: {},
+        output: "retained output ".repeat(12_000),
+        title: "done",
+        metadata: {},
+        time: { start: 1, end: 2 },
+      },
+    })
+    yield* user(chat.id, "x".repeat(50_000))
+    yield* llm.push(reply().tool("list_context", { compactable_only: true }).stop())
+    yield* llm.push(
+      reply()
+        .tool("compact_results", {
+          part_ids: [selected.id],
+          summary: "The selected output is no longer needed.",
+        })
+        .stop(),
+    )
+    yield* llm.push(reply().tool("glob", { pattern: "missing-feedback-loop-*" }).stop())
+    yield* llm.text("done")
+
+    const first = yield* prompt.loop({ sessionID: chat.id })
+    yield* sessions.updatePart({
+      id: PartID.ascending(),
+      messageID: first.info.id,
+      sessionID: chat.id,
+      type: "tool",
+      callID: "feedback-new-candidate",
+      tool: "read",
+      state: {
+        status: "completed",
+        input: {},
+        output: "new settled output ".repeat(5_000),
+        title: "done",
+        metadata: {},
+        time: { start: 1, end: 2 },
+      },
+    })
+    yield* user(chat.id, "continue with new evidence")
+    yield* llm.text("done again")
+    yield* prompt.loop({ sessionID: chat.id })
+
+    const hits = yield* llm.hits
+    expect(hits).toHaveLength(5)
+    const requests = hits.map((hit) => strings(hit.body))
+    const reminders = requests.map((values) => values.find((value) => value.includes("Context is ~")))
+    expect(reminders[0]).toContain("compact_results")
+    expect(reminders.slice(1, 4)).toEqual([undefined, undefined, undefined])
+    expect(reminders[4]).toContain("compact_results")
+
+    const fullInventory = requests[1]!.find((value) => value.includes("Context inventory for"))
+    expect(fullInventory).toBeString()
+    if (!fullInventory) return
+    expect(fullInventory).toContain(selected.id)
+    const inventorySummary = requests[2]!.find(
+      (value) => value.includes("Context-management receipt") && value.includes("(list_context)"),
+    )
+    expect(inventorySummary).toBeString()
+    if (!inventorySummary) return
+    expect(requests[2]).not.toContain(fullInventory)
+    expect(requests[2]!.some((value) => value.includes("Compacted 1 of 1 parts"))).toBe(true)
+    expect(requests[3]).toContain(inventorySummary)
+    expect(
+      requests[3]!.some(
+        (value) => value.includes("Context-management receipt") && value.includes("(compact_results)"),
+      ),
+    ).toBe(true)
+    expect(requests[3]!.some((value) => value.includes("Compacted 1 of 1 parts"))).toBe(false)
+
+    const stored = (yield* sessions.messages({ sessionID: chat.id })).flatMap((message) => message.parts)
+    const inventoryReceipt = stored.find(
+      (part): part is SessionV1.ToolPart => part.type === "tool" && part.tool === "list_context",
+    )
+    const compactionReceipt = stored.find(
+      (part): part is SessionV1.ToolPart => part.type === "tool" && part.tool === "compact_results",
+    )
+    expect(inventoryReceipt?.state.status === "completed" ? inventoryReceipt.state.output : undefined).toContain(
+      "Context inventory for",
+    )
+    expect(compactionReceipt?.state.status === "completed" ? compactionReceipt.state.output : undefined).toContain(
+      "Compacted 1 of 1 parts",
+    )
   }),
 )
 

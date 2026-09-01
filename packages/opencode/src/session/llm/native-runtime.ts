@@ -32,6 +32,7 @@ type StreamInput = {
   readonly auth: Auth.Info | undefined
   readonly llmClient: LLMClientShape
   readonly messages: ModelMessage[]
+  readonly cachePrefixLimit?: number
   readonly tools: Record<string, Tool>
   readonly toolChoice?: "auto" | "required" | "none"
   readonly temperature?: number
@@ -87,11 +88,18 @@ export function stream(input: StreamInput): StreamResult {
   // — if a field ever needs to differ between the two surfaces, the
   // translation belongs here, not split across both packages.
   const tools = nativeTools(input.tools, input)
+  const messages = ProviderTransform.message(
+    input.messages,
+    input.model,
+    input.providerOptions ?? {},
+    input.cachePrefixLimit,
+  )
   const request = LLMNative.request({
     model: input.model,
     apiKey: current.apiKey,
     baseURL: current.baseURL,
-    messages: ProviderTransform.message(input.messages, input.model, input.providerOptions ?? {}),
+    messages,
+    cachePrefixLimit: ProviderTransform.cachePrefixLimit(messages),
     toolChoice: input.toolChoice,
     temperature: input.temperature,
     topP: input.topP,

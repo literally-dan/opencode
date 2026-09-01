@@ -35,6 +35,9 @@ import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { Agent } from "@/agent/agent"
+import { ReadPartTool } from "@/tool/read_part"
+import { Truncate } from "@/tool/truncate"
 
 const summary = Layer.succeed(
   SessionSummary.Service,
@@ -133,6 +136,41 @@ function createAssistantMessage(sessionID: SessionID, parentID: MessageID, root:
       parentID,
       time: { created: Date.now() },
       finish: "end_turn",
+    }),
+  )
+}
+
+function createStepFinish(sessionID: SessionID, messageID: MessageID, reason = "stop") {
+  return SessionNs.Service.use((ssn) =>
+    ssn.updatePart({
+      id: PartID.ascending(),
+      messageID,
+      sessionID,
+      type: "step-finish",
+      reason,
+      cost: 0,
+      tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } },
+    }),
+  )
+}
+
+function createContextReceipt(sessionID: SessionID, messageID: MessageID, output: string) {
+  return SessionNs.Service.use((ssn) =>
+    ssn.updatePart({
+      id: PartID.ascending(),
+      messageID,
+      sessionID,
+      type: "tool",
+      callID: `call-list-context-${output.length}`,
+      tool: "list_context",
+      state: {
+        status: "completed",
+        input: { compactable_only: false, limit: 80 },
+        output,
+        title: "12 parts, 7 compactable",
+        metadata: { total: 12, compactable: 7, charsCompactable: 34_567 },
+        time: { start: 1, end: 2 },
+      },
     }),
   )
 }
@@ -254,6 +292,7 @@ type CompactionProcessOptions = {
   plugin?: Layer.Layer<Plugin.Service>
   provider?: ReturnType<typeof wide>
   config?: Layer.Layer<Config.Service>
+  session?: Layer.Layer<SessionNs.Service>
 }
 
 function withCompaction(options?: CompactionProcessOptions) {
@@ -265,6 +304,7 @@ function compactionProcessLayer(options?: CompactionProcessOptions) {
     [Provider.node, (options?.provider ?? wide()).layer],
     [RuntimeFlags.node, RuntimeFlags.layer({ experimentalEventSystem: true })],
     [SessionSummary.node, summary],
+    ...(options?.session ? ([[SessionNs.node, options.session]] as const) : []),
   ]
   if (options?.result) {
     return AppNodeBuilder.build(compactionTestNode, [
@@ -718,7 +758,284 @@ describe("session.compaction.create", () => {
   )
 })
 
+describe("session.compaction.receipts", () => {
+  it.instance(
+    "shows a receipt in full once, then collapses it once without losing recovery data",
+    Effect.gen(function* () {
+      const compact = yield* SessionCompaction.Service
+      const events = yield* EventV2Bridge.Service
+      const ssn = yield* SessionNs.Service
+      const test = yield* TestInstance
+      const session = yield* ssn.create({})
+      const user = yield* createUserMessage(session.id, "inspect context")
+      const assistant = yield* createAssistantMessage(session.id, user.id, test.directory)
+      const receipt = yield* createContextReceipt(session.id, assistant.id, "FULL_CONTEXT_INVENTORY")
+      // The step that requested the tool did not consume its result.
+      yield* createStepFinish(session.id, assistant.id, "tool-calls")
+      let writes = 0
+      const unsub = yield* events.listen((event) => {
+        if (event.type !== SessionV1.Event.PartUpdated.type) return Effect.void
+        if ((event.data as typeof SessionV1.Event.PartUpdated.data.Type).part.id === receipt.id) writes++
+        return Effect.void
+      })
+      yield* Effect.addFinalizer(() => unsub)
+
+      const full = yield* compact.collapseReceipts({ sessionID: session.id })
+      const fullProjection = JSON.stringify(yield* MessageV2.toModelMessagesEffect(full, defaultProvider.model))
+      expect(fullProjection).toContain("FULL_CONTEXT_INVENTORY")
+      expect(writes).toBe(0)
+
+      const nextUser = yield* createUserMessage(session.id, "continue")
+      const shell = yield* createAssistantMessage(session.id, nextUser.id, test.directory)
+      const preStream = yield* compact.collapseReceipts({ sessionID: session.id })
+      const preStreamProjection = JSON.stringify(yield* MessageV2.toModelMessagesEffect(preStream, defaultProvider.model))
+      expect(preStreamProjection).toContain("FULL_CONTEXT_INVENTORY")
+      expect(writes).toBe(0)
+
+      yield* createStepFinish(session.id, shell.id)
+      const bounded = yield* compact.collapseReceipts({ sessionID: session.id })
+      const firstProjection = JSON.stringify(yield* MessageV2.toModelMessagesEffect(bounded, defaultProvider.model))
+      expect(firstProjection).not.toContain("FULL_CONTEXT_INVENTORY")
+      expect(firstProjection).toContain("total parts=12; compactable parts=7; estimated reclaimable characters=34567")
+      expect(firstProjection).toContain(receipt.id)
+      expect(writes).toBe(1)
+
+      const repeated = yield* compact.collapseReceipts({ sessionID: session.id })
+      const repeatedProjection = JSON.stringify(yield* MessageV2.toModelMessagesEffect(repeated, defaultProvider.model))
+      expect(repeatedProjection).toBe(firstProjection)
+      expect(writes).toBe(1)
+
+      const stored = yield* ssn.findPart({ sessionID: session.id, partID: receipt.id })
+      expect(stored).toMatchObject({
+        type: "tool",
+        callID: "call-list-context-22",
+        tool: "list_context",
+        state: {
+          status: "completed",
+          input: { compactable_only: false, limit: 80 },
+          output: "FULL_CONTEXT_INVENTORY",
+          metadata: { total: 12, compactable: 7, charsCompactable: 34_567 },
+          time: { compacted: expect.any(Number) },
+        },
+      })
+      expect(stored?.type === "tool" && stored.state.status === "completed" && stored.state.compactionGroup).toBeUndefined()
+      expect(stored?.type === "tool" && stored.state.status === "completed" && stored.state.compactionSummary).toBeUndefined()
+      expect(stored?.type === "tool" && stored.state.status === "completed" && stored.state.compactionGeneration).toBeUndefined()
+
+      const readPart = yield* ReadPartTool.pipe(
+        Effect.provide(
+          Layer.merge(
+            Layer.mock(Agent.Service, {
+              get: () => Effect.succeed({ name: "build", mode: "primary", permission: [], options: {} }),
+            }),
+            Layer.mock(Truncate.Service, {
+              output: (text) => Effect.succeed({ content: text, truncated: false }),
+            }),
+          ),
+        ),
+        Effect.map((info) => info.init()),
+        Effect.flatten,
+      )
+      const recovered = yield* readPart.execute(
+        { part_id: receipt.id },
+        {
+          sessionID: session.id,
+          messageID: nextUser.id,
+          agent: "build",
+          abort: new AbortController().signal,
+          messages: repeated,
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        },
+      )
+      expect(recovered.output).toContain("FULL_CONTEXT_INVENTORY")
+      expect(recovered.output).toContain('"compactable_only": false')
+    }),
+  )
+
+  it.instance(
+    "keeps receipts full after crashed or cancelled assistant shells",
+    Effect.gen(function* () {
+      const compact = yield* SessionCompaction.Service
+      const ssn = yield* SessionNs.Service
+      const test = yield* TestInstance
+      const failures = [
+        new SessionV1.APIError({ message: "provider stream crashed", isRetryable: false }).toObject(),
+        new SessionV1.AbortedError({ message: "cancelled" }).toObject(),
+      ]
+
+      for (const [index, error] of failures.entries()) {
+        const session = yield* ssn.create({})
+        const user = yield* createUserMessage(session.id, `inspect context ${index}`)
+        const assistant = yield* createAssistantMessage(session.id, user.id, test.directory)
+        const receipt = yield* createContextReceipt(session.id, assistant.id, `FULL_FAILURE_RECEIPT_${index}`)
+        yield* createStepFinish(session.id, assistant.id, "tool-calls")
+        const nextUser = yield* createUserMessage(session.id, `continue ${index}`)
+        const shell = yield* createAssistantMessage(session.id, nextUser.id, test.directory)
+        yield* ssn.updateMessage({
+          ...shell,
+          finish: "error",
+          error,
+          time: { ...shell.time, completed: Date.now() },
+        })
+
+        const projected = yield* compact.collapseReceipts({ sessionID: session.id })
+        const serialized = JSON.stringify(yield* MessageV2.toModelMessagesEffect(projected, defaultProvider.model))
+        const stored = yield* ssn.findPart({ sessionID: session.id, partID: receipt.id })
+        expect(serialized).toContain(`FULL_FAILURE_RECEIPT_${index}`)
+        expect(
+          stored?.type === "tool" && stored.state.status === "completed" && stored.state.time.compacted,
+        ).toBeUndefined()
+      }
+    }),
+  )
+
+  itCompaction.instance(
+    "retries only the unmarked receipt after a partial write failure",
+    Effect.gen(function* () {
+      const ssn = yield* SessionNs.Service
+      const test = yield* TestInstance
+      const session = yield* ssn.create({})
+      const user = yield* createUserMessage(session.id, "inspect context")
+      const assistant = yield* createAssistantMessage(session.id, user.id, test.directory)
+      const first = yield* createContextReceipt(session.id, assistant.id, "FIRST_RECEIPT")
+      const second = yield* createContextReceipt(session.id, assistant.id, "SECOND_RECEIPT")
+      yield* createStepFinish(session.id, assistant.id, "tool-calls")
+      const nextUser = yield* createUserMessage(session.id, "continue")
+      const completed = yield* createAssistantMessage(session.id, nextUser.id, test.directory)
+      yield* createStepFinish(session.id, completed.id)
+
+      let writes = 0
+      let fail = true
+      const updatePart: SessionNs.Interface["updatePart"] = (part) =>
+        Effect.gen(function* () {
+          writes++
+          if (fail && writes === 2) return yield* Effect.die(new Error("injected receipt write failure"))
+          return yield* ssn.updatePart(part)
+        })
+      const sessionLayer = Layer.mock(SessionNs.Service, {
+        messages: (input) => ssn.messages(input),
+        updatePart,
+      })
+
+      yield* Effect.gen(function* () {
+        const compact = yield* SessionCompaction.Service
+        const failed = yield* Effect.exit(compact.collapseReceipts({ sessionID: session.id }))
+        expect(Exit.isFailure(failed)).toBe(true)
+        expect(writes).toBe(2)
+
+        const firstAfterFailure = yield* ssn.findPart({ sessionID: session.id, partID: first.id })
+        const secondAfterFailure = yield* ssn.findPart({ sessionID: session.id, partID: second.id })
+        const firstMarker =
+          firstAfterFailure?.type === "tool" && firstAfterFailure.state.status === "completed"
+            ? firstAfterFailure.state.time.compacted
+            : undefined
+        expect(firstMarker).toBeNumber()
+        expect(
+          secondAfterFailure?.type === "tool" &&
+            secondAfterFailure.state.status === "completed" &&
+            secondAfterFailure.state.time.compacted,
+        ).toBeUndefined()
+
+        fail = false
+        const retried = yield* compact.collapseReceipts({ sessionID: session.id })
+        const retriedProjection = JSON.stringify(yield* MessageV2.toModelMessagesEffect(retried, defaultProvider.model))
+        expect(writes).toBe(3)
+        expect(retriedProjection).not.toContain("FIRST_RECEIPT")
+        expect(retriedProjection).not.toContain("SECOND_RECEIPT")
+
+        const firstAfterRetry = yield* ssn.findPart({ sessionID: session.id, partID: first.id })
+        const secondAfterRetry = yield* ssn.findPart({ sessionID: session.id, partID: second.id })
+        expect(
+          firstAfterRetry?.type === "tool" &&
+            firstAfterRetry.state.status === "completed" &&
+            firstAfterRetry.state.time.compacted,
+        ).toBe(firstMarker)
+        expect(
+          secondAfterRetry?.type === "tool" &&
+            secondAfterRetry.state.status === "completed" &&
+            secondAfterRetry.state.time.compacted,
+        ).toBeNumber()
+
+        const repeated = yield* compact.collapseReceipts({ sessionID: session.id })
+        expect(JSON.stringify(yield* MessageV2.toModelMessagesEffect(repeated, defaultProvider.model))).toBe(
+          retriedProjection,
+        )
+        expect(writes).toBe(3)
+      }).pipe(withCompaction({ session: sessionLayer }))
+    }),
+  )
+})
+
 describe("session.compaction.prune", () => {
+  it.live(
+    "continues native pruning past a collapsed context-management receipt",
+    provideTmpdirInstance(
+      (dir) =>
+        Effect.gen(function* () {
+          const compact = yield* SessionCompaction.Service
+          const ssn = yield* SessionNs.Service
+          const session = yield* ssn.create({})
+          const user = yield* createUserMessage(session.id, "first")
+          const assistant = yield* createAssistantMessage(session.id, user.id, dir)
+          const old = yield* ssn.updatePart({
+            id: PartID.ascending(),
+            messageID: assistant.id,
+            sessionID: session.id,
+            type: "tool",
+            callID: "old-output-before-receipt",
+            tool: "bash",
+            state: {
+              status: "completed",
+              input: {},
+              output: "x".repeat(300_000),
+              title: "old output",
+              metadata: {},
+              time: { start: 1, end: 2 },
+            },
+          })
+          const marker = 123
+          const receipt = yield* ssn.updatePart({
+            id: PartID.ascending(),
+            messageID: assistant.id,
+            sessionID: session.id,
+            type: "tool",
+            callID: "collapsed-receipt",
+            tool: "list_context",
+            state: {
+              status: "completed",
+              input: {},
+              output: "full inventory remains durable",
+              title: "inventory",
+              metadata: { total: 2, compactable: 1, charsCompactable: 100_000 },
+              time: { start: 3, end: 4, compacted: marker },
+            },
+          })
+          yield* createUserMessage(session.id, "second")
+          yield* createUserMessage(session.id, "third")
+
+          yield* compact.prune({ sessionID: session.id })
+
+          const storedOld = yield* ssn.findPart({ sessionID: session.id, partID: old.id })
+          const storedReceipt = yield* ssn.findPart({ sessionID: session.id, partID: receipt.id })
+          expect(
+            storedOld?.type === "tool" &&
+              storedOld.state.status === "completed" &&
+              storedOld.state.time.compacted,
+          ).toBeNumber()
+          expect(
+            storedReceipt?.type === "tool" &&
+              storedReceipt.state.status === "completed" &&
+              storedReceipt.state.time.compacted,
+          ).toBe(marker)
+          expect(
+            storedReceipt?.type === "tool" && storedReceipt.state.status === "completed" && storedReceipt.state.output,
+          ).toBe("full inventory remains durable")
+        }),
+      { config: { compaction: { prune: true } } },
+    ),
+  )
+
   it.live(
     "reloads after overlapping manual compaction before pruning",
     provideTmpdirInstance(

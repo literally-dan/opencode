@@ -58,9 +58,6 @@ const markLastSystem = (system: LLMRequest["system"], hint: CacheHint): LLMReque
   return system.map((part, i) => (i === last ? { ...part, cache: hint } : part))
 }
 
-const lastIndexOfRole = (messages: ReadonlyArray<Message>, role: Message["role"]): number =>
-  messages.findLastIndex((m) => m.role === role)
-
 // Mark the last text part of `messages[index]`. If no text part exists, mark
 // the last content part regardless of type — that's the breakpoint position
 // in tool-result-only messages too.
@@ -88,11 +85,23 @@ const markMessages = (
   hint: CacheHint,
 ): ReadonlyArray<Message> => {
   if (messages.length === 0) return messages
-  if (strategy === "latest-user-message") return markMessageAt(messages, lastIndexOfRole(messages, "user"), hint)
-  if (strategy === "latest-assistant") return markMessageAt(messages, lastIndexOfRole(messages, "assistant"), hint)
-  const start = Math.max(0, messages.length - strategy.tail)
+  const excluded = messages.findIndex((message) => message.cacheable === false)
+  const end = excluded === -1 ? messages.length : excluded
+  if (strategy === "latest-user-message")
+    return markMessageAt(
+      messages,
+      messages.findLastIndex((message, index) => index < end && message.role === "user"),
+      hint,
+    )
+  if (strategy === "latest-assistant")
+    return markMessageAt(
+      messages,
+      messages.findLastIndex((message, index) => index < end && message.role === "assistant"),
+      hint,
+    )
+  const start = Math.max(0, end - strategy.tail)
   let next = messages
-  for (let i = start; i < messages.length; i++) next = markMessageAt(next, i, hint)
+  for (let i = start; i < end; i++) next = markMessageAt(next, i, hint)
   return next
 }
 

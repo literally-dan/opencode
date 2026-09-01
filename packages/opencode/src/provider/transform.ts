@@ -22,6 +22,21 @@ export const OUTPUT_TOKEN_MAX = 32_000
 // branch that requests it stays in lockstep.
 const INCLUDE_ENCRYPTED_REASONING = ["reasoning.encrypted_content"] as const
 
+const CACHE_PREFIX_EXCLUDED = Symbol("cache-prefix-excluded")
+
+const excludeCacheSuffix = (msgs: ModelMessage[], limit: number | undefined) => {
+  if (limit === undefined) return msgs
+  const end = Math.max(0, Math.min(Math.trunc(limit), msgs.length))
+  return msgs.map<ModelMessage>((msg, index) =>
+    index < end ? msg : Object.assign({}, msg, { [CACHE_PREFIX_EXCLUDED]: true }),
+  )
+}
+
+export function cachePrefixLimit(msgs: ModelMessage[]) {
+  const index = msgs.findIndex((msg) => Reflect.get(msg, CACHE_PREFIX_EXCLUDED) === true)
+  return index === -1 ? undefined : index
+}
+
 export function sanitizeSurrogates(content: string) {
   return content.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, "\uFFFD")
 }
@@ -357,8 +372,10 @@ function normalizeMessages(
 }
 
 function applyCaching(msgs: ModelMessage[], model: Provider.Model): ModelMessage[] {
-  const system = msgs.filter((msg) => msg.role === "system").slice(0, 2)
-  const final = msgs.filter((msg) => msg.role !== "system").slice(-2)
+  const limit = cachePrefixLimit(msgs)
+  const eligible = limit === undefined ? msgs : msgs.slice(0, limit)
+  const system = eligible.filter((msg) => msg.role === "system").slice(0, 2)
+  const final = eligible.filter((msg) => msg.role !== "system").slice(-2)
 
   const providerOptions = {
     anthropic: {
@@ -463,7 +480,13 @@ function mapProviderOptions(
   })
 }
 
-export function message(msgs: ModelMessage[], model: Provider.Model, options: Record<string, unknown>) {
+export function message(
+  msgs: ModelMessage[],
+  model: Provider.Model,
+  options: Record<string, unknown>,
+  cachePrefixLimit?: number,
+) {
+  msgs = excludeCacheSuffix(msgs, cachePrefixLimit)
   msgs = unsupportedParts(msgs, model)
   msgs = normalizeMessages(msgs, model, options)
   const usesAnthropicAutomaticCaching =

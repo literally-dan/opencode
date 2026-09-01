@@ -32,6 +32,9 @@ import { SessionCompactionEvent } from "@opencode-ai/schema/session-compaction-e
 import {
   compactionInput,
   compactionOf,
+  hasDurableProviderCompletion,
+  isContextManagementReceipt,
+  isFullContextManagementReceipt,
   isManualToolCompaction,
   projectionChannel,
   projectionChannelKey,
@@ -242,6 +245,7 @@ export interface Interface {
     tokens: SessionV1.Assistant["tokens"]
     model: Provider.Model
   }) => Effect.Effect<boolean>
+  readonly collapseReceipts: (input: { sessionID: SessionID }) => Effect.Effect<SessionV1.WithParts[]>
   readonly prune: (input: { sessionID: SessionID }) => Effect.Effect<void>
   readonly process: (input: {
     parentID: MessageID
@@ -365,6 +369,32 @@ const layer = Layer.effect(
       }
     })
 
+    const collapseReceipts = Effect.fn("SessionCompaction.collapseReceipts")(function* (input: {
+      sessionID: SessionID
+    }) {
+      return yield* withCompactionLock(
+        input.sessionID,
+        undefined,
+        Effect.gen(function* () {
+          const messages = yield* session.messages({ sessionID: input.sessionID }).pipe(Effect.orDie)
+          const compacted = Date.now()
+          const completed = messages.findLastIndex(hasDurableProviderCompletion)
+          const receipts = messages.flatMap((message, index) =>
+            index < completed ? message.parts.filter(isFullContextManagementReceipt) : [],
+          )
+          for (const part of receipts) {
+            const next = structuredClone(part)
+            next.state.time.compacted = compacted
+            yield* session.updatePart(next)
+          }
+          const projected = receipts.length
+            ? yield* session.messages({ sessionID: input.sessionID }).pipe(Effect.orDie)
+            : messages
+          return MessageV2.filterCompacted(projected.toReversed())
+        }),
+      )
+    })
+
     // goes backwards through parts until there are PRUNE_PROTECT tokens worth of tool
     // calls, then erases output of older tool calls to free context space
     const prune = Effect.fn("SessionCompaction.prune")(function* (input: { sessionID: SessionID }) {
@@ -404,6 +434,7 @@ const layer = Layer.effect(
               if (part.state.status !== "completed") continue
               if (PRUNE_PROTECTED_TOOLS.includes(part.tool)) continue
               if (isManualToolCompaction(part)) continue
+              if (isContextManagementReceipt(part)) continue
               if (part.state.time.compacted !== undefined) break loop
               const cached = projections.get(msg.info.id)
               const original = cached ?? (yield* projection({ messages: [msg], model }))
@@ -870,6 +901,7 @@ const layer = Layer.effect(
     return Service.of({
       checkOverflow: overflowStatus,
       isOverflow,
+      collapseReceipts,
       prune,
       process: processCompaction,
       create,

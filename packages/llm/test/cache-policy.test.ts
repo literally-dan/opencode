@@ -251,6 +251,134 @@ describe("applyCachePolicy", () => {
     }),
   )
 
+  it.effect("Anthropic automatic message markers stop at the first excluded message", () =>
+    Effect.gen(function* () {
+      const stable = yield* LLMClient.prepare(
+        LLM.request({
+          model: anthropicModel,
+          messages: [Message.user("stable user"), Message.assistant("stable assistant")],
+          cache: "auto",
+        }),
+      )
+      const limited = yield* LLMClient.prepare(
+        LLM.request({
+          model: anthropicModel,
+          messages: [
+            Message.user("stable user"),
+            Message.assistant("stable assistant"),
+            Message.make({ role: "assistant", content: "full receipt", cacheable: false }),
+            Message.make({ role: "user", content: "pressure reminder", cacheable: false }),
+          ],
+          cache: "auto",
+        }),
+      )
+      const stableMessages = (stable.body as { messages: unknown[] }).messages
+      const limitedMessages = (limited.body as { messages: unknown[] }).messages
+
+      expect(limitedMessages.slice(0, stableMessages.length)).toEqual(stableMessages)
+      expect(JSON.stringify(limitedMessages.slice(stableMessages.length))).not.toContain("cache_control")
+    }),
+  )
+
+  it.effect("Bedrock automatic message markers stop at the first excluded message", () =>
+    Effect.gen(function* () {
+      const stable = yield* LLMClient.prepare(
+        LLM.request({
+          model: bedrockModel,
+          messages: [Message.user("stable user"), Message.assistant("stable assistant")],
+          cache: "auto",
+        }),
+      )
+      const limited = yield* LLMClient.prepare(
+        LLM.request({
+          model: bedrockModel,
+          messages: [
+            Message.user("stable user"),
+            Message.assistant("stable assistant"),
+            Message.make({ role: "assistant", content: "full receipt", cacheable: false }),
+            Message.make({ role: "user", content: "pressure reminder", cacheable: false }),
+          ],
+          cache: "auto",
+        }),
+      )
+      const stableMessages = (stable.body as { messages: unknown[] }).messages
+      const limitedMessages = (limited.body as { messages: unknown[] }).messages
+
+      expect(limitedMessages.slice(0, stableMessages.length)).toEqual(stableMessages)
+      expect(JSON.stringify(limitedMessages.slice(stableMessages.length))).not.toContain("cachePoint")
+    }),
+  )
+
+  it.effect("manual hints remain authoritative after the automatic prefix", () =>
+    Effect.gen(function* () {
+      const prepared = yield* LLMClient.prepare(
+        LLM.request({
+          model: anthropicModel,
+          messages: [
+            Message.user("stable user"),
+            Message.assistant("stable assistant"),
+            Message.make({
+              role: "user",
+              cacheable: false,
+              content: {
+                type: "text",
+                text: "full receipt",
+                cache: new CacheHint({ type: "ephemeral", ttlSeconds: 3600 }),
+              },
+            }),
+            Message.make({ role: "assistant", content: "volatile suffix", cacheable: false }),
+          ],
+          cache: "auto",
+        }),
+      )
+      const messages = (prepared.body as { messages: Array<{ content: Array<{ cache_control?: unknown }> }> }).messages
+
+      expect(messages[0]?.content[0]?.cache_control).toEqual({ type: "ephemeral" })
+      expect(messages[2]?.content[0]?.cache_control).toEqual({ type: "ephemeral", ttl: "1h" })
+      expect(messages[3]?.content[0]?.cache_control).toBeUndefined()
+    }),
+  )
+
+  it.effect("provider bodies do not serialize internal cache eligibility", () =>
+    Effect.gen(function* () {
+      const bodies = [
+        (yield* LLMClient.prepare(
+          LLM.request({
+            model: anthropicModel,
+            messages: [Message.make({ role: "user", content: "volatile", cacheable: false })],
+            cache: "none",
+          }),
+        )).body,
+        (yield* LLMClient.prepare(
+          LLM.request({
+            model: bedrockModel,
+            messages: [Message.make({ role: "user", content: "volatile", cacheable: false })],
+            cache: "none",
+          }),
+        )).body,
+        (yield* LLMClient.prepare(
+          LLM.request({
+            model: openaiModel,
+            messages: [Message.make({ role: "user", content: "volatile", cacheable: false })],
+            cache: "none",
+          }),
+        )).body,
+        (yield* LLMClient.prepare(
+          LLM.request({
+            model: geminiModel,
+            messages: [Message.make({ role: "user", content: "volatile", cacheable: false })],
+            cache: "none",
+          }),
+        )).body,
+      ]
+
+      for (const body of bodies) {
+        expect(JSON.stringify(body)).toContain("volatile")
+        expect(JSON.stringify(body)).not.toContain("cacheable")
+      }
+    }),
+  )
+
   test("returns the same request reference when policy is a no-op (pure function)", () => {
     const request = LLM.request({
       model: anthropicModel,

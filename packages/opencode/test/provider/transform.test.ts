@@ -3030,6 +3030,61 @@ describe("ProviderTransform.message - bedrock caching with non-bedrock providerI
   })
 })
 
+describe("ProviderTransform.message - cache prefix limit", () => {
+  const createModel = (target: "anthropic" | "bedrock") =>
+    ({
+      id: target === "anthropic" ? "anthropic/claude-sonnet-4" : "amazon-bedrock/anthropic.claude-sonnet-4",
+      providerID: target === "anthropic" ? "anthropic" : "amazon-bedrock",
+      api: {
+        id: target === "anthropic" ? "claude-sonnet-4" : "anthropic.claude-sonnet-4",
+        url: "https://api.test.com",
+        npm: target === "anthropic" ? "@ai-sdk/anthropic" : "@ai-sdk/amazon-bedrock",
+      },
+      name: "Claude Sonnet 4",
+      capabilities: {},
+      options: {},
+      headers: {},
+    }) as any
+
+  const history = () =>
+    [
+      { role: "system", content: "System" },
+      { role: "user", content: "Stable user" },
+      { role: "assistant", content: "Stable assistant" },
+      { role: "assistant", content: "Full context receipt" },
+      { role: "user", content: "Pressure reminder" },
+    ] as any[]
+
+  for (const target of ["anthropic", "bedrock"] as const) {
+    test(`${target} selects automatic markers only from the stable prefix`, () => {
+      const model = createModel(target)
+      const stable = ProviderTransform.message(history().slice(0, 3), model, {}) as any[]
+      const limited = ProviderTransform.message(history(), model, {}, 3) as any[]
+
+      expect(limited.slice(0, 3)).toEqual(stable)
+      expect(JSON.stringify(limited.slice(3))).not.toContain("cacheControl")
+      expect(JSON.stringify(limited.slice(3))).not.toContain("cachePoint")
+    })
+  }
+
+  test("filtered stable messages do not shift the exclusion boundary", () => {
+    const result = ProviderTransform.message(
+      [
+        { role: "system", content: "System" },
+        { role: "assistant", content: "" },
+        { role: "user", content: "Full context receipt" },
+      ] as any[],
+      createModel("anthropic"),
+      {},
+      2,
+    ) as any[]
+
+    expect(result).toHaveLength(2)
+    expect(ProviderTransform.cachePrefixLimit(result)).toBe(1)
+    expect(result[1].providerOptions).toBeUndefined()
+  })
+})
+
 describe("ProviderTransform.message - cache control on gateway", () => {
   const createModel = (overrides: Partial<any> = {}) =>
     ({

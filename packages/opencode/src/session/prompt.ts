@@ -11,10 +11,17 @@ import { Agent } from "../agent/agent"
 import { Provider } from "@/provider/provider"
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { estimateRequest, REQUEST_REMINDER_HEADROOM, usable } from "./overflow"
-import { COMPACTION_PLANNING_SUMMARY, compactionInventory, compactionOf, compactionSavings } from "./compaction-pruning"
+import {
+  COMPACTION_PLANNING_SUMMARY,
+  compactionInventory,
+  compactionOf,
+  compactionSavings,
+  contextManagementReceiptKind,
+  isFullContextManagementReceipt,
+} from "./compaction-pruning"
 import { Superseded } from "./superseded"
 
-import { type Tool as AITool, tool, jsonSchema } from "ai"
+import { type ModelMessage, type Tool as AITool, tool, jsonSchema } from "ai"
 import type { JSONSchema7 } from "@ai-sdk/provider"
 import { SessionCompaction } from "./compaction"
 import { SystemPrompt } from "./system"
@@ -103,6 +110,39 @@ function isOrphanedInterruptedTool(part: SessionV1.ToolPart) {
   return part.state.status === "error" && part.state.metadata?.interrupted === true
 }
 
+function successfulContextCompaction(message: SessionV1.WithParts | undefined) {
+  return (
+    message?.parts.some((part) => {
+      if (!isFullContextManagementReceipt(part)) return false
+      const kind = contextManagementReceiptKind(part)
+      if (kind !== "compact_results" && kind !== "compact_bulk") return false
+      const charsFreed: unknown = part.state.metadata.charsFreed
+      return typeof charsFreed === "number" && charsFreed > 0
+    }) ?? false
+  )
+}
+
+function stableCachePrefixLimit(input: {
+  messages: SessionV1.WithParts[]
+  modelMessages: ModelMessage[]
+  ephemeralSuffix: boolean
+}) {
+  const receipt = input.messages.findLast(
+    (message) => message.info.role === "assistant" && message.parts.some(isFullContextManagementReceipt),
+  )
+  if (!receipt) return input.ephemeralSuffix ? input.modelMessages.length : undefined
+  const callIDs = new Set(receipt.parts.filter(isFullContextManagementReceipt).map((part) => part.callID))
+  const limit = input.modelMessages.findIndex(
+    (message) =>
+      message.role === "assistant" &&
+      Array.isArray(message.content) &&
+      message.content.some((part) => part.type === "tool-call" && callIDs.has(part.toolCallId)),
+  )
+  // Missing tool-call history is malformed, but caching no message history is
+  // safer than writing a one-use prefix through the volatile receipt.
+  return limit < 0 ? 0 : limit
+}
+
 // Two-stage context-pressure nudge. Native overflow compaction (whole-history
 // summarization) takes over at 100% of the usable budget and discards detail
 // wholesale, so we want the model to run a cheaper, surgical `compact_results`
@@ -122,8 +162,7 @@ const CONTEXT_PRESSURE_TARGET = 0.45
 const COMPACTION_MIN_RECLAIM_CHARS = 8_000
 
 // Context-pressure nudge: once usage crosses CONTEXT_PRESSURE_SOFT of the usable
-// window, remind the model to reclaim space with `compact_results`, listing the
-// heaviest compactable parts by id (or pointing at a `select` sweep). Returns a
+  // window, remind the model to inspect a fresh inventory before compacting. Returns a
 // candidate fingerprint alongside the text so the caller can dedupe across
 // completed runs. Suppressed when compaction is disabled.
 // What the request about to be sent actually costs, rather than what the last
@@ -169,10 +208,7 @@ function contextPressureReminder(input: {
   if (budget <= 0) return undefined
   const pct = input.used / budget
   if (pct < CONTEXT_PRESSURE_SOFT) return undefined
-  // The model only sees a part's `prt_…` id once it has been compacted, so a
-  // bare nudge isn't actionable on live context. List the heaviest still-live
-  // compactable parts with their ids so the model has something to pass.
-  const candidates = compactionManifest(input.messages, input.durableMessages, input.currentMessageID)
+  const candidates = compactionCandidates(input.messages, input.durableMessages, input.currentMessageID)
   const urgent = pct >= CONTEXT_PRESSURE_HARD
   // Nothing fresh worth reclaiming. Normally that means going quiet rather than
   // nagging about content that would cost more to re-fold than it frees — but
@@ -191,7 +227,6 @@ function contextPressureReminder(input: {
       ].join("\n"),
     }
   }
-  const manifest = candidates.entries
   // Ask for the whole gap down to the target, not just enough to clear the
   // threshold, so one compaction buys many turns instead of one.
   const deficit = Math.max(0, Math.round(input.used - budget * CONTEXT_PRESSURE_TARGET))
@@ -204,52 +239,30 @@ function contextPressureReminder(input: {
     : input.ignored >= 2
       ? `Context is ~${Math.round(pct * 100)}% of its usable budget and you have passed on ${input.ignored} previous reminders. Before doing anything else,`
       : `Context is ~${Math.round(pct * 100)}% of its usable budget and climbing. Before it gets critical,`
-  // Empty manifest = context is dominated by many parts each below the floor.
-  // Still worth nudging: a `select` sweep reclaims them in aggregate, so fall
-  // back to a manifest-less instruction rather than going silent at high usage.
-  const body = manifest.length
-    ? [
-        `${lead} reclaim space by calling the \`compact_results\` tool with the \`prt_…\` ids below that you no longer need verbatim (their content is dropped but stays recoverable via \`read_part\`; you can call it again as more work settles). ${goal} Then continue with and complete the user's current request as normal — this reminder is housekeeping, not a replacement for the task.`,
-        "",
-        "Compactable parts in your context (compact the ones you're done with):",
-        ...manifest,
-      ]
-    : [
-        `${lead} reclaim space by calling the \`compact_results\` tool. Your context is spread across many smaller parts, so pass a \`select\` filter (for example \`{ "types": ["tool"], "keep_last": 3 }\`) or call \`list_context\` first to get their \`prt_…\` ids. Content is dropped but stays recoverable via \`read_part\`. ${goal} Then continue with and complete the user's current request as normal — this reminder is housekeeping, not a replacement for the task.`,
-      ]
   return {
     pct,
     fingerprint: `${urgent ? "hard" : "soft"}:${candidates.fingerprint}`,
-    text: ["<system-reminder>", ...body, "</system-reminder>"].join("\n"),
+    text: [
+      "<system-reminder>",
+      `${lead} reclaim space by calling \`list_context\` first, then \`compact_results\`. Use only \`prt_…\` ids returned by that current \`list_context\` call; never copy id-like strings from prior messages or tool output. Content is dropped but stays recoverable via \`read_part\`. ${goal} Then continue with and complete the user's current request as normal — this reminder is housekeeping, not a replacement for the task.`,
+      "</system-reminder>",
+    ].join("\n"),
   }
 }
 
-// Reuses the tool's `eligibility` so the manifest can never advertise a part
-// the tool would refuse. Lists the largest compactable parts (>= the manifest
-// floor), largest-first, capped so the reminder stays small.
-function compactionManifest(
+// Reuse the tool's eligibility and accounting for pressure and reminder
+// deduplication, but never expose part ids without a current `list_context`.
+function compactionCandidates(
   messages: SessionV1.WithParts[],
   durableMessages: SessionV1.WithParts[],
   currentMessageID: string,
 ) {
-  const MAX_ENTRIES = 8
   const inventory = compactionInventory(messages, currentMessageID, durableMessages)
-  const fresh: { id: string; label: string; chars: number; part: SessionV1.Part }[] = []
-  const folded: { id: string; label: string; chars: number; part: SessionV1.Part }[] = []
-  for (const [id, { part, context, allowed, savings }] of inventory.actionable) {
+  const fresh: { id: string; chars: number; part: SessionV1.Part }[] = []
+  const folded: { id: string; chars: number; part: SessionV1.Part }[] = []
+  for (const [id, { part, allowed, savings }] of inventory.actionable) {
     if (savings <= 0) continue
-    const label = (
-      allowed.kind === "tool"
-        ? (allowed.tool ?? "tool")
-        : allowed.kind === "text"
-          ? context.role === "user"
-            ? "user message"
-            : "assistant note"
-          : allowed.kind
-    )
-      .slice(0, 48)
-      .replace(/\s+/g, " ")
-    ;(allowed.generation > 0 ? folded : fresh).push({ id, label, chars: savings, part })
+    ;(allowed.generation > 0 ? folded : fresh).push({ id, chars: savings, part })
   }
   const reclaimable = (parts: typeof fresh) =>
     parts.length
@@ -267,10 +280,6 @@ function compactionManifest(
   return {
     chars,
     folded: { parts: folded.length, chars: foldedChars },
-    entries: fresh
-      .toSorted((a, b) => b.chars - a.chars)
-      .slice(0, MAX_ENTRIES)
-      .map((entry) => `- ${entry.id} (${entry.label}, at least ~${entry.chars.toLocaleString()} chars)`),
     fingerprint: [...fresh, ...folded]
       .toSorted((a, b) => a.id.localeCompare(b.id))
       .map((entry) => `${entry.id}:${entry.chars}`)
@@ -1428,9 +1437,7 @@ const layer = Layer.effect(
           yield* status.set(sessionID, { type: "busy" })
           yield* Effect.logInfo("loop", { "session.id": sessionID, step })
 
-          let msgs = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
-            Effect.provideService(Database.Service, database),
-          )
+          let msgs = yield* compaction.collapseReceipts({ sessionID })
 
           const { user: lastUser, assistant: lastAssistant, finished: lastFinished, tasks } = MessageV2.latest(msgs)
           // Calibrate the char heuristic against what the provider actually
@@ -1657,7 +1664,7 @@ const layer = Layer.effect(
             ]
             const format = lastUser.format ?? { type: "text" as const }
             if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
-            // The reminder text is volatile (percentage + manifest ids change
+            // The reminder text is volatile (percentage and reclaim target change
             // as usage climbs) so it must NOT go in the cached `system` prefix —
             // that would bust the whole prompt cache on the most expensive
             // (high-context) turns. Deliver it as an ephemeral trailing user
@@ -1702,8 +1709,16 @@ const layer = Layer.effect(
             // Candidate identity, generation, and conservative savings are the
             // reminder clock. Unchanged high-pressure context stays quiet across
             // both provider steps and completed user-message runs.
-            const pressureText = pressure && pressure.fingerprint !== remembered.reminder ? pressure.text : undefined
-            if (pressure && pressureText) remembered.reminder = pressure.fingerprint
+            const progressed =
+              lastAssistant?.parentID === lastUser.id && successfulContextCompaction(lastAssistantMsg)
+            const pressureText =
+              pressure && !progressed && pressure.fingerprint !== remembered.reminder ? pressure.text : undefined
+            if (pressure && (pressureText || progressed)) remembered.reminder = pressure.fingerprint
+            const cachePrefixLimit = stableCachePrefixLimit({
+              messages: msgs,
+              modelMessages: modelMsgs,
+              ephemeralSuffix: isLastStep || pressureText !== undefined,
+            })
             const requestMessages = [
               ...modelMsgs,
               ...(isLastStep ? [{ role: "assistant" as const, content: MAX_STEPS_PROMPT }] : []),
@@ -1728,6 +1743,7 @@ const layer = Layer.effect(
               parentSessionID: session.parentID,
               system,
               messages: requestMessages,
+              cachePrefixLimit,
               tools,
               model,
               toolChoice: format.type === "json_schema" ? "required" : undefined,

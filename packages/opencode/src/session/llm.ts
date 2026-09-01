@@ -41,6 +41,7 @@ export type StreamInput = {
   permission?: PermissionV1.Ruleset
   system: string[]
   messages: ModelMessage[]
+  cachePrefixLimit?: number
   small?: boolean
   tools: Record<string, Tool>
   retries?: number
@@ -111,6 +112,12 @@ const live: Layer.Layer<
         flags,
         isWorkflow,
       })
+      const cachePrefixLimit =
+        input.cachePrefixLimit === undefined
+          ? undefined
+          : prepared.messages.length -
+            input.messages.length +
+            Math.max(0, Math.min(Math.trunc(input.cachePrefixLimit), input.messages.length))
 
       // Wire up toolExecutor for DWS workflow models so that tool calls
       // from the workflow service are executed via opencode's tool system
@@ -230,6 +237,7 @@ const live: Layer.Layer<
           auth: info,
           llmClient,
           messages: prepared.messages,
+          cachePrefixLimit,
           tools: prepared.tools,
           toolChoice: input.toolChoice,
           temperature: prepared.params.temperature,
@@ -334,6 +342,7 @@ const live: Layer.Layer<
                       args.params.prompt,
                       input.model,
                       prepared.messageTransformOptions,
+                      cachePrefixLimit,
                     )
                   }
                   return args.params
