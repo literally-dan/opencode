@@ -1,0 +1,5 @@
+List or stop running subagent tasks owned by the current session.
+
+Use action="list" to see running tasks and their task_id values. Use action="stop" with a task_id to cancel that task and its running descendants. You cannot view or stop tasks owned by unrelated sessions.
+
+Do not repeatedly list tasks to poll for completion. Task results are delivered automatically.

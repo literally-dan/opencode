@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test"
 import { OpencodeClient, type GlobalEvent } from "@opencode-ai/sdk/v2"
 import { createSessionTransport } from "@/cli/cmd/run/stream.transport"
+import { canInterruptRun } from "@/cli/cmd/run/footer"
 import type { FooterApi, FooterEvent, LocalReplayRow, RunFilePart, StreamCommit } from "@/cli/cmd/run/types"
 
 type EventStream = Awaited<ReturnType<OpencodeClient["event"]["subscribe"]>>["stream"]
@@ -1195,7 +1196,7 @@ describe("run stream transport", () => {
     }
   })
 
-  test("keeps completed historical subagent tabs during bootstrap", async () => {
+  test("uses bootstrap status to distinguish completed history from a running async Task", async () => {
     const src = eventFeed()
     const ui = footer()
     const transport = await createSessionTransport({
@@ -1225,11 +1226,26 @@ describe("run stream transport", () => {
                     sessionId: "child-1",
                   },
                 }),
+                completedTool({
+                  sessionID: "session-1",
+                  messageID: "msg-1",
+                  id: "task-2",
+                  callID: "call-2",
+                  tool: "task",
+                  body: {
+                    description: "Inspect async task",
+                    subagent_type: "general",
+                  },
+                  metadata: {
+                    sessionId: "child-2",
+                  },
+                }),
               ],
             }),
           ])
         },
-        children: async () => ok([child("child-1")]),
+        children: async () => ok([child("child-1"), child("child-2")]),
+        status: async () => ok({ "child-2": { type: "busy" } }),
       }),
       sessionID: "session-1",
       thinking: true,
@@ -1243,9 +1259,206 @@ describe("run stream transport", () => {
         return item?.type === "stream.subagent" ? item.state : undefined
       })
 
-      expect(state.tabs).toEqual([expect.objectContaining({ sessionID: "child-1", status: "completed" })])
+      expect(state.tabs).toEqual([
+        expect.objectContaining({ sessionID: "child-2", status: "running" }),
+        expect.objectContaining({ sessionID: "child-1", status: "completed" }),
+      ])
       expect(state.details).toEqual({})
     } finally {
+      src.close()
+      await transport.close()
+    }
+  })
+
+  test("bootstraps a busy grandchild from descendant history without blockers", async () => {
+    const src = eventFeed()
+    const ui = footer()
+    const transport = await createSessionTransport({
+      sdk: sdk({
+        stream: src.stream,
+        messages: async ({ sessionID }) => {
+          if (sessionID === "session-1") {
+            return ok([
+              assistantMessage({
+                sessionID,
+                id: "msg-root",
+                parts: [
+                  completedTool({
+                    sessionID,
+                    messageID: "msg-root",
+                    id: "task-child",
+                    callID: "call-child",
+                    tool: "task",
+                    body: { description: "Inspect child", subagent_type: "general" },
+                    metadata: { sessionId: "child-1" },
+                  }),
+                ],
+              }),
+            ])
+          }
+          if (sessionID === "child-1") {
+            return ok([
+              assistantMessage({
+                sessionID,
+                id: "msg-child",
+                parts: [
+                  completedTool({
+                    sessionID,
+                    messageID: "msg-child",
+                    id: "task-grandchild",
+                    callID: "call-grandchild",
+                    tool: "task",
+                    body: { description: "Inspect grandchild", subagent_type: "explore" },
+                    metadata: { sessionId: "grandchild-1" },
+                  }),
+                ],
+              }),
+            ])
+          }
+          return ok([])
+        },
+        children: async ({ sessionID }) => {
+          if (sessionID === "session-1") return ok([child("child-1")])
+          if (sessionID === "child-1") return ok([child("grandchild-1", "child-1")])
+          return ok([])
+        },
+        status: async () => ok({ "grandchild-1": { type: "busy" } }),
+      }),
+      sessionID: "session-1",
+      thinking: true,
+      limits: () => ({}),
+      footer: ui.api,
+    })
+
+    try {
+      const state = await waitFor(() => {
+        const item = ui.events.findLast((event) => event.type === "stream.subagent")
+        const state = item?.type === "stream.subagent" ? item.state : undefined
+        return state?.tabs.some((tab) => tab.sessionID === "grandchild-1") ? state : undefined
+      })
+
+      expect(state.tabs).toEqual([
+        expect.objectContaining({ sessionID: "grandchild-1", status: "running" }),
+        expect.objectContaining({ sessionID: "child-1", status: "completed" }),
+      ])
+      expect(state.permissions).toEqual([])
+      expect(state.questions).toEqual([])
+      expect(
+        canInterruptRun(
+          {
+            phase: "idle",
+            status: "idle",
+            queue: 0,
+            model: "test-model",
+            duration: "0s",
+            usage: "",
+            first: false,
+            interrupt: 0,
+            exit: 0,
+          },
+          state,
+        ),
+      ).toBe(true)
+    } finally {
+      src.close()
+      await transport.close()
+    }
+  })
+
+  test("drains a grandchild idle event buffered during delayed history bootstrap", async () => {
+    const src = eventFeed()
+    const ui = footer()
+    const trace = mock((_type: string, _data?: unknown) => {})
+    const historyStarted = Promise.withResolvers<void>()
+    const historyRelease = Promise.withResolvers<void>()
+    const transport = await createSessionTransport({
+      sdk: sdk({
+        stream: src.stream,
+        messages: async ({ sessionID }) => {
+          if (sessionID === "session-1") {
+            return ok([
+              assistantMessage({
+                sessionID,
+                id: "msg-root",
+                parts: [
+                  completedTool({
+                    sessionID,
+                    messageID: "msg-root",
+                    id: "task-child",
+                    callID: "call-child",
+                    tool: "task",
+                    body: { description: "Inspect child", subagent_type: "general" },
+                    metadata: { sessionId: "child-1" },
+                  }),
+                ],
+              }),
+            ])
+          }
+          if (sessionID === "child-1") {
+            historyStarted.resolve()
+            await historyRelease.promise
+            return ok([
+              assistantMessage({
+                sessionID,
+                id: "msg-child",
+                parts: [
+                  completedTool({
+                    sessionID,
+                    messageID: "msg-child",
+                    id: "task-grandchild",
+                    callID: "call-grandchild",
+                    tool: "task",
+                    body: { description: "Inspect grandchild", subagent_type: "explore" },
+                    metadata: { sessionId: "grandchild-1" },
+                  }),
+                ],
+              }),
+            ])
+          }
+          return ok([])
+        },
+        children: async ({ sessionID }) => {
+          if (sessionID === "session-1") return ok([child("child-1")])
+          if (sessionID === "child-1") return ok([child("grandchild-1", "child-1")])
+          return ok([])
+        },
+        status: async () => ok({ "grandchild-1": { type: "busy" } }),
+      }),
+      sessionID: "session-1",
+      thinking: true,
+      limits: () => ({}),
+      footer: ui.api,
+      trace: { write: trace },
+    })
+
+    try {
+      await historyStarted.promise
+      src.push(idle("grandchild-1"))
+      await waitFor(() =>
+        trace.mock.calls.some(
+          (call) => call[0] === "recv.event" && (call[1] as SdkEvent | undefined)?.id === "evt-grandchild-1-idle",
+        )
+          ? true
+          : undefined,
+      )
+      historyRelease.resolve()
+
+      const state = await waitFor(() => {
+        const item = ui.events.findLast((event) => event.type === "stream.subagent")
+        const state = item?.type === "stream.subagent" ? item.state : undefined
+        return state?.tabs.some((tab) => tab.sessionID === "grandchild-1" && tab.status === "completed")
+          ? state
+          : undefined
+      })
+
+      expect(state.tabs).toEqual([
+        expect.objectContaining({ sessionID: "grandchild-1", status: "completed" }),
+        expect.objectContaining({ sessionID: "child-1", status: "completed" }),
+      ])
+      expect(state.permissions).toEqual([])
+      expect(state.questions).toEqual([])
+    } finally {
+      historyRelease.resolve()
       src.close()
       await transport.close()
     }

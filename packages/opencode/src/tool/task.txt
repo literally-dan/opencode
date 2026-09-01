@@ -20,8 +20,7 @@ Usage notes:
 8. If the agent description mentions that it should be used proactively, then you should try your best to use it without the user having to ask for it first. Use your judgement.
 
 Background tasks:
-- Background is the default. The call returns immediately with a task_id so you can keep helping the user while the subagent runs.
-- Set background=false only when the parent must block for the result.
+- Every call returns immediately with a task_id so you can keep helping the user while the subagent runs.
 - The task_id is the durable child session ID and can be passed back to resume the task, including after an error. Active execution itself remains process-local.
 - Do not poll, sleep, or ask for status. Completion is delivered automatically into the conversation.
 - Keep working on non-overlapping tasks after launch. Do not duplicate the background agent's work or edit the same files.

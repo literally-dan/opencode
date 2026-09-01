@@ -65,6 +65,7 @@ export type PromptProps = {
   sessionID?: string
   visible?: boolean
   disabled?: boolean
+  interruptible?: boolean
   onSubmit?: () => void
   ref?: (ref: PromptRef | undefined) => void
   hint?: JSX.Element
@@ -397,7 +398,7 @@ export function Prompt(props: PromptProps) {
         name: "session.interrupt",
         category: "Session",
         hidden: true,
-        enabled: status().type !== "idle",
+        enabled: status().type !== "idle" || props.interruptible === true,
         run: () => {
           if (auto()?.visible) return
           if (!input.focused) return

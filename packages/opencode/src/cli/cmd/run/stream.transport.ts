@@ -31,6 +31,7 @@ import { replayActiveText, replayLocalRows, replaySession } from "./session-repl
 import {
   bootstrapSubagentCalls,
   bootstrapSubagentData,
+  bootstrapSubagentTabs,
   createSubagentData,
   listSubagentPermissions,
   listSubagentQuestions,
@@ -644,38 +645,34 @@ function createLayer(input: StreamInput) {
 
         const bootstrapSubagentHistory = Effect.fn("RunStreamTransport.bootstrapSubagentHistory")(function* (
           sessions: string[],
+          children: Set<string>,
         ) {
-          yield* Effect.forEach(
+          const histories = yield* Effect.forEach(
             sessions,
             (sessionID) =>
               messages(sessionID, SUBAGENT_CALL_BOOTSTRAP_LIMIT).pipe(
-                Effect.tap((messagesList) =>
-                  Effect.sync(() => {
-                    if (
-                      !bootstrapSubagentCalls({
-                        data: state.subagent,
-                        sessionID,
-                        messages: messagesList,
-                        thinking: input.thinking,
-                        limits: input.limits(),
-                      })
-                    ) {
-                      return
-                    }
-
-                    syncFooter([], undefined, currentSubagentState())
-                  }),
-                ),
+                Effect.map((messages) => ({ sessionID, messages })),
               ),
-            {
-              concurrency: 4,
-              discard: true,
-            },
+            { concurrency: 4 },
           )
+          const changed = histories.reduce((changed, history) => {
+            const tabs = bootstrapSubagentTabs({ data: state.subagent, messages: history.messages, children })
+            const calls = bootstrapSubagentCalls({
+              data: state.subagent,
+              sessionID: history.sessionID,
+              messages: history.messages,
+              thinking: input.thinking,
+              limits: input.limits(),
+            })
+            return tabs || calls || changed
+          }, false)
+          if (!changed) return
+          syncFooter([], undefined, currentSubagentState())
+          yield* drainBuffered()
         })
 
         const bootstrap = Effect.fn("RunStreamTransport.bootstrap")(function* () {
-          const [messagesList, descendants, permissions, questions] = yield* Effect.all(
+          const [messagesList, descendants, statuses, permissions, questions] = yield* Effect.all(
             [
               messages(
                 input.sessionID,
@@ -705,6 +702,10 @@ function createLayer(input: StreamInput) {
                     failures: error.failures.map((item) => item.sessionID),
                   }).pipe(Effect.as(error.partial))
                 }),
+              ),
+              Effect.promise(() => input.sdk.session.status()).pipe(
+                Effect.map((item) => item.data ?? {}),
+                Effect.orElseSucceed(() => ({})),
               ),
               Effect.promise(() => input.sdk.permission.list()).pipe(
                 Effect.map((item) => item.data ?? []),
@@ -765,6 +766,7 @@ function createLayer(input: StreamInput) {
             data: state.subagent,
             messages: messagesList,
             children: descendants,
+            statuses,
             permissions,
             questions,
           })
@@ -802,12 +804,12 @@ function createLayer(input: StreamInput) {
           booting = false
           yield* drainBuffered()
 
-          const sessions = [...state.subagent.tabs.keys()]
+          const sessions = descendants.map((item) => item.id)
           if (sessions.length === 0) {
             return
           }
 
-          yield* bootstrapSubagentHistory(sessions).pipe(
+          yield* bootstrapSubagentHistory(sessions, new Set(sessions)).pipe(
             Effect.forkIn(scope, { startImmediately: true }),
             Effect.asVoid,
           )

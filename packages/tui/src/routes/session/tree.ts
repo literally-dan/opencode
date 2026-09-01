@@ -37,6 +37,14 @@ export function sessionTree(sessions: readonly Session[], rootID: string): Sessi
   return out
 }
 
+export function sessionTreeBusy(
+  sessions: readonly Session[],
+  statuses: Record<string, { type: string } | undefined>,
+  rootID: string,
+) {
+  return sessionTree(sessions, rootID).some((session) => (statuses[session.id]?.type ?? "idle") !== "idle")
+}
+
 function isTaskChild(parent: Session, child: Session) {
   return (
     child.parentID === parent.id &&

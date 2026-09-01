@@ -35,8 +35,6 @@ type Active = {
   output?: { sequence: number; text: string }
   settlement?: Settlement
   tail: Deferred.Deferred<void>
-  promoted: Deferred.Deferred<Info>
-  onPromote?: Effect.Effect<void>
   onComplete?: (info: Info) => Effect.Effect<void>
   awaitOnComplete: boolean
   notifyOnComplete: boolean
@@ -63,12 +61,6 @@ type FinishResult = {
   finalize?: FinalizeResult
 }
 
-type PromoteResult = {
-  info?: Info
-  promoted?: Deferred.Deferred<Info>
-  onPromote?: Effect.Effect<void>
-}
-
 type StartResult =
   | { info: Info }
   | { info: Info; scope: Scope.Closeable; token: object }
@@ -90,7 +82,6 @@ export type StartInput = {
   type: string
   title?: string
   metadata?: Record<string, unknown>
-  onPromote?: Effect.Effect<void>
   /** Runs once for this in-memory generation when completion delivery is enabled. */
   onComplete?: (info: Info) => Effect.Effect<void>
   /** Waits for `onComplete` to enqueue delivery before publishing completion. */
@@ -127,8 +118,6 @@ export interface Interface {
   readonly start: (input: StartInput) => Effect.Effect<Info>
   readonly extend: (input: ExtendInput) => Effect.Effect<boolean>
   readonly wait: (input: WaitInput) => Effect.Effect<WaitResult>
-  readonly waitForPromotion: (id: string) => Effect.Effect<Info>
-  readonly promote: (id: string) => Effect.Effect<Info | undefined>
   readonly cancel: (id: string) => Effect.Effect<Info | undefined>
 }
 
@@ -271,7 +260,6 @@ export const make = Effect.gen(function* () {
                 new Map(jobs).set(id, {
                   ...job,
                   settling: "finalizing",
-                  onPromote: undefined,
                   onComplete: undefined,
                   notifyOnComplete: false,
                 }),
@@ -319,7 +307,6 @@ export const make = Effect.gen(function* () {
       Effect.gen(function* () {
         const started_at = yield* Clock.currentTimeMillis
         const done = yield* Deferred.make<Info>()
-        const promoted = yield* Deferred.make<Info>()
         const tail = yield* Deferred.make<void>()
         const result = yield* SynchronizedRef.modifyEffect(
           state.jobs,
@@ -350,8 +337,6 @@ export const make = Effect.gen(function* () {
               pending: 1,
               next: 1,
               tail,
-              promoted,
-              onPromote: input.onPromote,
               onComplete: input.onComplete,
               awaitOnComplete: input.awaitOnComplete ?? false,
               notifyOnComplete: input.notifyOnComplete ?? false,
@@ -435,42 +420,6 @@ export const make = Effect.gen(function* () {
     return { info: snapshot(job), timedOut: true }
   })
 
-  const waitForPromotion: Interface["waitForPromotion"] = Effect.fn("BackgroundJob.waitForPromotion")(function* (id) {
-    const job = (yield* SynchronizedRef.get(state.jobs)).get(id)
-    if (!job || job.info.status !== "running" || job.settling !== "running") return yield* Effect.never
-    if (job.info.metadata?.background === true) return snapshot(job)
-    return yield* Deferred.await(job.promoted)
-  })
-
-  const promote: Interface["promote"] = Effect.fn("BackgroundJob.promote")(function* (id) {
-    const result = yield* SynchronizedRef.modifyEffect(
-      state.jobs,
-      Effect.fnUntraced(function* (jobs) {
-        const job = jobs.get(id)
-        if (!job || job.info.status !== "running" || job.settling !== "running")
-          return [{}, jobs] as readonly [PromoteResult, Map<string, Active>]
-        if (job.info.metadata?.background === true)
-          return [{ info: snapshot(job) }, jobs] as readonly [PromoteResult, Map<string, Active>]
-        const next = {
-          ...job,
-          onPromote: undefined,
-          notifyOnComplete: true,
-          info: {
-            ...job.info,
-            metadata: { ...job.info.metadata, background: true },
-          },
-        }
-        return [
-          { info: snapshot(next), onPromote: job.onPromote, promoted: job.promoted },
-          new Map(jobs).set(id, next),
-        ] as readonly [PromoteResult, Map<string, Active>]
-      }),
-    )
-    if (result.info && result.promoted) yield* Deferred.succeed(result.promoted, result.info).pipe(Effect.ignore)
-    if (result.onPromote) yield* result.onPromote.pipe(Effect.ignore)
-    return result.info
-  })
-
   const cancel: Interface["cancel"] = Effect.fn("BackgroundJob.cancel")((id) =>
     Effect.uninterruptibleMask((restore) =>
       Effect.gen(function* () {
@@ -500,7 +449,6 @@ export const make = Effect.gen(function* () {
               new Map(jobs).set(id, {
                 ...job,
                 settling: "finalizing",
-                onPromote: undefined,
                 onComplete: undefined,
                 notifyOnComplete: false,
                 pending: 0,
@@ -514,7 +462,7 @@ export const make = Effect.gen(function* () {
     ),
   )
 
-  return Service.of({ list, get, start, extend, wait, waitForPromotion, promote, cancel })
+  return Service.of({ list, get, start, extend, wait, cancel })
 })
 
 const layer = Layer.effect(Service, make)

@@ -221,23 +221,19 @@ describe("background.job", () => {
     }),
   )
 
-  it.instance("promotes running jobs without interrupting them", () =>
+  it.instance("gets running jobs without interrupting them", () =>
     Effect.gen(function* () {
       const jobs = yield* BackgroundJob.Service
       const latch = yield* Deferred.make<void>()
-      const promoted = yield* Deferred.make<void>()
       const job = yield* jobs.start({
         type: "test",
         metadata: { parentSessionId: "parent" },
-        onPromote: Deferred.succeed(promoted, undefined).pipe(Effect.asVoid),
         run: Deferred.await(latch).pipe(Effect.as("done")),
       })
 
-      const info = yield* jobs.promote(job.id)
+      const info = yield* jobs.get(job.id)
 
       expect(info?.status).toBe("running")
-      expect(info?.metadata?.background).toBe(true)
-      yield* Deferred.await(promoted)
       expect((yield* jobs.get(job.id))?.status).toBe("running")
 
       yield* Deferred.succeed(latch, undefined)

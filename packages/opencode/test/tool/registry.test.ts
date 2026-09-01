@@ -122,12 +122,12 @@ describe("tool.registry", () => {
       expect(ids).not.toContain("list_context")
     }),
   )
-  it.instance("does not expose task_status", () =>
+  it.instance("exposes task_control", () =>
     Effect.gen(function* () {
       const registry = yield* ToolRegistry.Service
       const ids = yield* registry.ids()
 
-      expect(ids).not.toContain("task_status")
+      expect(ids).toContain("task_control")
     }),
   )
 
@@ -172,7 +172,7 @@ describe("tool.registry", () => {
     }),
   )
 
-  it.instance("exposes background-by-default task parameters without an experimental gate", () =>
+  it.instance("exposes always-background task parameters without an experimental gate", () =>
     Effect.gen(function* () {
       const registry = yield* ToolRegistry.Service
       const agent = yield* Agent.Service
@@ -187,7 +187,7 @@ describe("tool.registry", () => {
       expect(task).toBeDefined()
       const schema = ToolJsonSchema.fromSchema(task!.parameters)
       expect(schema.properties).toBeDefined()
-      expect(schema.properties!.background).toMatchObject({ type: "boolean", default: true })
+      expect(schema.properties).not.toHaveProperty("background")
       expect(schema.properties).toHaveProperty("task_id")
     }),
   )

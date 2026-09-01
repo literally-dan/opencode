@@ -27,7 +27,7 @@ import { Spinner } from "../../component/spinner"
 import { createSyntaxStyleMemo, generateSubtleSyntax, selectedForeground, useTheme } from "../../context/theme"
 import { BoxRenderable, ScrollBoxRenderable, addDefaultParsers, TextAttributes, RGBA } from "@opentui/core"
 import { Prompt, type PromptRef } from "../../component/prompt"
-import { sessionTree } from "./tree"
+import { sessionTree, sessionTreeBusy } from "./tree"
 import type {
   AssistantMessage,
   Part,
@@ -226,6 +226,7 @@ export function Session() {
     if (!s || s.parentID) return []
     return sessionTree(sync.data.session, s.id)
   })
+  const interruptible = createMemo(() => sessionTreeBusy(sync.data.session, sync.data.session_status, route.sessionID))
   const messages = createMemo(() => sync.data.message[route.sessionID] ?? [])
   const messagesBeforeRevert = () => {
     const messageID = session()?.revert?.messageID
@@ -233,19 +234,6 @@ export function Session() {
     const index = messages().findIndex((message) => message.id === messageID)
     return index === -1 ? messages() : messages().slice(0, index)
   }
-  const foregroundTasks = createMemo(() =>
-    sync.data.capabilities.experimentalBackgroundSubagents
-      ? messages().flatMap((message) =>
-          (sync.data.part[message.id] ?? []).filter(
-            (part): part is ToolPart =>
-              part.type === "tool" &&
-              part.tool === "task" &&
-              part.state.status === "running" &&
-              part.state.metadata?.background !== true,
-          ),
-        )
-      : [],
-  )
   const permissions = createMemo(() => {
     if (session()?.parentID) return []
     return descendants().flatMap((x) => sync.data.permission[x.id] ?? [])
@@ -1036,20 +1024,6 @@ export function Session() {
       },
     },
     {
-      title: "Background subagents",
-      value: "session.background",
-      category: "Session",
-      hidden: true,
-      enabled: foregroundTasks().length > 0,
-      run: () => {
-        void sdk.client.experimental.session.background({
-          sessionID: route.sessionID,
-          workspace: project.workspace.current(),
-        })
-        dialog.clear()
-      },
-    },
-    {
       title: "Go to child session",
       value: "session.child.first",
       category: "Session",
@@ -1127,13 +1101,6 @@ export function Session() {
   useBindings(() => ({
     mode: OPENCODE_BASE_MODE,
     bindings: tuiConfig.keybinds.gather("session", sessionBindingCommands),
-  }))
-
-  useBindings(() => ({
-    mode: OPENCODE_BASE_MODE,
-    enabled: foregroundTasks().length > 0,
-    priority: 1,
-    bindings: tuiConfig.keybinds.get("session.background"),
   }))
 
   const revertInfo = createMemo(() => session()?.revert)
@@ -1340,6 +1307,7 @@ export function Session() {
                       visible={visible()}
                       ref={bind}
                       disabled={disabled()}
+                      interruptible={interruptible()}
                       onSubmit={() => {
                         toBottom()
                       }}
@@ -1504,7 +1472,6 @@ function AssistantMessage(props: { message: AssistantMessage; parts: Part[]; las
   })
 
   const childShortcut = useCommandShortcut("session.child.first")
-  const backgroundShortcut = useCommandShortcut("session.background")
 
   return (
     <>
@@ -1528,22 +1495,6 @@ function AssistantMessage(props: { message: AssistantMessage; parts: Part[]; las
           <text fg={theme.text}>
             {childShortcut()}
             <span style={{ fg: theme.textMuted }}> view subagents</span>
-            <Show
-              when={
-                sync.data.capabilities.experimentalBackgroundSubagents &&
-                props.parts.some(
-                  (x) =>
-                    x.type === "tool" &&
-                    x.tool === "task" &&
-                    x.state.status === "running" &&
-                    x.state.metadata?.background !== true,
-                )
-              }
-            >
-              <span style={{ fg: theme.textMuted }}> · </span>
-              {backgroundShortcut()}
-              <span style={{ fg: theme.textMuted }}> background</span>
-            </Show>
           </text>
         </box>
       </Show>
