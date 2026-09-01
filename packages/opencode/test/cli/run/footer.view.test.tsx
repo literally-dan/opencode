@@ -17,6 +17,7 @@ import {
   RunVariantSelectBody,
 } from "@/cli/cmd/run/footer.command"
 import { RunFooterView } from "@/cli/cmd/run/footer.view"
+import { canInterruptRun } from "@/cli/cmd/run/footer"
 import { RunEntryContent } from "@/cli/cmd/run/scrollback.writer"
 import { RUN_THEME_FALLBACK, type RunTheme } from "@/cli/cmd/run/theme"
 import type {
@@ -160,7 +161,6 @@ async function renderFooter(
     currentModel?: RunInput["model"]
     currentVariant?: string
     subagents?: FooterSubagentState
-    backgroundSubagents?: boolean
     width?: number
     height?: number
     state?: Partial<FooterState>
@@ -198,7 +198,6 @@ async function renderFooter(
           subagent={subagents}
           theme={input.theme ?? (() => RUN_THEME_FALLBACK)}
           tuiConfig={config}
-          backgroundSubagents={input.backgroundSubagents ?? true}
           agent="opencode"
           onSubmit={input.onSubmit ?? (() => true)}
           onPermissionReply={() => {}}
@@ -251,6 +250,27 @@ function expectPaletteList(list: BoxRenderable, selectedIndex: number) {
 function child(root: BoxRenderable | RootRenderable, index: number) {
   return root.getChildren()[index] as BoxRenderable
 }
+
+test("direct run remains interruptible while the root is idle and a subagent is running", () => {
+  const state = footerState({ phase: "idle" })()
+
+  expect(
+    canInterruptRun(state, {
+      tabs: [subagent({ sessionID: "child-1", label: "Explore", description: "Inspect task" })],
+      details: {},
+      permissions: [],
+      questions: [],
+    }),
+  ).toBe(true)
+  expect(
+    canInterruptRun(state, {
+      tabs: [subagent({ sessionID: "child-1", label: "Explore", description: "Inspect task", status: "completed" })],
+      details: {},
+      permissions: [],
+      questions: [],
+    }),
+  ).toBe(false)
+})
 
 function boxPath(root: BoxRenderable | RootRenderable, name: string): BoxRenderable[] | undefined {
   for (const item of root.getChildren()) {
@@ -987,7 +1007,6 @@ test("direct footer shows editable prompts and additional queued work while runn
           ]}
           theme={() => RUN_THEME_FALLBACK}
           tuiConfig={tuiConfig}
-          backgroundSubagents={true}
           agent="opencode"
           onSubmit={() => true}
           onPermissionReply={() => {}}
@@ -1039,7 +1058,6 @@ test("direct footer shows editable prompts and additional queued work while runn
     expect(spinner).toBeDefined()
     expect(frame).toContain("a-model-name-long-enough-to-force-responsive-truncation")
     expect(frame).toContain("3 queued")
-    expect(frame).toContain("ctrl+b background")
     expect(frame).toContain("ctrl+x q 3 queued")
     expect(frame).toContain("ctrl+x down subagents")
     expect(frame).toContain("ctrl+p cmd")
@@ -1071,7 +1089,6 @@ test("direct footer separates a lone context hint from model and command hint", 
       permissions: [],
       questions: [],
     },
-    backgroundSubagents: false,
     width: 160,
   })
 
@@ -1099,7 +1116,6 @@ test("direct footer hides the subagent hint when only completed subagents remain
       permissions: [],
       questions: [],
     },
-    backgroundSubagents: false,
     width: 160,
   })
 

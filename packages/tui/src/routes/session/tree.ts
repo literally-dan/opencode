@@ -37,6 +37,31 @@ export function sessionTree(sessions: readonly Session[], rootID: string): Sessi
   return out
 }
 
+export function sessionTreeBusy(
+  sessions: readonly Session[],
+  statuses: Record<string, { type: string } | undefined>,
+  rootID: string,
+) {
+  return sessionTree(sessions, rootID).some((session) => (statuses[session.id]?.type ?? "idle") !== "idle")
+}
+
+// Aborting the root cancels Task jobs only in the root's Instance. Busy direct Task children in
+// another location (for example after the root moved) must be aborted in their own Instance.
+export function busyTaskChildrenElsewhere(
+  sessions: readonly Session[],
+  statuses: Record<string, { type: string } | undefined>,
+  rootID: string,
+) {
+  const root = sessions.find((session) => session.id === rootID)
+  if (!root) return []
+  return sessions.filter(
+    (session) =>
+      isTaskChild(root, session) &&
+      (statuses[session.id]?.type ?? "idle") !== "idle" &&
+      (session.directory !== root.directory || session.workspaceID !== root.workspaceID),
+  )
+}
+
 // Location is not compared: moving a Session does not move its Task children.
 function isTaskChild(parent: Session, child: Session) {
   return child.parentID === parent.id && child.taskParentID === child.parentID && child.projectID === parent.projectID

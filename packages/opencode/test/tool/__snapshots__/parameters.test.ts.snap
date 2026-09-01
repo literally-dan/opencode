@@ -301,11 +301,6 @@ exports[`tool parameters JSON Schema (wire shape) task 1`] = `
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "properties": {
-    "background": {
-      "default": true,
-      "description": "Run the agent in the background (default true). Set false only to wait synchronously. You will be notified when it completes. DO NOT sleep, poll, or proactively check on its progress",
-      "type": "boolean",
-    },
     "command": {
       "description": "The command that triggered this task",
       "type": "string",
@@ -335,6 +330,30 @@ exports[`tool parameters JSON Schema (wire shape) task 1`] = `
     "description",
     "prompt",
     "subagent_type",
+  ],
+  "type": "object",
+}
+`;
+
+exports[`tool parameters JSON Schema (wire shape) task_control 1`] = `
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "action": {
+      "description": "List running subagents or stop one task and its running descendants",
+      "enum": [
+        "list",
+        "stop",
+      ],
+      "type": "string",
+    },
+    "task_id": {
+      "description": "The task_id to stop. Required when action is stop.",
+      "type": "string",
+    },
+  },
+  "required": [
+    "action",
   ],
   "type": "object",
 }

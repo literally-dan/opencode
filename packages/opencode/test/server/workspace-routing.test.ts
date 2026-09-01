@@ -41,11 +41,6 @@ describe("getWorkspaceRouteSessionID", () => {
     expect(getWorkspaceRouteSessionID(url)).toBe(SessionID.make("ses_xyz"))
   })
 
-  test("extracts session ID from experimental background path", () => {
-    const url = new URL("http://localhost/experimental/session/ses_bg/background")
-    expect(getWorkspaceRouteSessionID(url)).toBe(SessionID.make("ses_bg"))
-  })
-
   test("returns null for /session/status", () => {
     const url = new URL("http://localhost/session/status")
     expect(getWorkspaceRouteSessionID(url)).toBeNull()
@@ -53,6 +48,11 @@ describe("getWorkspaceRouteSessionID", () => {
 
   test("returns null for non-session paths", () => {
     const url = new URL("http://localhost/config")
+    expect(getWorkspaceRouteSessionID(url)).toBeNull()
+  })
+
+  test("returns null for the removed experimental background path", () => {
+    const url = new URL("http://localhost/experimental/session/ses_bg/background")
     expect(getWorkspaceRouteSessionID(url)).toBeNull()
   })
 

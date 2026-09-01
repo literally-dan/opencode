@@ -40,12 +40,14 @@ type DetailState = {
 export type SubagentData = {
   tabs: Map<string, FooterSubagentTab>
   details: Map<string, DetailState>
+  statuses: Map<string, FooterSubagentTab["status"]>
 }
 
 export type BootstrapSubagentInput = {
   data: SubagentData
   messages: SessionMessage[]
   children: Array<{ id: string; title?: string }>
+  statuses: Record<string, { type: "idle" | "busy" | "retry" }>
   permissions: PermissionRequest[]
   questions: QuestionRequest[]
 }
@@ -308,9 +310,10 @@ function taskStatus(part: ToolPart): FooterSubagentTab["status"] {
   return "running"
 }
 
-function taskTab(part: ToolPart, sessionID: string): FooterSubagentTab {
+function taskTab(data: SubagentData, part: ToolPart, sessionID: string): FooterSubagentTab {
   const label = Locale.titlecase(text(part.state.input.subagent_type) ?? "general")
   const description = text(part.state.input.description) ?? stateTitle(part) ?? inputLabel(part.state.input) ?? ""
+  const partStatus = taskStatus(part)
 
   return {
     sessionID,
@@ -318,7 +321,8 @@ function taskTab(part: ToolPart, sessionID: string): FooterSubagentTab {
     callID: part.callID,
     label,
     description,
-    status: taskStatus(part),
+    status:
+      partStatus === "error" || partStatus === "cancelled" ? partStatus : (data.statuses.get(sessionID) ?? partStatus),
     background: metadata(part, "background") === true,
     title: stateTitle(part),
     toolCalls: num(metadata(part, "toolcalls")) ?? num(metadata(part, "toolCalls")) ?? num(metadata(part, "calls")),
@@ -328,6 +332,25 @@ function taskTab(part: ToolPart, sessionID: string): FooterSubagentTab {
 
 function taskSessionID(part: ToolPart) {
   return text(metadata(part, "sessionId")) ?? text(metadata(part, "sessionID"))
+}
+
+function syncSessionStatus(data: SubagentData, sessionID: string, status: { type: "idle" | "busy" | "retry" }) {
+  const current = data.tabs.get(sessionID)
+  const nextStatus =
+    status.type !== "idle"
+      ? "running"
+      : current?.status === "cancelled" || current?.status === "error"
+        ? current.status
+        : "completed"
+  data.statuses.set(sessionID, nextStatus)
+  if (!current || current.status === nextStatus) return false
+
+  data.tabs.set(sessionID, {
+    ...current,
+    status: nextStatus,
+    lastUpdatedAt: Date.now(),
+  })
+  return true
 }
 
 function syncTaskTab(data: SubagentData, part: ToolPart, children?: Set<string>) {
@@ -344,7 +367,7 @@ function syncTaskTab(data: SubagentData, part: ToolPart, children?: Set<string>)
     return false
   }
 
-  const next = taskTab(part, sessionID)
+  const next = taskTab(data, part, sessionID)
   if (sameSubagentTab(data.tabs.get(sessionID), next)) {
     ensureDetail(data, sessionID)
     return false
@@ -491,6 +514,7 @@ function cancelSubagentTab(data: SubagentData, sessionID: string) {
     return false
   }
 
+  data.statuses.set(sessionID, "cancelled")
   data.tabs.set(sessionID, next)
   return true
 }
@@ -654,6 +678,7 @@ export function createSubagentData(): SubagentData {
   return {
     tabs: new Map(),
     details: new Map(),
+    statuses: new Map(),
   }
 }
 
@@ -711,15 +736,12 @@ export function bootstrapSubagentData(input: BootstrapSubagentInput) {
   const children = new Set(child.keys())
   let changed = false
 
-  for (const message of input.messages) {
-    for (const part of message.parts) {
-      if (part.type !== "tool") {
-        continue
-      }
-
-      changed = syncTaskTab(input.data, part, children) || changed
-    }
+  for (const item of input.children) {
+    const status = input.statuses[item.id]
+    if (status) syncSessionStatus(input.data, item.id, status)
   }
+
+  changed = bootstrapSubagentTabs({ data: input.data, messages: input.messages, children }) || changed
 
   for (const item of input.permissions) {
     if (!children.has(item.sessionID)) {
@@ -756,6 +778,24 @@ export function bootstrapSubagentData(input: BootstrapSubagentInput) {
     changed = queueChanged(detail.data, before) || changed
   }
 
+  return changed
+}
+
+export function bootstrapSubagentTabs(input: {
+  data: SubagentData
+  messages: SessionMessage[]
+  children: Set<string>
+}) {
+  let changed = false
+  for (const message of input.messages) {
+    for (const part of message.parts) {
+      if (part.type !== "tool") {
+        continue
+      }
+
+      changed = syncTaskTab(input.data, part, input.children) || changed
+    }
+  }
   return changed
 }
 
@@ -797,6 +837,10 @@ export function reduceSubagentData(input: {
   limits: Record<string, number>
 }) {
   const event = input.event
+  const statusChanged =
+    event.type === "session.status" && event.properties.sessionID !== input.sessionID
+      ? syncSessionStatus(input.data, event.properties.sessionID, event.properties.status)
+      : false
 
   // Sub-effect: a task tool part can register a new tab in addition to
   // any per-session detail mutation the downstream routing performs. We
@@ -838,7 +882,7 @@ export function reduceSubagentData(input: {
         : undefined
 
   if (!sessionID || !knownSession(input.data, sessionID)) {
-    return tabChanged
+    return statusChanged || tabChanged
   }
 
   const detail = ensureDetail(input.data, sessionID)
@@ -848,7 +892,7 @@ export function reduceSubagentData(input: {
       : false
   if (event.type === "session.status") {
     if (event.properties.status.type !== "retry") {
-      return cancelled || tabChanged
+      return statusChanged || cancelled || tabChanged
     }
 
     return (
@@ -861,6 +905,7 @@ export function reduceSubagentData(input: {
           messageID: `retry:${event.properties.status.attempt}`,
         },
       ]) ||
+      statusChanged ||
       cancelled ||
       tabChanged
     )
@@ -889,6 +934,7 @@ export function reduceSubagentData(input: {
       thinking: input.thinking,
       limits: input.limits,
     }) ||
+    statusChanged ||
     cancelled ||
     tabChanged
   )

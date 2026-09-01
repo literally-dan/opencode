@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import type { Session } from "@opencode-ai/sdk/v2"
-import { sessionTree } from "../../../src/routes/session/tree"
+import { busyTaskChildrenElsewhere, sessionTree, sessionTreeBusy } from "../../../src/routes/session/tree"
 
 const session = (id: string, input: Partial<Session> = {}) =>
   ({
@@ -73,5 +73,45 @@ describe("sessionTree", () => {
     ]
 
     expect(sessionTree(sessions, "root").map((item) => item.id)).toEqual(["root", "child", "grandchild"])
+  })
+
+  test("reports a running Task descendant when the root is idle", () => {
+    const sessions = [session("root"), taskSession("child", "root")]
+
+    expect(sessionTreeBusy(sessions, { root: { type: "idle" }, child: { type: "busy" } }, "root")).toBe(true)
+  })
+
+  test("ignores running sessions outside the authenticated Task subtree", () => {
+    const sessions = [session("root"), session("history", { parentID: "root" })]
+
+    expect(sessionTreeBusy(sessions, { history: { type: "busy" } }, "root")).toBe(false)
+  })
+})
+
+describe("busyTaskChildrenElsewhere", () => {
+  test("returns busy direct Task children outside the root's location", () => {
+    const sessions = [
+      session("root", { directory: "/moved" }),
+      taskSession("old-directory", "root"),
+      taskSession("old-workspace", "root", { directory: "/moved", workspaceID: "old" }),
+      taskSession("same-location", "root", { directory: "/moved" }),
+      taskSession("idle", "root"),
+      taskSession("grandchild", "old-directory"),
+      session("history", { parentID: "root" }),
+    ]
+    const busy = { type: "busy" }
+    const statuses = {
+      "old-directory": busy,
+      "old-workspace": busy,
+      "same-location": busy,
+      idle: { type: "idle" },
+      grandchild: busy,
+      history: busy,
+    }
+
+    expect(busyTaskChildrenElsewhere(sessions, statuses, "root").map((item) => item.id)).toEqual([
+      "old-directory",
+      "old-workspace",
+    ])
   })
 })

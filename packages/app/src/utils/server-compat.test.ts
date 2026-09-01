@@ -170,6 +170,23 @@ describe("createCompatibleApi", () => {
     expect(new URL(requests[0]!.url).pathname).toBe("/experimental/session")
   })
 
+  test("keeps V1 Task ownership so fetched child requests still route", async () => {
+    const base = { projectID: "project", directory: "/repo", version: "1", time: { created: 1, updated: 1 } }
+    const { api } = setup("v1", {
+      sessions: [
+        { ...base, id: "ses_root", slug: "ses_root", title: "Root" },
+        { ...base, id: "ses_child", slug: "ses_child", title: "Child", parentID: "ses_root", taskParentID: "ses_root" },
+      ],
+    })
+    const sessions = await Promise.all(
+      ["ses_root", "ses_child"].map((sessionID) => api.session.get({ sessionID }).then(normalizeSessionInfo)),
+    )
+    const request = { id: "per_child", sessionID: "ses_child" } as PermissionRequest
+
+    expect(sessionPermissionRequest(sessions, { ses_child: [request] }, "ses_root")).toBe(request)
+    expect(autoRespondsPermission({ ses_root: true }, sessions, request, "/repo")).toBe(true)
+  })
+
   /*
   test("projects the V1 default branch", async () => {
     const { api } = setup("v1", { vcs: { branch: "feature", default_branch: "dev" } })

@@ -582,17 +582,6 @@ const scenarios: Scenario[] = [
     check(typeof body === "object" && body !== null, "capabilities should be an object")
     check("backgroundSubagents" in body, "capabilities should report background subagents")
   }),
-  http.protected
-    .post("/experimental/session/{sessionID}/background", "experimental.session.background")
-    .mutating()
-    .seeded((ctx) => ctx.session({ title: "Background route owner" }))
-    .at((ctx) => ({
-      path: route("/experimental/session/{sessionID}/background", { sessionID: ctx.state.id }),
-      headers: ctx.headers(),
-    }))
-    .json(200, (body) => {
-      check(body === false, "background route should be a no-op without running subagents")
-    }),
   http.protected.get("/experimental/resource", "experimental.resource.list").json(),
   http.protected
     .post("/sync/history", "sync.history.list")

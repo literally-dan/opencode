@@ -57,6 +57,7 @@ import { usePromptWorkspace } from "./workspace"
 import { usePromptMove } from "./move"
 import { readLocalAttachment } from "./local-attachment"
 import { useLocation } from "../../context/location"
+import { busyTaskChildrenElsewhere } from "../../routes/session/tree"
 
 registerOpencodeSpinner()
 
@@ -64,6 +65,7 @@ export type PromptProps = {
   sessionID?: string
   visible?: boolean
   disabled?: boolean
+  interruptible?: boolean
   onSubmit?: () => void
   ref?: (ref: PromptRef | undefined) => void
   hint?: JSX.Element
@@ -394,7 +396,7 @@ export function Prompt(props: PromptProps) {
         name: "session.interrupt",
         category: "Session",
         hidden: true,
-        enabled: status().type !== "idle",
+        enabled: status().type !== "idle" || props.interruptible === true,
         run: () => {
           if (auto()?.visible) return
           if (!input.focused) return
@@ -415,6 +417,10 @@ export function Prompt(props: PromptProps) {
             void sdk.client.session.abort({
               sessionID: props.sessionID,
             })
+            // Session routes use each child's own location, so this reaches the Instance that runs it.
+            busyTaskChildrenElsewhere(sync.data.session, sync.data.session_status, props.sessionID).forEach(
+              (child) => void sdk.client.session.abort({ sessionID: child.id }),
+            )
             setStore("interrupt", 0)
           }
           dialog.clear()
@@ -1512,7 +1518,7 @@ export function Prompt(props: PromptProps) {
         </box>
         <box width="100%" flexDirection="row" justifyContent="space-between">
           <Switch>
-            <Match when={status().type !== "idle"}>
+            <Match when={status().type !== "idle" || props.interruptible}>
               <box
                 flexDirection="row"
                 gap={1}

@@ -10,7 +10,6 @@ import { deriveSubagentSessionPermission } from "../agent/subagent-permissions"
 import type { SessionPrompt } from "../session/prompt"
 import { Config } from "@/config/config"
 import { Deferred, Effect, Exit, Option, Ref, Schema, Scope } from "effect"
-import { EffectBridge } from "@/effect/bridge"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Database } from "@opencode-ai/core/database/database"
 
@@ -35,8 +34,7 @@ const id = "task"
 // cannot nest further.
 const DEFAULT_SUBAGENT_DEPTH = 2
 const BACKGROUND_DESCRIPTION = [
-  "Background mode is the default: the subagent launches asynchronously and returns a resumable task_id immediately.",
-  "Set background=false only when the parent must wait synchronously for the result.",
+  "Every subagent launches asynchronously and returns a resumable task_id immediately.",
   "You will be notified automatically when it finishes.",
 ].join(" ")
 const BACKGROUND_STARTED = [
@@ -62,14 +60,7 @@ const BaseParameterFields = {
   command: Schema.optional(Schema.String).annotate({ description: "The command that triggered this task" }),
 }
 
-export const Parameters = Schema.Struct({
-  ...BaseParameterFields,
-  background: Schema.optional(Schema.Boolean).annotate({
-    description:
-      "Run the agent in the background (default true). Set false only to wait synchronously. You will be notified when it completes. DO NOT sleep, poll, or proactively check on its progress",
-    default: true,
-  }),
-})
+export const Parameters = Schema.Struct(BaseParameterFields)
 
 function renderOutput(input: {
   sessionID: SessionID
@@ -118,23 +109,15 @@ export const TaskTool = Tool.define(
       ctx: Tool.Context,
     ) {
       const cfg = yield* config.get()
-      const runInBackground = params.background !== false
 
       const parent = yield* sessions.get(ctx.sessionID)
       const ancestors = [parent]
+      const seen = new Set([parent.id])
       let current = parent
       let depth = 0
       while (current.parentID) {
         const parentID = current.parentID
-        const owner = yield* background.get(current.id)
-        if (
-          owner?.status !== "running" ||
-          owner.type !== id ||
-          current.taskParentID !== parentID ||
-          owner.metadata?.sessionId !== current.id ||
-          owner.metadata?.parentSessionId !== parentID
-        )
-          break
+        if (current.taskParentID !== parentID || seen.has(parentID)) break
         const next = yield* sessions.get(parentID)
         if (current.projectID !== next.projectID) break
         depth++
@@ -148,6 +131,7 @@ export const TaskTool = Tool.define(
         )
           ancestors.push(next)
         current = next
+        seen.add(current.id)
       }
       const maxDepth = cfg.subagent_depth ?? DEFAULT_SUBAGENT_DEPTH
       if (depth >= maxDepth) {
@@ -273,8 +257,9 @@ export const TaskTool = Tool.define(
       const metadata = {
         parentSessionId: ctx.sessionID,
         sessionId: nextSession.id,
+        ancestorSessionIds: ancestors.map((item) => item.id),
         model,
-        ...(runInBackground ? { background: true } : {}),
+        background: true,
       }
 
       yield* ctx.metadata({
@@ -463,57 +448,6 @@ export const TaskTool = Tool.define(
         }
       }
 
-      const waitForeground = Effect.fn("TaskTool.waitForeground")(function* (allowPromotion: boolean) {
-        const runCancel = yield* EffectBridge.make()
-        const cancel = ops.cancel(nextSession.id)
-        const promoted = { value: false }
-
-        function onAbort() {
-          runCancel.fork(cancel)
-        }
-
-        return yield* Effect.acquireUseRelease(
-          Effect.sync(() => {
-            ctx.abort.addEventListener("abort", onAbort)
-          }),
-          () =>
-            Effect.gen(function* () {
-              const result = allowPromotion
-                ? yield* Effect.raceFirst(
-                    background.wait({ id: nextSession.id }).pipe(Effect.map((waited) => waited.info)),
-                    background.waitForPromotion(nextSession.id),
-                  )
-                : (yield* background.wait({ id: nextSession.id })).info
-              if (result?.status === "running" && result.metadata?.background === true) {
-                promoted.value = true
-                return backgroundResult("Background task started", BACKGROUND_STARTED)
-              }
-              if (!result) return yield* Effect.fail(new Error(resumableFailure("Task result unavailable")))
-              if (result.status === "error")
-                return yield* Effect.fail(new Error(resumableFailure(result.error ?? "Task failed")))
-              if (result.status === "cancelled")
-                return yield* Effect.fail(new Error(resumableFailure("Task cancelled")))
-              return {
-                title: params.description,
-                metadata,
-                output: renderOutput({ sessionID: nextSession.id, state: "completed", text: result.output ?? "" }),
-              }
-            }),
-          (_, exit) =>
-            Effect.gen(function* () {
-              if (Exit.hasInterrupts(exit))
-                yield* Effect.all([cancel, background.cancel(nextSession.id)], { discard: true })
-            }).pipe(
-              Effect.ensuring(
-                Effect.gen(function* () {
-                  ctx.abort.removeEventListener("abort", onAbort)
-                  if (!promoted.value) yield* releaseTargets
-                }),
-              ),
-            ),
-        )
-      })
-
       const taskRun = runTask().pipe(
         Effect.mapError(resumableError),
         Effect.catchDefect((defect) => Effect.fail(resumableError(defect))),
@@ -544,7 +478,6 @@ export const TaskTool = Tool.define(
                 yield* background.extend({
                   id: nextSession.id,
                   expectedType: id,
-                  claimCompletion: !runInBackground,
                   onFinalize: releaseTargets,
                   run: taskRun,
                 })
@@ -556,14 +489,10 @@ export const TaskTool = Tool.define(
                 type: id,
                 title: params.description,
                 metadata,
-                onPromote: ctx.metadata({
-                  title: params.description,
-                  metadata: { ...metadata, background: true, jobId: nextSession.id },
-                }),
                 onComplete: complete,
                 awaitOnComplete: true,
                 onFinalize: releaseTargets,
-                notifyOnComplete: runInBackground,
+                notifyOnComplete: true,
                 run: taskRun,
               })
               if (started.type !== id) return yield* Effect.interrupt
@@ -575,17 +504,8 @@ export const TaskTool = Tool.define(
         }).pipe(Effect.ensuring(Effect.suspend(() => (handoff.value ? Effect.void : releaseTargets)))),
       )
       if (Option.isNone(admitted)) return yield* Effect.interrupt
-      if (admitted.value === "extended") {
-        if (runInBackground) return backgroundResult("Background task updated", BACKGROUND_UPDATED)
-        const active = yield* background.get(nextSession.id)
-        return yield* waitForeground(active?.metadata?.background !== true)
-      }
-
-      if (runInBackground) {
-        return backgroundResult("Background task started", BACKGROUND_STARTED)
-      }
-
-      return yield* waitForeground(true)
+      if (admitted.value === "extended") return backgroundResult("Background task updated", BACKGROUND_UPDATED)
+      return backgroundResult("Background task started", BACKGROUND_STARTED)
     })
 
     return {

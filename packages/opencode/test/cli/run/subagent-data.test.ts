@@ -218,6 +218,7 @@ describe("run subagent data", () => {
         data,
         messages: [taskMessage("child-1")],
         children: [{ id: "child-1" }, { id: "child-2" }],
+        statuses: {},
         permissions: [
           {
             id: "perm-1",
@@ -269,6 +270,7 @@ describe("run subagent data", () => {
       data,
       messages: [taskMessage("child-1", "interrupted")],
       children: [{ id: "child-1" }],
+      statuses: {},
       permissions: [],
       questions: [],
     })
@@ -288,6 +290,7 @@ describe("run subagent data", () => {
       data,
       messages: [taskMessage("child-1", "running")],
       children: [{ id: "child-1" }],
+      statuses: {},
       permissions: [],
       questions: [],
     })
@@ -424,6 +427,7 @@ describe("run subagent data", () => {
       data,
       messages: [taskMessage("child-1", "completed")],
       children: [{ id: "child-1" }],
+      statuses: {},
       permissions: [],
       questions: [],
     })
@@ -491,6 +495,7 @@ describe("run subagent data", () => {
       data,
       messages: [taskMessage("child-1", "running")],
       children: [{ id: "child-1" }],
+      statuses: {},
       permissions: [],
       questions: [],
     })
@@ -559,6 +564,7 @@ describe("run subagent data", () => {
       data,
       messages: [taskMessage("child-1", "running")],
       children: [{ id: "child-1" }],
+      statuses: {},
       permissions: [],
       questions: [],
     })
@@ -616,5 +622,43 @@ describe("run subagent data", () => {
 
     expect(permChanged).toBe(true)
     expect(snapshotSubagentData(data).permissions.map((p) => p.id)).toContain("perm-grandchild")
+  })
+
+  test("tracks running child status independently of a completed async Task part", () => {
+    const data = createSubagentData()
+
+    expect(
+      reduce(data, {
+        type: "session.status",
+        properties: {
+          sessionID: "child-1",
+          status: { type: "busy" },
+        },
+      }),
+    ).toBe(false)
+    bootstrapSubagentData({
+      data,
+      messages: [taskMessage("child-1", "completed")],
+      children: [{ id: "child-1" }],
+      statuses: {},
+      permissions: [],
+      questions: [],
+    })
+
+    expect(snapshotSubagentData(data).tabs).toEqual([
+      expect.objectContaining({ sessionID: "child-1", status: "running" }),
+    ])
+    expect(
+      reduce(data, {
+        type: "session.status",
+        properties: {
+          sessionID: "child-1",
+          status: { type: "idle" },
+        },
+      }),
+    ).toBe(true)
+    expect(snapshotSubagentData(data).tabs).toEqual([
+      expect.objectContaining({ sessionID: "child-1", status: "completed" }),
+    ])
   })
 })

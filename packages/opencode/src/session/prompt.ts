@@ -535,7 +535,6 @@ const layer = Layer.effect(
             description: task.description,
             subagent_type: task.agent,
             command: task.command,
-            background: task.background ?? false,
           },
           time: { start: Date.now() },
         },
@@ -545,7 +544,6 @@ const layer = Layer.effect(
         description: task.description,
         subagent_type: task.agent,
         command: task.command,
-        background: task.background ?? false,
       }
       yield* plugin.trigger(
         "tool.execute.before",
@@ -1216,7 +1214,7 @@ const layer = Layer.effect(
         }
 
         if (part.type === "subtask") {
-          return [{ ...part, messageID: info.id, sessionID: input.sessionID, background: part.background ?? true }]
+          return [{ ...part, messageID: info.id, sessionID: input.sessionID, background: true }]
         }
 
         return [{ ...part, messageID: info.id, sessionID: input.sessionID }]
@@ -1919,7 +1917,7 @@ const layer = Layer.effect(
               command: input.command,
               model: { providerID: taskModel.providerID, modelID: taskModel.modelID },
               prompt: templateParts.find((y) => y.type === "text")?.text ?? "",
-              background: cmd.background ?? true,
+              background: true,
             },
           ]
         : [...uniqueTemplateParts, ...(input.parts ?? [])]
