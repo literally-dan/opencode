@@ -234,8 +234,6 @@ export function Prompt(props: PromptProps) {
   const agentStyleId = syntax().getStyleId("extmark.agent")!
   const pasteStyleId = syntax().getStyleId("extmark.paste")!
   let promptPartTypeId = 0
-  let askRequest = 0
-  onCleanup(() => askRequest++)
   const event = useEvent()
 
   event.on("tui.prompt.append", (evt, { workspace }) => {
@@ -1038,43 +1036,16 @@ export function Prompt(props: PromptProps) {
       input.clear()
       setStore("prompt", { input: "", parts: [] })
       setStore("extmarkToPartIndex", new Map())
-      dialog.setSize("large")
-      const request = ++askRequest
-      const controller = new AbortController()
-      let pending = true
-      dialog.replace(
-        () => <DialogAsk question={askQuestion} />,
-        () => {
-          if (pending && askRequest === request) {
-            askRequest++
-            controller.abort()
-          }
-        },
-      )
-      void sdk.client.session
-        .ask(
-          {
-            sessionID: props.sessionID,
-            question: askQuestion,
-            agent: agent.name,
-            model: selectedModel,
-            variant,
-          },
-          { signal: controller.signal },
-        )
-        .then((result) => {
-          if (askRequest !== request) return
-          if (result.error) throw result.error
-          pending = false
-          dialog.setSize("large")
-          dialog.replace(() => <DialogAsk question={askQuestion} answer={result.data.text} />)
-        })
-        .catch((error) => {
-          if (askRequest !== request) return
-          pending = false
-          dialog.clear()
-          toast.show({ title: "Failed to ask", message: errorMessage(error), variant: "error" })
-        })
+      dialog.setSize("xlarge")
+      dialog.replace(() => (
+        <DialogAsk
+          sessionID={props.sessionID!}
+          question={askQuestion}
+          agent={agent.name}
+          model={selectedModel}
+          variant={variant}
+        />
+      ))
       return true
     }
 

@@ -6,6 +6,7 @@ export type Runtime = {
   InstanceRef: (typeof import("../../../src/effect/instance-ref"))["InstanceRef"]
   InstanceStore: (typeof import("../../../src/project/instance-store"))["InstanceStore"]
   Session: (typeof import("../../../src/session/session"))["Session"]
+  SessionAsk: (typeof import("../../../src/session/ask"))["SessionAsk"]
   Todo: (typeof import("../../../src/session/todo"))["Todo"]
   Worktree: (typeof import("../../../src/worktree"))["Worktree"]
   Project: (typeof import("../../../src/project/project"))["Project"]
@@ -26,6 +27,7 @@ export function runtime() {
     const instanceRef = await import("../../../src/effect/instance-ref")
     const instanceStore = await import("../../../src/project/instance-store")
     const session = await import("../../../src/session/session")
+    const sessionAsk = await import("../../../src/session/ask")
     const todo = await import("../../../src/session/todo")
     const worktree = await import("../../../src/worktree")
     const project = await import("../../../src/project/project")
@@ -40,6 +42,7 @@ export function runtime() {
       InstanceRef: instanceRef.InstanceRef,
       InstanceStore: instanceStore.InstanceStore,
       Session: session.Session,
+      SessionAsk: sessionAsk.SessionAsk,
       Todo: todo.Todo,
       Worktree: worktree.Worktree,
       Project: project.Project,

@@ -6,6 +6,7 @@ import { useConnected } from "../../component/use-connected"
 import { createStore } from "solid-js/store"
 import { useRoute } from "../../context/route"
 import { sessionTree } from "./tree"
+import { isAskPermission } from "./permission"
 
 export function Footer() {
   const { theme } = useTheme()
@@ -22,8 +23,10 @@ export function Footer() {
     if (route.data.type !== "session") return []
     const viewed = sync.session.get(route.data.sessionID)
     if (!viewed) return []
-    if (viewed.parentID) return sync.data.permission[viewed.id] ?? []
-    return sessionTree(sync.data.session, viewed.id).flatMap((x) => sync.data.permission[x.id] ?? [])
+    if (viewed.parentID) return (sync.data.permission[viewed.id] ?? []).filter((request) => !isAskPermission(request))
+    return sessionTree(sync.data.session, viewed.id).flatMap((x) =>
+      (sync.data.permission[x.id] ?? []).filter((request) => !isAskPermission(request)),
+    )
   })
   const directory = useDirectory()
   const connected = useConnected()

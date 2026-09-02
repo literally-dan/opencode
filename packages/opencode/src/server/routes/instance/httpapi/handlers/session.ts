@@ -6,6 +6,7 @@ import { Command } from "@/command"
 import { Permission } from "@/permission"
 import { SessionShare } from "@/share/session"
 import { Session } from "@/session/session"
+import { SessionAsk } from "@/session/ask"
 import { SessionCompaction } from "@/session/compaction"
 import { MessageV2 } from "@/session/message-v2"
 import { SessionPrompt } from "@/session/prompt"
@@ -25,6 +26,8 @@ import { HttpApiBuilder, HttpApiError, HttpApiSchema } from "effect/unstable/htt
 import { InstanceHttpApi } from "../api"
 import {
   AskPayload,
+  AskThreadQuery,
+  AskThreadsQuery,
   CommandPayload,
   DiffQuery,
   ForkPayload,
@@ -38,7 +41,14 @@ import {
   SummarizePayload,
   UpdatePayload,
 } from "../groups/session"
-import { ModelNotFoundError, PermissionNotFoundError, UpstreamError, notFound } from "../errors"
+import {
+  ConflictError,
+  InvalidRequestError,
+  ModelNotFoundError,
+  PermissionNotFoundError,
+  UpstreamError,
+  notFound,
+} from "../errors"
 import * as SessionError from "./session-errors"
 
 const tryParseJson = (text: string) =>
@@ -47,11 +57,25 @@ const tryParseJson = (text: string) =>
     catch: () => new HttpApiError.BadRequest({}),
   })
 
+const decodeAskThreadsCursor = Schema.decodeUnknownSync(
+  Schema.fromJsonString(Schema.Struct({ id: SessionAsk.ID, updated: Schema.Number })),
+)
+const decodeAskTurnsCursor = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Struct({ id: SessionAsk.TurnID })))
+
+function validateAskCursor(value: string | undefined, decode: (input: unknown) => unknown) {
+  if (!value) return Effect.void
+  return Effect.try({
+    try: () => decode(Buffer.from(value, "base64url").toString("utf8")),
+    catch: () => new HttpApiError.BadRequest({}),
+  }).pipe(Effect.asVoid)
+}
+
 export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", (handlers) =>
   Effect.gen(function* () {
     const session = yield* Session.Service
     const shareSvc = yield* SessionShare.Service
     const promptSvc = yield* SessionPrompt.Service
+    const askSvc = yield* SessionAsk.Service
     const revertSvc = yield* SessionRevert.Service
     const compactSvc = yield* SessionCompaction.Service
     const runState = yield* SessionRunState.Service
@@ -341,12 +365,39 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       payload: typeof AskPayload.Type
     }) {
       yield* requireSession(ctx.params.sessionID)
-      return yield* promptSvc.ask({ ...ctx.payload, sessionID: ctx.params.sessionID }).pipe(
-        Effect.matchCauseEffect({
-          onSuccess: (value) => Effect.succeed(value),
-          onFailure: (cause): Effect.Effect<never, HttpApiError.BadRequest | ModelNotFoundError | UpstreamError> => {
-            if (Cause.hasInterruptsOnly(cause)) return Effect.interrupt
-            const error = Cause.squash(cause)
+      return yield* askSvc.ask({ ...ctx.payload, sessionID: ctx.params.sessionID }).pipe(
+        Effect.catch(
+          (
+            error,
+          ): Effect.Effect<
+            never,
+            ReturnType<typeof notFound> | InvalidRequestError | ConflictError | ModelNotFoundError | UpstreamError
+          > => {
+            if (error instanceof SessionAsk.ThreadNotFoundError) return Effect.fail(notFound(error.message))
+            if (error instanceof SessionAsk.ThreadBusyError) {
+              return Effect.fail(
+                new ConflictError({
+                  message: error.message,
+                  resource: error.threadID,
+                }),
+              )
+            }
+            if (error instanceof SessionAsk.RequestBusyError) {
+              return Effect.fail(
+                new ConflictError({
+                  message: error.message,
+                  resource: error.requestID,
+                }),
+              )
+            }
+            if (error instanceof SessionAsk.UnsupportedModelError) {
+              return Effect.fail(
+                new InvalidRequestError({
+                  message: error.message,
+                  kind: "UnsupportedModel",
+                }),
+              )
+            }
             if (Provider.ModelNotFoundError.isInstance(error)) {
               return Effect.fail(
                 new ModelNotFoundError({
@@ -358,34 +409,79 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
               )
             }
             const data = typeof error === "object" && error !== null && "data" in error ? error.data : undefined
-            const message =
-              typeof data === "object" && data !== null && "message" in data && typeof data.message === "string"
-                ? data.message
-                : error instanceof Error
-                  ? error.message
-                  : String(error)
             if (SessionV1.APIError.isInstance(error)) {
               return Effect.fail(
                 new UpstreamError({
-                  message,
+                  message:
+                    typeof data === "object" && data !== null && "message" in data && typeof data.message === "string"
+                      ? data.message
+                      : error.message,
                   service: "model provider",
                   status: error.data.statusCode,
                 }),
               )
             }
-            if (message.startsWith("Agent not found:")) {
-              return Effect.fail(new HttpApiError.BadRequest({}))
-            }
-            return Effect.fail(
-              new UpstreamError({
-                message,
-                service: "model provider",
-                status: undefined,
-              }),
-            )
+            return Effect.die(error)
           },
+        ),
+        Effect.catchDefect((error) => {
+          if (
+            ctx.payload.agent &&
+            error instanceof Error &&
+            error.message === `Agent not found: "${ctx.payload.agent}"`
+          ) {
+            return Effect.fail(
+              new InvalidRequestError({ message: error.message, kind: "UnknownAgent", field: "agent" }),
+            )
+          }
+          return Effect.die(error)
         }),
       )
+    })
+
+    const askThreads = Effect.fn("SessionHttpApi.askThreads")(function* (ctx: {
+      params: { sessionID: SessionID }
+      query: typeof AskThreadsQuery.Type
+    }) {
+      yield* requireSession(ctx.params.sessionID)
+      yield* validateAskCursor(ctx.query.before, decodeAskThreadsCursor)
+      return yield* askSvc
+        .threads({ sessionID: ctx.params.sessionID, limit: ctx.query.limit, before: ctx.query.before })
+        .pipe(Effect.orDie)
+    })
+
+    const askThread = Effect.fn("SessionHttpApi.askThread")(function* (ctx: {
+      params: { sessionID: SessionID; threadID: SessionAsk.ID }
+      query: typeof AskThreadQuery.Type
+    }) {
+      yield* requireSession(ctx.params.sessionID)
+      yield* validateAskCursor(ctx.query.before, decodeAskTurnsCursor)
+      return yield* askSvc
+        .turns({
+          sessionID: ctx.params.sessionID,
+          threadID: ctx.params.threadID,
+          limit: ctx.query.limit,
+          before: ctx.query.before,
+        })
+        .pipe(
+          Effect.catch((error) =>
+            error instanceof SessionAsk.ThreadNotFoundError ? Effect.fail(notFound(error.message)) : Effect.die(error),
+          ),
+        )
+    })
+
+    const askCancel = Effect.fn("SessionHttpApi.askCancel")(function* (ctx: {
+      params: { sessionID: SessionID; threadID: SessionAsk.ID }
+    }) {
+      yield* requireSession(ctx.params.sessionID)
+      yield* askSvc
+        .cancel(ctx.params)
+        .pipe(
+          Effect.catch((error) =>
+            error instanceof SessionAsk.ThreadNotFoundError ? Effect.fail(notFound(error.message)) : Effect.die(error),
+          ),
+        )
+      return true
     })
 
     const command = Effect.fn("SessionHttpApi.command")(function* (ctx: {
@@ -491,6 +587,9 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       .handle("prompt", prompt)
       .handle("promptAsync", promptAsync)
       .handle("ask", ask)
+      .handle("askThreads", askThreads)
+      .handle("askThread", askThread)
+      .handle("askCancel", askCancel)
       .handle("command", command)
       .handle("shell", shell)
       .handle("revert", revert)

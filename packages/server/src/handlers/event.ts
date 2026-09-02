@@ -1,4 +1,5 @@
 import { EventV2 } from "@opencode-ai/core/event"
+import { PublicEventManifest } from "@opencode-ai/core/public-event-manifest"
 import { OpenCodeEvent } from "@opencode-ai/protocol/groups/event"
 import { Effect, Schema, Stream } from "effect"
 import { HttpServerResponse } from "effect/unstable/http"
@@ -7,6 +8,7 @@ import * as Sse from "effect/unstable/encoding/Sse"
 import { Api } from "../api"
 
 const subscriberCapacity = 256
+const serverEventTypes = new Set<string>(PublicEventManifest.Definitions.map((definition) => definition.type))
 
 function eventData(data: unknown): Sse.Event {
   return {
@@ -30,7 +32,9 @@ export const EventHandler = HttpApiBuilder.group(Api, "server.event", (handlers)
         const output = Stream.unwrap(
           Effect.gen(function* () {
             // Acquiring the bounded stream installs its listener before readiness is observable.
-            const live = yield* EventV2.allBounded(events, subscriberCapacity)
+            const live = yield* EventV2.allBounded(events, subscriberCapacity).pipe(
+              Effect.map(Stream.filter((event) => serverEventTypes.has(event.type))),
+            )
             return Stream.make(connected).pipe(Stream.concat(live))
           }),
         ).pipe(Stream.map(eventData), Stream.pipeThroughChannel(Sse.encode()))

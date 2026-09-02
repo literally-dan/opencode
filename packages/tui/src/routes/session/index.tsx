@@ -65,7 +65,7 @@ import stripAnsi from "strip-ansi"
 import { usePromptRef } from "../../context/prompt"
 import { useEpilogue } from "../../context/epilogue"
 import { normalizePath } from "../../util/path"
-import { PermissionPrompt } from "./permission"
+import { isAskPermission, normalPermissionCallID, PermissionPrompt } from "./permission"
 import { QuestionPrompt } from "./question"
 import { DialogExportOptions } from "../../ui/dialog-export-options"
 import * as Model from "../../util/model"
@@ -236,7 +236,9 @@ export function Session() {
   }
   const permissions = createMemo(() => {
     if (session()?.parentID) return []
-    return descendants().flatMap((x) => sync.data.permission[x.id] ?? [])
+    return descendants().flatMap((x) =>
+      (sync.data.permission[x.id] ?? []).filter((request) => !isAskPermission(request)),
+    )
   })
   const questions = createMemo(() => {
     if (session()?.parentID) return []
@@ -1822,7 +1824,7 @@ function InlineTool(props: {
   const [errorExpanded, setErrorExpanded] = createSignal(false)
 
   const permission = createMemo(() => {
-    const callID = sync.data.permission[ctx.sessionID]?.at(0)?.tool?.callID
+    const callID = normalPermissionCallID(sync.data.permission[ctx.sessionID])
     if (!callID) return false
     return callID === props.part.callID
   })

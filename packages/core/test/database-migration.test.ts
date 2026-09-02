@@ -4,13 +4,14 @@ import { fileURLToPath } from "url"
 import path from "path"
 import { SqliteClient } from "@effect/sql-sqlite-bun"
 import { EffectDrizzleSqlite } from "@opencode-ai/effect-drizzle-sqlite"
-import { Effect, Layer } from "effect"
+import { Effect, Exit, Layer } from "effect"
 import { eq, inArray, sql } from "drizzle-orm"
 import { DatabaseMigration } from "@opencode-ai/core/database/migration"
 import { migrations } from "@opencode-ai/core/database/migration.gen"
 import workspaceNameMigration from "@opencode-ai/core/database/migration/20260410174513_workspace-name"
 import sessionListIndexesMigration from "@opencode-ai/core/database/migration/20260724103001_session_list_indexes"
 import sessionTaskParentMigration from "@opencode-ai/core/database/migration/20260827164832_session_task_parent"
+import sessionAskMigration from "@opencode-ai/core/database/migration/20260901225503_session_ask"
 import sessionUsageMigration from "@opencode-ai/core/database/migration/20260510033149_session_usage"
 import normalizeStoragePathsMigration from "@opencode-ai/core/database/migration/20260601010001_normalize_storage_paths"
 import sessionMessageProjectionOrderMigration from "@opencode-ai/core/database/migration/20260603040000_session_message_projection_order"
@@ -25,7 +26,11 @@ import { ProjectV2 } from "@opencode-ai/core/project"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import { SessionSchema } from "@opencode-ai/core/session/schema"
-import { SessionTable } from "@opencode-ai/core/session/sql"
+import {
+  SESSION_ASK_TITLE_MAX_CHARS,
+  SESSION_ASK_TOOL_ACTIVITY_MAX_BYTES,
+  SessionTable,
+} from "@opencode-ai/core/session/sql"
 import sessionMetadataMigration from "@opencode-ai/core/database/migration/20260511173437_session-metadata"
 import type { SqlClient as SqlClientService } from "effect/unstable/sql/SqlClient"
 import { Database } from "@opencode-ai/core/database/database"
@@ -39,6 +44,31 @@ const run = <A, E>(effect: Effect.Effect<A, E, SqlClientService>) =>
   )
 
 const makeDb = EffectDrizzleSqlite.makeWithDefaults()
+
+const askSchema = (db: EffectDrizzleSqlite.EffectSQLiteDatabase) =>
+  Effect.gen(function* () {
+    const tables = yield* db.all<{ name: string; sql: string }>(sql`
+      SELECT name, sql
+      FROM sqlite_master
+      WHERE type = 'table' AND name IN ('session_ask_thread', 'session_ask_turn')
+      ORDER BY name
+    `)
+    const indexes = yield* db.all<{ name: string; sql: string }>(sql`
+      SELECT name, sql
+      FROM sqlite_master
+      WHERE type = 'index' AND name IN (
+        'session_ask_thread_session_updated_id_idx',
+        'session_ask_turn_thread_id_id_idx'
+      )
+      ORDER BY name
+    `)
+    const columns = yield* Effect.forEach(indexes, (index) =>
+      db
+        .all<{ name: string }>(sql`PRAGMA index_info(${sql.raw(index.name)})`)
+        .pipe(Effect.map((rows) => ({ name: index.name, columns: rows.map((row) => row.name) }))),
+    )
+    return { tables, indexes, columns }
+  })
 
 describe("DatabaseMigration", () => {
   test("defaults missing workspace names while preserving legacy workspace data", async () => {
@@ -268,6 +298,97 @@ describe("DatabaseMigration", () => {
           { name: "session_message_session_time_created_id_idx" },
           { name: "session_message_session_type_seq_idx" },
         ])
+      }),
+    )
+  })
+
+  test("matches fresh Ask storage when migrating an existing Session database", async () => {
+    const fresh = await run(
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        yield* DatabaseMigration.apply(db)
+        return yield* askSchema(db)
+      }),
+    )
+
+    await run(
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        yield* db.run(sql`PRAGMA foreign_keys = ON`)
+        yield* db.run(sql`CREATE TABLE session (id text PRIMARY KEY, time_updated integer NOT NULL)`)
+        yield* db.run(sql`INSERT INTO session (id, time_updated) VALUES ('ses_existing', 10)`)
+
+        yield* DatabaseMigration.applyOnly(db, [sessionAskMigration])
+        expect(yield* askSchema(db)).toEqual(fresh)
+        expect(fresh.columns).toEqual([
+          {
+            name: "session_ask_thread_session_updated_id_idx",
+            columns: ["session_id", "updated_at", "id"],
+          },
+          { name: "session_ask_turn_thread_id_id_idx", columns: ["thread_id", "id"] },
+        ])
+        expect(fresh.tables.find((table) => table.name === "session_ask_thread")?.sql).toContain(
+          `CHECK(length("title") <= ${SESSION_ASK_TITLE_MAX_CHARS})`,
+        )
+        expect(fresh.tables.find((table) => table.name === "session_ask_turn")?.sql).toContain(
+          `CHECK(length(cast("tool_activity" as blob)) <= ${SESSION_ASK_TOOL_ACTIVITY_MAX_BYTES})`,
+        )
+        expect(fresh.tables.find((table) => table.name === "session_ask_turn")?.sql).toContain(
+          `CHECK(json_valid("tool_activity") AND json_type("tool_activity") = 'array')`,
+        )
+
+        yield* db.run(
+          sql`INSERT INTO session_ask_thread (id, session_id, title, created_at, updated_at) VALUES ('ask_existing', 'ses_existing', ${"x".repeat(SESSION_ASK_TITLE_MAX_CHARS)}, 1, 1)`,
+        )
+        expect(
+          Exit.isFailure(
+            yield* db
+              .run(
+                sql`INSERT INTO session_ask_thread (id, session_id, title, created_at, updated_at) VALUES ('ask_title_too_long', 'ses_existing', ${"x".repeat(SESSION_ASK_TITLE_MAX_CHARS + 1)}, 1, 1)`,
+              )
+              .pipe(Effect.exit),
+          ),
+        ).toBe(true)
+
+        const toolActivityAtLimit = `["${"x".repeat(SESSION_ASK_TOOL_ACTIVITY_MAX_BYTES - 4)}"]`
+        expect(Buffer.byteLength(toolActivityAtLimit)).toBe(SESSION_ASK_TOOL_ACTIVITY_MAX_BYTES)
+        yield* db.run(
+          sql`INSERT INTO session_ask_turn (id, thread_id, question, answer, tool_activity, created_at) VALUES ('atn_existing', 'ask_existing', 'Question', 'Answer', ${toolActivityAtLimit}, 1)`,
+        )
+        expect(
+          Exit.isFailure(
+            yield* db
+              .run(
+                sql`INSERT INTO session_ask_turn (id, thread_id, question, answer, tool_activity, created_at) VALUES ('atn_tool_activity_too_large', 'ask_existing', 'Question', 'Answer', ${`${toolActivityAtLimit} `}, 1)`,
+              )
+              .pipe(Effect.exit),
+          ),
+        ).toBe(true)
+        expect(
+          Exit.isFailure(
+            yield* db
+              .run(
+                sql`INSERT INTO session_ask_turn (id, thread_id, question, answer, tool_activity, created_at) VALUES ('atn_invalid_json', 'ask_existing', 'Question', 'Answer', 'not-json', 1)`,
+              )
+              .pipe(Effect.exit),
+          ),
+        ).toBe(true)
+        expect(
+          Exit.isFailure(
+            yield* db
+              .run(
+                sql`INSERT INTO session_ask_turn (id, thread_id, question, answer, tool_activity, created_at) VALUES ('atn_not_array', 'ask_existing', 'Question', 'Answer', '{}', 1)`,
+              )
+              .pipe(Effect.exit),
+          ),
+        ).toBe(true)
+
+        expect(yield* db.get(sql`SELECT time_updated FROM session WHERE id = 'ses_existing'`)).toEqual({
+          time_updated: 10,
+        })
+        yield* db.run(sql`DELETE FROM session WHERE id = 'ses_existing'`)
+        expect(yield* db.get(sql`SELECT COUNT(*) AS count FROM session_ask_thread`)).toEqual({ count: 0 })
+        expect(yield* db.get(sql`SELECT COUNT(*) AS count FROM session_ask_turn`)).toEqual({ count: 0 })
       }),
     )
   })

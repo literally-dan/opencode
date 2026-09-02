@@ -175,8 +175,15 @@ import type {
   QuestionV2Reply,
   SessionAbortErrors,
   SessionAbortResponses,
+  SessionAskCancelErrors,
+  SessionAskCancelResponses,
   SessionAskErrors,
+  SessionAskRequestId,
   SessionAskResponses,
+  SessionAskThreadErrors,
+  SessionAskThreadResponses,
+  SessionAskThreadsErrors,
+  SessionAskThreadsResponses,
   SessionChildrenErrors,
   SessionChildrenResponses,
   SessionCommandErrors,
@@ -4112,15 +4119,53 @@ export class Session2 extends HeyApiClient {
   }
 
   /**
+   * List Ask threads
+   *
+   * List isolated Ask threads for a session with cursor pagination.
+   */
+  public askThreads<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      directory?: string
+      workspace?: string
+      limit?: number
+      before?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "query", key: "limit" },
+            { in: "query", key: "before" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<SessionAskThreadsResponses, SessionAskThreadsErrors, ThrowOnError>({
+      url: "/session/{sessionID}/ask",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
    * Ask without changing history
    *
-   * Ask a one-turn question using the current session context without persisting the question or answer.
+   * Start or continue an isolated Ask thread using the current session context without changing session history.
    */
   public ask<ThrowOnError extends boolean = false>(
     parameters: {
       sessionID: string
       directory?: string
       workspace?: string
+      requestID?: SessionAskRequestId
+      threadID?: string
       question?: string
       model?: {
         providerID: string
@@ -4139,6 +4184,8 @@ export class Session2 extends HeyApiClient {
             { in: "path", key: "sessionID" },
             { in: "query", key: "directory" },
             { in: "query", key: "workspace" },
+            { in: "body", key: "requestID" },
+            { in: "body", key: "threadID" },
             { in: "body", key: "question" },
             { in: "body", key: "model" },
             { in: "body", key: "agent" },
@@ -4156,6 +4203,78 @@ export class Session2 extends HeyApiClient {
         ...options?.headers,
         ...params.headers,
       },
+    })
+  }
+
+  /**
+   * Get Ask thread
+   *
+   * Get completed turns from an isolated Ask thread with cursor pagination.
+   */
+  public askThread<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      threadID: string
+      directory?: string
+      workspace?: string
+      limit?: number
+      before?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "path", key: "threadID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "query", key: "limit" },
+            { in: "query", key: "before" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<SessionAskThreadResponses, SessionAskThreadErrors, ThrowOnError>({
+      url: "/session/{sessionID}/ask/{threadID}",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Cancel Ask turn
+   *
+   * Cancel active work for one isolated Ask thread without cancelling session execution.
+   */
+  public askCancel<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      threadID: string
+      directory?: string
+      workspace?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "path", key: "threadID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<SessionAskCancelResponses, SessionAskCancelErrors, ThrowOnError>({
+      url: "/session/{sessionID}/ask/{threadID}/cancel",
+      ...options,
+      ...params,
     })
   }
 

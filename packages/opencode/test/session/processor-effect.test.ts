@@ -465,6 +465,7 @@ function recoveryRegistry(state: RecoveryStateValue) {
     ids: () => Effect.succeed([held.id]),
     all: () => Effect.succeed([held]),
     named: () => Effect.die("unused"),
+    askTools: () => Effect.die("unused"),
     tools: () => Effect.succeed([held]),
   })
 }
@@ -1532,6 +1533,7 @@ it.live("session.processor effect tests admit a duplicate provider tool call ID 
           ids: () => Effect.succeed([lookup.id]),
           all: () => Effect.succeed([lookup]),
           named: () => Effect.die("unused"),
+          askTools: () => Effect.die("unused"),
           tools: () => Effect.succeed([lookup]),
         })
         const toolChunk = (index: number) => ({

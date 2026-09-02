@@ -5,8 +5,8 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { eq } from "drizzle-orm"
 import { EventV2Bridge } from "@/event-v2-bridge"
-import { expect } from "bun:test"
-import { Cause, Deferred, Duration, Effect, Exit, Fiber, Layer, Option, Stream } from "effect"
+import { expect, test } from "bun:test"
+import { Cause, Deferred, Duration, Effect, Exit, Fiber, Layer, Option, Schema, Stream } from "effect"
 import { LLMEvent, Usage } from "@opencode-ai/llm"
 import path from "path"
 import { fileURLToPath } from "url"
@@ -27,7 +27,8 @@ import { Image } from "../../src/image/image"
 import { Question } from "../../src/question"
 import { Todo } from "../../src/session/todo"
 import { Session } from "@/session/session"
-import { SessionMessageTable } from "@opencode-ai/core/session/sql"
+import { SessionContextEpochTable, SessionInputTable, SessionMessageTable } from "@opencode-ai/core/session/sql"
+import { EventTable } from "@opencode-ai/core/event/sql"
 import { LLM } from "../../src/session/llm"
 import { MessageV2 } from "../../src/session/message-v2"
 import { FSUtil } from "@opencode-ai/core/fs-util"
@@ -36,6 +37,7 @@ import { SessionSummary } from "../../src/session/summary"
 import { Instruction } from "../../src/session/instruction"
 import { SessionProcessor } from "../../src/session/processor"
 import { SessionPrompt } from "../../src/session/prompt"
+import { SessionAsk } from "../../src/session/ask"
 import { SessionRevert } from "../../src/session/revert"
 import { SessionRunState } from "../../src/session/run-state"
 import { MessageID, PartID, SessionID } from "../../src/session/schema"
@@ -109,14 +111,14 @@ function completedTool(parts: SessionV1.Part[]) {
   return part?.state.status === "completed" ? (part as CompletedToolPart) : undefined
 }
 
-function makeMcp(instructions: MCP.ServerInstructions[] = []) {
+function makeMcp(instructions: MCP.ServerInstructions[] = [], tools: Record<string, MCP.McpTool> = {}) {
   return Layer.succeed(
     MCP.Service,
     MCP.Service.of({
       status: () => Effect.succeed({}),
       clients: () => Effect.succeed({}),
       instructions: () => Effect.succeed(instructions),
-      tools: () => Effect.succeed({}),
+      tools: () => Effect.succeed(tools),
       prompts: () => Effect.succeed({}),
       resources: () => Effect.succeed({}),
       resourceTemplates: () => Effect.succeed({}),
@@ -191,6 +193,7 @@ const testLLMServerNode = LayerNode.make({ service: TestLLMServer, layer: TestLL
 
 const promptRoot = LayerNode.group([
   SessionPrompt.node,
+  SessionAsk.node,
   Session.node,
   SessionProjector.node,
   MessageV2.node,
@@ -231,22 +234,31 @@ const promptRoot = LayerNode.group([
 
 function makePrompt(input?: {
   mcpInstructions?: MCP.ServerInstructions[]
-  processor?: "blocking"
+  mcpTools?: Record<string, MCP.McpTool>
+  processor?: "blocking" | Layer.Layer<SessionProcessor.Service>
   llm?: Layer.Layer<LLM.Service>
   plugin?: Layer.Layer<Plugin.Service>
 }) {
   const replacements = [
     [SessionSummary.node, summary],
     [LSP.node, lsp],
-    [MCP.node, makeMcp(input?.mcpInstructions)],
+    [MCP.node, makeMcp(input?.mcpInstructions, input?.mcpTools)],
     [RuntimeFlags.node, runtimeFlags],
   ] as const
   const plugin = input?.plugin ? ([Plugin.node, input.plugin] as const) : undefined
-  if (input?.processor === "blocking") {
+  if (input?.processor && input.llm) {
     return LayerNode.compile(promptRoot, [
       ...replacements,
       ...(plugin ? [plugin] : []),
-      [SessionProcessor.node, blockingProcessor],
+      [SessionProcessor.node, input.processor === "blocking" ? blockingProcessor : input.processor],
+      [LLM.node, input.llm],
+    ])
+  }
+  if (input?.processor) {
+    return LayerNode.compile(promptRoot, [
+      ...replacements,
+      ...(plugin ? [plugin] : []),
+      [SessionProcessor.node, input.processor === "blocking" ? blockingProcessor : input.processor],
     ])
   }
   if (input?.llm)
@@ -257,22 +269,32 @@ function makePrompt(input?: {
 
 function makeHttp(input?: {
   mcpInstructions?: MCP.ServerInstructions[]
-  processor?: "blocking"
+  mcpTools?: Record<string, MCP.McpTool>
+  processor?: "blocking" | Layer.Layer<SessionProcessor.Service>
   plugin?: Layer.Layer<Plugin.Service>
+  llm?: Layer.Layer<LLM.Service>
 }) {
   const root = LayerNode.group([promptRoot, testLLMServerNode])
   const replacements = [
     [SessionSummary.node, summary],
     [LSP.node, lsp],
-    [MCP.node, makeMcp(input?.mcpInstructions)],
+    [MCP.node, makeMcp(input?.mcpInstructions, input?.mcpTools)],
     [RuntimeFlags.node, runtimeFlags],
   ] as const
   const plugin = input?.plugin ? ([Plugin.node, input.plugin] as const) : undefined
-  if (input?.processor === "blocking") {
+  if (input?.processor && input.llm) {
     return LayerNode.compile(root, [
       ...replacements,
       ...(plugin ? [plugin] : []),
-      [SessionProcessor.node, blockingProcessor],
+      [SessionProcessor.node, input.processor === "blocking" ? blockingProcessor : input.processor],
+      [LLM.node, input.llm],
+    ])
+  }
+  if (input?.processor) {
+    return LayerNode.compile(root, [
+      ...replacements,
+      ...(plugin ? [plugin] : []),
+      [SessionProcessor.node, input.processor === "blocking" ? blockingProcessor : input.processor],
     ])
   }
   if (plugin) return LayerNode.compile(root, [...replacements, plugin])
@@ -346,6 +368,158 @@ const askTransform = testEffect(
     ),
   }),
 )
+const askSystemTransformCalls: string[] = []
+const askHistoryTransform = testEffect(
+  makeHttp({
+    plugin: Layer.succeed(
+      Plugin.Service,
+      Plugin.Service.of({
+        trigger: ((name, _input, output) =>
+          Effect.sync(() => {
+            if (name !== "experimental.chat.messages.transform") return output
+            if (typeof output !== "object" || output === null || !("messages" in output)) return output
+            if (!Array.isArray(output.messages)) return output
+            const mode = [
+              "length",
+              "reorder",
+              "removal",
+              "add",
+              "current-removal",
+              "id-mutation",
+              "duplicate",
+              "wrong-role",
+            ].find((value) => JSON.stringify(output.messages).includes(`current ${value} transform question`))
+            if (!mode) return output
+            if (mode === "length") {
+              const normal = output.messages.find((message) =>
+                JSON.stringify(message).includes("normal transform marker"),
+              )
+              if (normal) output.messages.unshift(normal)
+            }
+            if (mode === "reorder") {
+              const index = output.messages.findIndex((message) =>
+                JSON.stringify(message).includes("current reorder transform question"),
+              )
+              const current = index >= 0 ? output.messages.splice(index, 1)[0] : undefined
+              if (current) output.messages.unshift(current)
+              const stale = output.messages.find((message) =>
+                JSON.stringify(message).includes("prior reorder transform question"),
+              )
+              if (stale && typeof stale === "object" && "info" in stale && typeof stale.info === "object" && stale.info)
+                stale.info.system = "stale reordered user settings"
+            }
+            if (mode === "removal") {
+              const index = output.messages.findIndex((message) =>
+                JSON.stringify(message).includes("prior removal transform answer"),
+              )
+              if (index >= 0) output.messages.splice(index, 1)
+            }
+            if (mode === "add") {
+              const current = output.messages.find((message) =>
+                JSON.stringify(message).includes("current add transform question"),
+              )
+              if (current && typeof current === "object" && "info" in current && typeof current.info === "object") {
+                const added = structuredClone(current)
+                added.info.id = MessageID.ascending()
+                added.info.system = "stale added user settings"
+                output.messages.push(added)
+              }
+            }
+            if (mode === "current-removal") {
+              const index = output.messages.findIndex((message) =>
+                JSON.stringify(message).includes("current current-removal transform question"),
+              )
+              if (index >= 0) output.messages.splice(index, 1)
+            }
+            if (mode === "id-mutation") {
+              const current = output.messages.find((message) =>
+                JSON.stringify(message).includes("current id-mutation transform question"),
+              )
+              if (current && typeof current === "object" && "info" in current && current.info)
+                current.info.id = MessageID.ascending()
+            }
+            if (mode === "duplicate") {
+              const current = output.messages.find((message) =>
+                JSON.stringify(message).includes("current duplicate transform question"),
+              )
+              if (current) output.messages.push(structuredClone(current))
+            }
+            if (mode === "wrong-role") {
+              const current = output.messages.find((message) =>
+                JSON.stringify(message).includes("current wrong-role transform question"),
+              )
+              if (current && typeof current === "object" && "info" in current && current.info)
+                current.info.role = "assistant"
+            }
+            return output
+          })) as Plugin.Interface["trigger"],
+        list: () => Effect.succeed([]),
+        init: () => Effect.void,
+      }),
+    ),
+  }),
+)
+const transformedSystemMarker = "ask transformed system marker 6248"
+const askSystemBudget = testEffect(
+  makeHttp({
+    plugin: Layer.succeed(
+      Plugin.Service,
+      Plugin.Service.of({
+        trigger: ((name, _input, output) =>
+          Effect.sync(() => {
+            if (name !== "experimental.chat.system.transform") return output
+            if (typeof output !== "object" || output === null || !("system" in output) || !Array.isArray(output.system))
+              return output
+            askSystemTransformCalls.push(name)
+            output.system.push(`${transformedSystemMarker} ${"system ".repeat(4_000)}`)
+            return output
+          })) as Plugin.Interface["trigger"],
+        list: () => Effect.succeed([]),
+        init: () => Effect.void,
+      }),
+    ),
+  }),
+)
+const askBoundaryHooks: string[] = []
+const askBoundaryPlugin = Layer.succeed(
+  Plugin.Service,
+  Plugin.Service.of({
+    init: () => Effect.void,
+    list: () =>
+      Effect.succeed([
+        {
+          tool: {
+            custom_forbidden: {
+              description: "must not be visible to Ask",
+              args: {},
+              execute: async () => "forbidden",
+            },
+          },
+        },
+      ]),
+    trigger: ((name, _input, output) =>
+      Effect.sync(() => {
+        askBoundaryHooks.push(name)
+        return output
+      })) as Plugin.Interface["trigger"],
+  }),
+)
+const askBoundary = testEffect(
+  makeHttp({
+    plugin: askBoundaryPlugin,
+    mcpTools: {
+      mcp_forbidden: {
+        client: {} as MCP.McpTool["client"],
+        def: {
+          name: "mcp_forbidden",
+          description: "must not be visible to Ask",
+          inputSchema: { type: "object", properties: {} },
+        } as MCP.McpTool["def"],
+      },
+    },
+  }),
+)
+
 const askProviderFailure = testEffect(
   makePrompt({
     llm: Layer.succeed(
@@ -385,6 +559,45 @@ const askCleanupRace = testEffect(
     ),
   }),
 )
+let cancelNormalGate:
+  | {
+      started: Deferred.Deferred<void>
+      finalizing: Deferred.Deferred<void>
+      release: Deferred.Deferred<void>
+    }
+  | undefined
+let cancelAskStarted: Deferred.Deferred<void> | undefined
+
+const cancelConcurrency = testEffect(
+  makePrompt({
+    processor: Layer.succeed(
+      SessionProcessor.Service,
+      SessionProcessor.Service.of({
+        create: () => {
+          const gate = cancelNormalGate
+          if (!gate) return Effect.die("missing normal cancellation gate")
+          return Deferred.succeed(gate.started, undefined).pipe(
+            Effect.andThen(Effect.never),
+            Effect.ensuring(
+              Deferred.succeed(gate.finalizing, undefined).pipe(Effect.andThen(Deferred.await(gate.release))),
+            ),
+          )
+        },
+      }),
+    ),
+    llm: Layer.succeed(
+      LLM.Service,
+      LLM.Service.of({
+        stream: () => {
+          const started = cancelAskStarted
+          if (!started) return Stream.die("missing Ask cancellation gate")
+          return Stream.fromEffect(Deferred.succeed(started, undefined).pipe(Effect.andThen(Effect.never)))
+        },
+      }),
+    ),
+  }),
+)
+
 const withMcpInstructions = testEffect(
   makeHttp({
     mcpInstructions: [
@@ -441,6 +654,58 @@ function providerCfg(url: string) {
           ...cfg.provider.test.options,
           baseURL: url,
         },
+      },
+    },
+  }
+}
+
+function askModelBudgetCfg(url: string) {
+  const config = providerCfg(url)
+  return {
+    ...config,
+    provider: {
+      ...config.provider,
+      test: {
+        ...config.provider.test,
+        models: {
+          "test-model": {
+            ...config.provider.test.models["test-model"],
+            limit: { context: 6_000, output: 1_000 },
+          },
+        },
+      },
+    },
+  }
+}
+
+function askBudgetCfg(url: string) {
+  return {
+    ...askModelBudgetCfg(url),
+    agent: { build: { prompt: `ask effective system ${"system ".repeat(4_000)}` } },
+  }
+}
+
+function gitlabWorkflowCfg(url: string) {
+  return {
+    ...cfg,
+    provider: {
+      ...cfg.provider,
+      gitlab: {
+        ...cfg.provider.test,
+        id: "gitlab",
+        models: {
+          "duo-workflow-test": {
+            ...cfg.provider.test.models["test-model"],
+            id: "duo-workflow-test",
+            name: "GitLab Workflow Test",
+          },
+          "workflow-alias": {
+            ...cfg.provider.test.models["test-model"],
+            id: "duo-workflow-test",
+            name: "GitLab Workflow Alias",
+          },
+        },
+        options: { ...cfg.provider.test.options, baseURL: url },
       },
     },
   }
@@ -1063,44 +1328,146 @@ it.instance("loop calls LLM and returns assistant message", () =>
   }),
 )
 
-it.instance("ask uses session context without persisting the question or answer", () =>
-  Effect.gen(function* () {
-    const { llm } = yield* useServerConfig(providerCfg)
-    const prompt = yield* SessionPrompt.Service
-    const sessions = yield* Session.Service
-    const chat = yield* sessions.create({ title: "Pinned" })
-    yield* seed(chat.id, { finish: "stop" })
-    const before = yield* sessions.messages({ sessionID: chat.id })
-    yield* llm.text("The answer is 42.")
+test("ask input request ID is optional and bounded", () => {
+  const input = { sessionID: "ses_test", question: "question" }
+  expect(Schema.is(SessionAsk.AskInput)(input)).toBe(true)
+  expect(Schema.is(SessionAsk.AskInput)({ ...input, requestID: "client-request" })).toBe(true)
+  expect(Schema.is(SessionAsk.AskInput)({ ...input, requestID: "" })).toBe(false)
+  expect(Schema.is(SessionAsk.AskInput)({ ...input, requestID: "x".repeat(129) })).toBe(false)
+})
 
-    const result = yield* prompt.ask({ sessionID: chat.id, question: "What number did we establish?" })
-    const after = yield* sessions.messages({ sessionID: chat.id })
-    const hit = (yield* llm.hits)[0]
+it.instance(
+  "ask uses session context without persisting the question or answer",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const asks = yield* SessionAsk.Service
+      const sessions = yield* Session.Service
+      const status = yield* SessionStatus.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
+      yield* seed(chat.id, { finish: "stop" })
+      const before = yield* sessions.messages({ sessionID: chat.id })
+      const beforeInfo = yield* sessions.get(chat.id)
+      yield* llm.text("The answer is 42.")
 
-    expect(result).toEqual({ text: "The answer is 42." })
-    expect(after.map((message) => message.info.id)).toEqual(before.map((message) => message.info.id))
-    expect(strings(hit?.body)).toContain("hello")
-    expect(strings(hit?.body)).toContain("hi there")
-    expect(strings(hit?.body)).toContain("What number did we establish?")
-    expect(hit?.body.tools).toBeUndefined()
-  }),
+      const result = yield* prompt.ask({ sessionID: chat.id, question: "What number did we establish?" })
+      const after = yield* sessions.messages({ sessionID: chat.id })
+      const hit = (yield* llm.hits)[0]
+
+      expect(result).toMatchObject({ text: "The answer is 42." })
+      expect(after.map((message) => message.info.id)).toEqual(before.map((message) => message.info.id))
+      expect((yield* sessions.get(chat.id)).time.updated).toBe(beforeInfo.time.updated)
+      expect((yield* status.get(chat.id)).type).toBe("idle")
+      const threads = yield* asks.threads({ sessionID: chat.id })
+      expect(threads.items).toHaveLength(1)
+      expect((yield* asks.turns({ sessionID: chat.id, threadID: result.threadID })).items).toEqual([
+        {
+          id: result.id,
+          threadID: result.threadID,
+          question: "What number did we establish?",
+          answer: "The answer is 42.",
+          toolActivity: [],
+          time: result.time,
+        },
+      ])
+      expect(strings(hit?.body)).toContain("hello")
+      expect(strings(hit?.body)).toContain("hi there")
+      expect(strings(hit?.body)).toContain("What number did we establish?")
+      expect(strings(hit?.body.tools)).toEqual(expect.arrayContaining(["read", "glob", "grep", "webfetch"]))
+    }),
+  30_000,
 )
 
-askTransform.instance("ask transforms the ephemeral question before model serialization", () =>
-  Effect.gen(function* () {
-    const { llm } = yield* useServerConfig(providerCfg)
-    const prompt = yield* SessionPrompt.Service
-    const sessions = yield* Session.Service
-    const chat = yield* sessions.create({ title: "Pinned" })
-    yield* llm.text("transformed")
+it.instance(
+  "ask correlates concurrent client requests and generates unique defaults",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const asks = yield* SessionAsk.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Ask request correlation" })
+      yield* llm.text("first answer")
+      yield* llm.text("second answer")
 
-    expect(yield* prompt.ask({ sessionID: chat.id, question: "untransformed question" })).toEqual({
-      text: "transformed",
-    })
-    const hit = (yield* llm.hits)[0]
-    expect(strings(hit?.body)).toContain("transformed question")
-    expect(strings(hit?.body)).not.toContain("untransformed question")
-  }),
+      const explicit = yield* Effect.all(
+        [
+          asks.ask({ sessionID: chat.id, requestID: "client-first", question: "first question" }),
+          asks.ask({ sessionID: chat.id, requestID: "client-second", question: "second question" }),
+        ],
+        { concurrency: "unbounded" },
+      )
+      yield* llm.text("third answer")
+      yield* llm.text("fourth answer")
+      const generated = yield* Effect.all(
+        [
+          asks.ask({ sessionID: chat.id, question: "third question" }),
+          asks.ask({ sessionID: chat.id, question: "fourth question" }),
+        ],
+        { concurrency: "unbounded" },
+      )
+
+      expect(explicit.map((result) => result.requestID)).toEqual(["client-first", "client-second"])
+      expect(generated[0].requestID).not.toBe(generated[1].requestID)
+      expect(generated.every((result) => Schema.is(SessionAsk.Event.RequestID)(result.requestID))).toBe(true)
+      const persisted = yield* Effect.forEach([...explicit, ...generated], (result) =>
+        asks.turns({ sessionID: chat.id, threadID: result.threadID }).pipe(Effect.map((page) => page.items[0])),
+      )
+      expect(persisted.every((turn) => turn && !("requestID" in turn))).toBe(true)
+    }),
+  30_000,
+)
+
+askTransform.instance(
+  "ask transforms the ephemeral question before model serialization",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
+      yield* llm.text("transformed")
+
+      expect(yield* prompt.ask({ sessionID: chat.id, question: "untransformed question" })).toMatchObject({
+        text: "transformed",
+      })
+      const hit = (yield* llm.hits)[0]
+      expect(strings(hit?.body)).toContain("transformed question")
+      expect(strings(hit?.body)).not.toContain("untransformed question")
+    }),
+  30_000,
+)
+
+it.instance(
+  "Ask runs while the normal runner stays busy and receives the exact isolation instruction",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const asks = yield* SessionAsk.Service
+      const sessions = yield* Session.Service
+      const status = yield* SessionStatus.Service
+      const chat = yield* sessions.create({ title: "Busy normal runner" })
+      const release = defer<void>()
+      yield* llm.hold("normal answer", release.promise)
+      const normal = yield* prompt
+        .prompt({ sessionID: chat.id, parts: [{ type: "text", text: "normal busy snapshot marker" }] })
+        .pipe(Effect.forkChild)
+      yield* awaitWithTimeout(llm.wait(1), "normal runner did not reach the provider", "10 seconds")
+      expect((yield* status.get(chat.id)).type).toBe("busy")
+      yield* llm.text("isolated answer")
+
+      const result = yield* asks.ask({ sessionID: chat.id, question: "isolated busy question" })
+      const request = strings((yield* llm.hits)[1]?.body)
+
+      expect(result.text).toBe("isolated answer")
+      expect(request.some((item) => item.includes(SessionAsk.IsolationInstruction))).toBe(true)
+      expect(request).toContain("normal busy snapshot marker")
+      expect((yield* status.get(chat.id)).type).toBe("busy")
+      release.resolve()
+      yield* Fiber.join(normal)
+    }),
+  30_000,
 )
 
 it.instance(
@@ -1109,6 +1476,7 @@ it.instance(
     Effect.gen(function* () {
       const { llm } = yield* useServerConfig(providerCfg)
       const prompt = yield* SessionPrompt.Service
+      const asks = yield* SessionAsk.Service
       const sessions = yield* Session.Service
       const chat = yield* sessions.create({ title: "Pinned" })
       yield* llm.hang
@@ -1123,6 +1491,53 @@ it.instance(
 
       expect(Exit.isFailure(firstExit) && Cause.hasInterruptsOnly(firstExit.cause)).toBe(true)
       expect(Exit.isFailure(secondExit) && Cause.hasInterruptsOnly(secondExit.cause)).toBe(true)
+      expect((yield* asks.threads({ sessionID: chat.id })).items).toEqual([])
+    }),
+  30_000,
+)
+
+cancelConcurrency.instance(
+  "cancel interrupts Ask while normal runner finalization is blocked",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const asks = yield* SessionAsk.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Concurrent cancellation" })
+      const normal = {
+        started: yield* Deferred.make<void>(),
+        finalizing: yield* Deferred.make<void>(),
+        release: yield* Deferred.make<void>(),
+      }
+      const askStarted = yield* Deferred.make<void>()
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          cancelNormalGate = undefined
+          cancelAskStarted = undefined
+        }).pipe(Effect.andThen(Deferred.succeed(normal.release, undefined)), Effect.asVoid),
+      )
+      cancelNormalGate = normal
+      cancelAskStarted = askStarted
+      const normalFiber = yield* prompt
+        .prompt({ sessionID: chat.id, parts: [{ type: "text", text: "normal work" }] })
+        .pipe(Effect.forkChild)
+      yield* awaitWithTimeout(Deferred.await(normal.started), "normal runner did not start", "10 seconds")
+      const askFiber = yield* asks.ask({ sessionID: chat.id, question: "isolated work" }).pipe(Effect.forkChild)
+      yield* awaitWithTimeout(Deferred.await(askStarted), "Ask did not start", "10 seconds")
+
+      const cancelling = yield* prompt.cancel(chat.id).pipe(Effect.forkChild)
+      yield* awaitWithTimeout(
+        Deferred.await(normal.finalizing),
+        "normal runner did not enter finalization",
+        "10 seconds",
+      )
+      const askExit = yield* awaitWithTimeout(Fiber.await(askFiber), "Ask was not cancelled concurrently", "2 seconds")
+
+      expect(Exit.isFailure(askExit) && Cause.hasInterruptsOnly(askExit.cause)).toBe(true)
+      expect((yield* asks.threads({ sessionID: chat.id })).items).toEqual([])
+      yield* Deferred.succeed(normal.release, undefined)
+      yield* awaitWithTimeout(Fiber.join(cancelling), "Session cancel did not finish", "5 seconds")
+      yield* awaitWithTimeout(Fiber.interrupt(normalFiber), "normal prompt did not finish", "5 seconds")
     }),
   30_000,
 )
@@ -1187,10 +1602,13 @@ askProviderFailure.instance("ask preserves structured provider stream failures",
     const test = yield* TestInstance
     yield* writeConfig(test.directory, cfg)
     const prompt = yield* SessionPrompt.Service
+    const asks = yield* SessionAsk.Service
     const sessions = yield* Session.Service
     const chat = yield* sessions.create({ title: "Pinned" })
 
-    const exit = yield* prompt.ask({ sessionID: chat.id, question: "fail" }).pipe(Effect.exit)
+    const exit = yield* prompt
+      .ask({ sessionID: chat.id, requestID: "failed-request", question: "fail" })
+      .pipe(Effect.exit)
 
     expect(Exit.isFailure(exit)).toBe(true)
     if (Exit.isSuccess(exit)) return
@@ -1202,61 +1620,794 @@ askProviderFailure.instance("ask preserves structured provider stream failures",
       isRetryable: true,
     })
     expect(error.data.responseBody).toContain("server_error")
+    const reused = yield* prompt
+      .ask({ sessionID: chat.id, requestID: "failed-request", question: "fail again" })
+      .pipe(Effect.exit)
+    expect(Exit.isFailure(reused) && SessionV1.APIError.isInstance(Cause.squash(reused.cause))).toBe(true)
+    expect((yield* asks.threads({ sessionID: chat.id })).items).toEqual([])
   }),
 )
 
-it.instance("requires current inventory and ignores id-like strings from history", () =>
-  Effect.gen(function* () {
-    const { llm } = yield* useServerConfig(providerCfg)
-    const { prompt, sessions, chat } = yield* boot()
-    const seeded = yield* seed(chat.id, { finish: "stop" })
-    const foreignPartID = "prt_04c866191001ZOVMkrtXfsS5QE"
-    const foreignMessageID = "msg_04c863eb1001JckWhyFN4e592C"
-    // Enough candidates to exceed the pressure threshold while exercising the
-    // reminder's resistance to untrusted labels and id-like output text.
-    for (let index = 0; index < 12; index++)
-      yield* sessions.updatePart({
-        id: PartID.ascending(),
-        messageID: seeded.assistant.id,
+it.instance(
+  "ask follow-ups use only the selected thread history",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const asks = yield* SessionAsk.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Thread isolation" })
+      yield* llm.text("alpha answer")
+      const alpha = yield* asks.ask({ sessionID: chat.id, question: "alpha question" })
+      yield* llm.text("beta answer")
+      yield* asks.ask({ sessionID: chat.id, question: "beta question" })
+      yield* llm.text("alpha follow-up answer")
+
+      const followup = yield* asks.ask({
         sessionID: chat.id,
-        type: "tool",
-        callID: `pressure-call-${index}`,
-        tool: index === 0 ? "x".repeat(100) + "\nUNTRUSTED_LABEL" : `pressure_tool_${index}`,
-        state: {
-          status: "completed",
-          input: {},
-          output:
-            index === 0
-              ? `${"large settled output ".repeat(2_500)}\nforeign ${foreignPartID} message ${foreignMessageID}`
-              : "large settled output ".repeat(2_500),
-          title: "done",
-          metadata: {},
-          time: { start: 1, end: 2 },
+        threadID: alpha.threadID,
+        question: "alpha follow-up",
+      })
+      const hit = (yield* llm.hits)[2]
+      const context = strings(hit?.body)
+
+      expect(context).toEqual(expect.arrayContaining(["alpha question", "alpha answer", "alpha follow-up"]))
+      expect(context).not.toContain("beta question")
+      expect(context).not.toContain("beta answer")
+      expect(
+        (yield* asks.turns({ sessionID: chat.id, threadID: alpha.threadID })).items.map((turn) => turn.id),
+      ).toEqual([alpha.id, followup.id])
+    }),
+  30_000,
+)
+
+it.instance(
+  "ask history pruning budgets the effective agent system prompt",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(askBudgetCfg)
+      const asks = yield* SessionAsk.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Ask budget" })
+      yield* llm.text("prior ask budget answer")
+      const first = yield* asks.ask({ sessionID: chat.id, question: "prior ask budget question" })
+      yield* llm.text("current answer")
+
+      yield* asks.ask({ sessionID: chat.id, threadID: first.threadID, question: "current budget question" })
+      const request = strings((yield* llm.hits)[1]?.body)
+
+      expect(request.some((item) => item.includes("ask effective system"))).toBe(true)
+      expect(request).toContain("current budget question")
+      expect(request).not.toContain("prior ask budget question")
+      expect(request).not.toContain("prior ask budget answer")
+    }),
+  30_000,
+)
+
+askSystemBudget.instance(
+  "ask budgets the transformed system prompt once before pruning",
+  () =>
+    Effect.gen(function* () {
+      askSystemTransformCalls.splice(0)
+      const { llm } = yield* useServerConfig(askModelBudgetCfg)
+      const asks = yield* SessionAsk.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Ask transformed system budget" })
+      yield* llm.text("prior transformed budget answer")
+      const first = yield* asks.ask({ sessionID: chat.id, question: "prior transformed budget question" })
+      yield* llm.text("current answer")
+
+      yield* asks.ask({ sessionID: chat.id, threadID: first.threadID, question: "current transformed question" })
+      const request = JSON.stringify((yield* llm.hits)[1]?.body)
+
+      expect(askSystemTransformCalls).toHaveLength(2)
+      expect(request.split(transformedSystemMarker)).toHaveLength(2)
+      expect(request).toContain("current transformed question")
+      expect(request).not.toContain("prior transformed budget question")
+      expect(request).not.toContain("prior transformed budget answer")
+    }),
+  30_000,
+)
+
+askHistoryTransform.instance(
+  "ask prunes only prior thread turns after length, reorder, removal, and add transforms",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(askBudgetCfg)
+      const asks = yield* SessionAsk.Service
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+
+      yield* Effect.forEach(["length", "reorder", "removal", "add"] as const, (mode) =>
+        Effect.gen(function* () {
+          const chat = yield* sessions.create({ title: `Ask ${mode} transform pruning` })
+          yield* llm.text(`normal ${mode} answer`)
+          yield* prompt.prompt({
+            sessionID: chat.id,
+            parts: [{ type: "text", text: `normal transform marker ${mode}` }],
+          })
+          yield* llm.text(`prior ${mode} transform answer`)
+          const first = yield* asks.ask({
+            sessionID: chat.id,
+            question: `prior ${mode} transform question`,
+          })
+          yield* llm.text(`current ${mode} answer`)
+          yield* asks.ask({
+            sessionID: chat.id,
+            threadID: first.threadID,
+            question: `current ${mode} transform question`,
+          })
+          const request = JSON.stringify((yield* llm.hits).at(-1)?.body)
+
+          expect(request).toContain(`normal transform marker ${mode}`)
+          expect(request).toContain(`current ${mode} transform question`)
+          expect(request).not.toContain(`prior ${mode} transform question`)
+          expect(request).not.toContain(`prior ${mode} transform answer`)
+          expect(request).not.toContain("stale reordered user settings")
+          expect(request).not.toContain("stale added user settings")
+        }),
+      )
+    }),
+  60_000,
+)
+
+askHistoryTransform.instance(
+  "ask rejects transformed current-message mutation, collision, role changes, and removal",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const asks = yield* SessionAsk.Service
+      const sessions = yield* Session.Service
+      yield* Effect.forEach(["id-mutation", "duplicate", "wrong-role", "current-removal"] as const, (mode) =>
+        Effect.gen(function* () {
+          const chat = yield* sessions.create({ title: `Invalid current Ask ${mode}` })
+          const exit = yield* asks
+            .ask({
+              sessionID: chat.id,
+              requestID: `invalid-current-${mode}`,
+              question: `current ${mode} transform question`,
+            })
+            .pipe(Effect.exit)
+
+          expect(Exit.isFailure(exit)).toBe(true)
+          if (Exit.isFailure(exit))
+            expect(Cause.squash(exit.cause)).toMatchObject({
+              _tag: "SessionAskCurrentMessageMissingError",
+              sessionID: chat.id,
+              requestID: `invalid-current-${mode}`,
+              messageID: expect.stringMatching(/^msg_/),
+            })
+          expect((yield* asks.threads({ sessionID: chat.id })).items).toEqual([])
+        }),
+      )
+      expect(yield* llm.hits).toHaveLength(0)
+    }),
+  30_000,
+)
+
+it.instance(
+  "later normal prompts exclude all Ask thread data",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const asks = yield* SessionAsk.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Ask exclusion" })
+      yield* llm.text("ask private answer marker 4831")
+      const result = yield* asks.ask({ sessionID: chat.id, question: "ask private question marker 9274" })
+      yield* llm.text("normal answer")
+
+      yield* prompt.prompt({ sessionID: chat.id, parts: [{ type: "text", text: "normal request marker" }] })
+      const request = JSON.stringify((yield* llm.hits)[1]?.body)
+
+      expect(request).toContain("normal request marker")
+      for (const value of [
+        "ask private question marker 9274",
+        "ask private answer marker 4831",
+        result.threadID,
+        result.id,
+        SessionAsk.IsolationInstruction,
+      ]) {
+        expect(request).not.toContain(value)
+      }
+    }),
+  30_000,
+)
+
+it.instance(
+  "Ask writes no normal messages, durable inputs, context epochs, or replay events",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const asks = yield* SessionAsk.Service
+      const sessions = yield* Session.Service
+      const { db } = yield* Database.Service
+      const chat = yield* sessions.create({ title: "Ask durable isolation" })
+      const beforeEvents = (yield* db.select().from(EventTable).all().pipe(Effect.orDie)).length
+      yield* llm.text("isolated durable answer")
+
+      const result = yield* asks.ask({ sessionID: chat.id, question: "isolated durable question" })
+
+      expect(
+        yield* db.select().from(SessionMessageTable).where(eq(SessionMessageTable.session_id, chat.id)).all(),
+      ).toEqual([])
+      expect(yield* db.select().from(SessionInputTable).where(eq(SessionInputTable.session_id, chat.id)).all()).toEqual(
+        [],
+      )
+      expect(
+        yield* db.select().from(SessionContextEpochTable).where(eq(SessionContextEpochTable.session_id, chat.id)).all(),
+      ).toEqual([])
+      expect((yield* db.select().from(EventTable).all().pipe(Effect.orDie)).length).toBe(beforeEvents)
+      expect((yield* asks.turns({ sessionID: chat.id, threadID: result.threadID })).items).toHaveLength(1)
+    }),
+  30_000,
+)
+
+it.instance(
+  "Ask thread operations authenticate the owning session",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const asks = yield* SessionAsk.Service
+      const sessions = yield* Session.Service
+      const owner = yield* sessions.create({ title: "Ask owner" })
+      const other = yield* sessions.create({ title: "Ask other" })
+      yield* llm.text("owned answer")
+      const result = yield* asks.ask({ sessionID: owner.id, question: "owned question" })
+
+      const attempts = yield* Effect.all([
+        asks
+          .ask({ sessionID: other.id, threadID: result.threadID, question: "unauthorized follow-up" })
+          .pipe(Effect.asVoid, Effect.exit),
+        asks.turns({ sessionID: other.id, threadID: result.threadID }).pipe(Effect.asVoid, Effect.exit),
+        asks.cancel({ sessionID: other.id, threadID: result.threadID }).pipe(Effect.exit),
+      ])
+
+      for (const attempt of attempts) {
+        expect(Exit.isFailure(attempt)).toBe(true)
+        if (Exit.isFailure(attempt)) expect(Cause.squash(attempt.cause)).toBeInstanceOf(SessionAsk.ThreadNotFoundError)
+      }
+      expect(yield* llm.hits).toHaveLength(1)
+      expect((yield* asks.turns({ sessionID: owner.id, threadID: result.threadID })).items).toHaveLength(1)
+    }),
+  30_000,
+)
+
+it.instance(
+  "ask thread and turn pagination follows stable cursors",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const asks = yield* SessionAsk.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Ask pagination" })
+      yield* llm.text("one")
+      const one = yield* asks.ask({ sessionID: chat.id, question: "one" })
+      yield* llm.text("one follow-up")
+      const followup = yield* asks.ask({ sessionID: chat.id, threadID: one.threadID, question: "continue one" })
+      yield* llm.text("two")
+      const two = yield* asks.ask({ sessionID: chat.id, question: "two" })
+
+      const threadPage = yield* asks.threads({ sessionID: chat.id, limit: 1 })
+      expect(threadPage.items.map((thread) => thread.id)).toEqual([two.threadID])
+      expect(threadPage.more).toBe(true)
+      const olderThreads = yield* asks.threads({ sessionID: chat.id, limit: 1, before: threadPage.cursor })
+      expect(olderThreads.items.map((thread) => thread.id)).toEqual([one.threadID])
+
+      const turnPage = yield* asks.turns({ sessionID: chat.id, threadID: one.threadID, limit: 1 })
+      expect(turnPage.items.map((turn) => turn.id)).toEqual([followup.id])
+      expect(turnPage.more).toBe(true)
+      const olderTurns = yield* asks.turns({
+        sessionID: chat.id,
+        threadID: one.threadID,
+        limit: 1,
+        before: turnPage.cursor,
+      })
+      expect(olderTurns.items.map((turn) => turn.id)).toEqual([one.id])
+    }),
+  30_000,
+)
+
+askBoundary.instance(
+  "Ask excludes custom and MCP tools and suppresses plugin tool execution hooks",
+  () =>
+    Effect.gen(function* () {
+      askBoundaryHooks.splice(0)
+      const { dir, llm } = yield* useServerConfig(providerCfg)
+      const asks = yield* SessionAsk.Service
+      const sessions = yield* Session.Service
+      const file = path.join(dir, "ask-boundary.txt")
+      yield* writeText(file, "allowed read result")
+      const chat = yield* sessions.create({
+        title: "Ask tool boundary",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      yield* llm.tool("read", { filePath: file })
+      yield* llm.text("boundary answer")
+
+      yield* asks.ask({ sessionID: chat.id, question: "Use only an allowed source tool" })
+      const tools = strings((yield* llm.hits)[0]?.body.tools)
+
+      expect(tools).toContain("read")
+      expect(tools).not.toContain("custom_forbidden")
+      expect(tools).not.toContain("mcp_forbidden")
+      expect(askBoundaryHooks).toContain("experimental.chat.messages.transform")
+      expect(askBoundaryHooks).not.toContain("tool.execute.before")
+      expect(askBoundaryHooks).not.toContain("tool.execute.after")
+    }),
+  30_000,
+)
+
+it.instance(
+  "ask executes allowlisted read tools and sends results to the next provider call",
+  () =>
+    Effect.gen(function* () {
+      const { dir, llm } = yield* useServerConfig(providerCfg)
+      const asks = yield* SessionAsk.Service
+      const sessions = yield* Session.Service
+      const events = yield* EventV2Bridge.Service
+      const activity: { status: string; requestID: string; threadID: string; turnID: string }[] = []
+      const unsub = yield* events.listen((event) => {
+        if (Schema.is(SessionAsk.Event.ToolActivity)(event)) activity.push(event.data)
+        return Effect.void
+      })
+      yield* Effect.addFinalizer(() => unsub)
+      const chat = yield* sessions.create({
+        title: "Read tool",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      const file = path.join(dir, "ask-read.txt")
+      yield* writeText(
+        file,
+        [
+          "isolated ask tool result 8472",
+          ...Array.from({ length: 220 }, (_, index) => `${index}:${"x".repeat(90)}`),
+          "ask full result end 3941",
+        ].join("\n"),
+      )
+      yield* llm.tool("read", { filePath: file })
+      yield* llm.text("I read it.")
+
+      const result = yield* asks.ask({
+        sessionID: chat.id,
+        requestID: "read-request",
+        question: "Read the test file",
+      })
+      const hits = yield* llm.hits
+      const available = strings(hits[0]?.body.tools)
+
+      expect(hits).toHaveLength(2)
+      expect(available).toEqual(expect.arrayContaining(["read", "glob", "grep", "webfetch"]))
+      expect(available).not.toEqual(expect.arrayContaining(["bash", "write", "edit", "task"]))
+      expect(strings(hits[1]?.body).some((value) => value.includes("isolated ask tool result 8472"))).toBe(true)
+      expect(strings(hits[1]?.body).some((value) => value.includes("ask full result end 3941"))).toBe(true)
+      expect(result.toolActivity).toHaveLength(1)
+      expect(result.toolActivity[0]).toMatchObject({ tool: "read", status: "completed" })
+      expect(result.toolActivity[0]?.output).toContain("isolated ask tool result 8472")
+      expect(result.toolActivity[0]?.output).not.toContain("ask full result end 3941")
+      expect(new TextEncoder().encode(result.toolActivity[0]?.output).length).toBeLessThanOrEqual(16 * 1024)
+      expect(result.requestID).toBe("read-request")
+      expect(activity.map((item) => item.status)).toEqual(["running", "completed"])
+      expect(activity.map((item) => item.requestID)).toEqual(["read-request", "read-request"])
+      expect(activity.every((item) => item.threadID === result.threadID && item.turnID === result.id)).toBe(true)
+    }),
+  30_000,
+)
+
+it.instance(
+  "ask reuses one Instruction claim across tool calls",
+  () =>
+    Effect.gen(function* () {
+      const { dir, llm } = yield* useServerConfig(providerCfg)
+      const asks = yield* SessionAsk.Service
+      const sessions = yield* Session.Service
+      const fs = yield* FSUtil.Service
+      const nested = path.join(dir, "instruction-claim")
+      const marker = "request local instruction claim 7381"
+      yield* fs.makeDirectory(nested, { recursive: true })
+      yield* writeText(path.join(nested, "AGENTS.md"), marker)
+      const file = path.join(nested, "input.txt")
+      yield* writeText(file, "claim input")
+      yield* llm.tool("read", { filePath: file })
+      yield* llm.tool("read", { filePath: file })
+      yield* llm.text("done")
+      const chat = yield* sessions.create({ title: "Instruction claim" })
+
+      yield* asks.ask({ sessionID: chat.id, question: "Read twice" })
+      const request = JSON.stringify((yield* llm.hits).at(-1)?.body)
+
+      expect(request.split(marker)).toHaveLength(2)
+    }),
+  30_000,
+)
+
+it.instance(
+  "ask disables tools on the fourth provider call",
+  () =>
+    Effect.gen(function* () {
+      const { dir, llm } = yield* useServerConfig(providerCfg)
+      const asks = yield* SessionAsk.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({
+        title: "Turn limit",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      const file = path.join(dir, "ask-limit.txt")
+      yield* writeText(file, "limit")
+      yield* llm.tool("read", { filePath: file })
+      yield* llm.tool("read", { filePath: file })
+      yield* llm.tool("read", { filePath: file })
+      yield* llm.text("final answer")
+
+      const result = yield* asks.ask({ sessionID: chat.id, question: "Keep reading" })
+      const hits = yield* llm.hits
+
+      expect(hits).toHaveLength(4)
+      expect(strings(hits[3]?.body.tools)).not.toContain("read")
+      expect(result.text).toBe("final answer")
+      expect(result.toolActivity).toHaveLength(3)
+    }),
+  30_000,
+)
+
+it.instance(
+  "ask rejects a concurrent turn in the same thread",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const asks = yield* SessionAsk.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Busy thread" })
+      yield* llm.text("first answer")
+      const first = yield* asks.ask({ sessionID: chat.id, question: "first" })
+      yield* llm.hang
+      const pending = yield* asks
+        .ask({ sessionID: chat.id, threadID: first.threadID, question: "pending" })
+        .pipe(Effect.forkChild)
+      yield* awaitWithTimeout(llm.wait(2), "timed out waiting for same-thread ask", "10 seconds")
+
+      const duplicate = yield* asks
+        .ask({ sessionID: chat.id, threadID: first.threadID, question: "duplicate" })
+        .pipe(Effect.exit)
+      expect(Exit.isFailure(duplicate)).toBe(true)
+      if (Exit.isFailure(duplicate)) expect(Cause.squash(duplicate.cause)).toBeInstanceOf(SessionAsk.ThreadBusyError)
+
+      yield* asks.cancel({ sessionID: chat.id, threadID: first.threadID })
+      const exit = yield* Fiber.await(pending)
+      expect(Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)).toBe(true)
+      expect((yield* asks.turns({ sessionID: chat.id, threadID: first.threadID })).items).toHaveLength(1)
+    }),
+  30_000,
+)
+
+it.instance(
+  "ask rejects duplicate active request IDs and releases them after terminal cleanup",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const asks = yield* SessionAsk.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Duplicate Ask request" })
+      const other = yield* sessions.create({ title: "Same request other Session" })
+      yield* llm.hang
+      yield* llm.hang
+      const first = yield* asks
+        .ask({ sessionID: chat.id, requestID: "duplicate-request", question: "first" })
+        .pipe(Effect.forkChild)
+      yield* awaitWithTimeout(llm.wait(1), "timed out waiting for first duplicate Ask", "10 seconds")
+
+      const duplicate = yield* asks
+        .ask({ sessionID: chat.id, requestID: "duplicate-request", question: "duplicate" })
+        .pipe(Effect.exit)
+      expect(Exit.isFailure(duplicate)).toBe(true)
+      if (Exit.isFailure(duplicate))
+        expect(Cause.squash(duplicate.cause)).toMatchObject({
+          _tag: "SessionAskRequestBusyError",
+          sessionID: chat.id,
+          requestID: "duplicate-request",
+        })
+
+      const otherSession = yield* asks
+        .ask({ sessionID: other.id, requestID: "duplicate-request", question: "other" })
+        .pipe(Effect.forkChild)
+      yield* awaitWithTimeout(llm.wait(2), "timed out waiting for cross-Session Ask", "10 seconds")
+      yield* Fiber.interrupt(first)
+      yield* Fiber.interrupt(otherSession)
+
+      yield* llm.text("reused after cancel")
+      const reused = yield* asks.ask({ sessionID: chat.id, requestID: "duplicate-request", question: "reuse" })
+      yield* llm.text("reused after success")
+      const reusedAgain = yield* asks.ask({
+        sessionID: chat.id,
+        requestID: "duplicate-request",
+        question: "reuse again",
+      })
+      expect([reused.text, reusedAgain.text]).toEqual(["reused after cancel", "reused after success"])
+    }),
+  30_000,
+)
+
+it.instance(
+  "ask permission requests carry Ask metadata without a Session Part pointer",
+  () =>
+    Effect.gen(function* () {
+      const { dir, llm } = yield* useServerConfig(providerCfg)
+      const asks = yield* SessionAsk.Service
+      const sessions = yield* Session.Service
+      const permissions = yield* Permission.Service
+      const chat = yield* sessions.create({
+        title: "Ask permission",
+        permission: [{ permission: "read", pattern: "*", action: "ask" }],
+      })
+      const file = path.join(dir, "ask-permission.txt")
+      yield* writeText(file, "permission result")
+      yield* llm.tool("read", { filePath: file })
+      yield* llm.text("approved")
+      const clientRequestID = "ask-permission-request"
+      const pending = yield* asks
+        .ask({ sessionID: chat.id, requestID: clientRequestID, question: "Read with approval" })
+        .pipe(Effect.forkChild)
+      const request = yield* pollWithTimeout(
+        permissions.list().pipe(Effect.map((items) => items[0])),
+        "Ask permission was not published",
+        "10 seconds",
+      )
+
+      expect(request.tool).toBeUndefined()
+      expect(request.metadata).toMatchObject({
+        ask: {
+          requestID: clientRequestID,
+          threadID: expect.stringMatching(/^ask_/),
+          turnID: expect.stringMatching(/^atn_/),
+          callID: "call_1",
+          tool: "read",
         },
       })
-    yield* user(chat.id, "continue")
-    yield* llm.hang
+      yield* permissions.reply({ requestID: request.id, reply: "once" })
+      expect(yield* Fiber.join(pending)).toMatchObject({ requestID: clientRequestID, text: "approved" })
+    }),
+  30_000,
+)
 
-    const fiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
-    yield* awaitWithTimeout(llm.wait(1), "timed out waiting for pressure-nudge request", "10 seconds")
-    const hit = (yield* llm.hits)[0]
-    const reminder = strings(hit?.body).find(
-      (value) => value.includes("<system-reminder>") && value.includes("compact_results"),
-    )
-    expect(reminder).toBeString()
-    expect(reminder!.length).toBeLessThan(3_000)
-    expect(reminder).not.toContain("UNTRUSTED_LABEL")
-    expect(reminder).toContain("calling `list_context` first")
-    expect(reminder).toContain("Use only `prt_…` ids returned by that current `list_context` call")
-    expect(reminder).not.toContain(foreignPartID)
-    expect(reminder).not.toContain(foreignMessageID)
-    expect(reminder).not.toMatch(/\n- prt_[A-Za-z0-9]+/)
-    const messages = hit?.body.messages
-    expect(Array.isArray(messages)).toBe(true)
-    expect((messages as { role?: unknown }[]).at(-1)?.role).toBe("user")
-    expect(strings((messages as unknown[]).at(-1)).some((value) => value.includes("<system-reminder>"))).toBe(true)
-    yield* Fiber.interrupt(fiber)
-  }),
+it.instance(
+  "Ask always permission approves repeated matching tool calls",
+  () =>
+    Effect.gen(function* () {
+      const { dir, llm } = yield* useServerConfig(providerCfg)
+      const asks = yield* SessionAsk.Service
+      const sessions = yield* Session.Service
+      const permissions = yield* Permission.Service
+      const file = path.join(dir, "ask-always.txt")
+      yield* writeText(file, "always permission")
+      const chat = yield* sessions.create({
+        title: "Ask always permission",
+        permission: [{ permission: "read", pattern: "*", action: "ask" }],
+      })
+      yield* llm.tool("read", { filePath: file })
+      yield* llm.tool("read", { filePath: file })
+      yield* llm.text("always approved")
+      const pending = yield* asks.ask({ sessionID: chat.id, question: "Read twice" }).pipe(Effect.forkChild)
+      const request = yield* pollWithTimeout(
+        permissions.list().pipe(Effect.map((items) => items[0])),
+        "Ask permission was not published",
+        "10 seconds",
+      )
+
+      yield* permissions.reply({ requestID: request.id, reply: "always" })
+      const result = yield* awaitWithTimeout(Fiber.join(pending), "always permission did not resume Ask", "20 seconds")
+
+      expect(result.text).toBe("always approved")
+      expect(result.toolActivity.map((item) => item.status)).toEqual(["completed", "completed"])
+      expect(yield* permissions.list()).toEqual([])
+    }),
+  45_000,
+)
+
+it.instance(
+  "Ask deny permission removes the tool before provider execution",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const asks = yield* SessionAsk.Service
+      const sessions = yield* Session.Service
+      const permissions = yield* Permission.Service
+      const chat = yield* sessions.create({
+        title: "Ask deny permission",
+        permission: [{ permission: "read", pattern: "*", action: "deny" }],
+      })
+      yield* llm.text("denied tool answer")
+
+      const result = yield* asks.ask({ sessionID: chat.id, question: "Do not expose read" })
+
+      expect(strings((yield* llm.hits)[0]?.body.tools)).not.toContain("read")
+      expect(result.toolActivity).toEqual([])
+      expect(yield* permissions.list()).toEqual([])
+    }),
+  30_000,
+)
+
+it.instance(
+  "Ask reject permission returns a tool error and continues without stale requests",
+  () =>
+    Effect.gen(function* () {
+      const { dir, llm } = yield* useServerConfig(providerCfg)
+      const asks = yield* SessionAsk.Service
+      const sessions = yield* Session.Service
+      const permissions = yield* Permission.Service
+      const file = path.join(dir, "ask-reject.txt")
+      yield* writeText(file, "rejected permission")
+      const chat = yield* sessions.create({
+        title: "Ask reject permission",
+        permission: [{ permission: "read", pattern: "*", action: "ask" }],
+      })
+      yield* llm.tool("read", { filePath: file })
+      yield* llm.text("rejection handled")
+      const pending = yield* asks.ask({ sessionID: chat.id, question: "Reject this read" }).pipe(Effect.forkChild)
+      const request = yield* pollWithTimeout(
+        permissions.list().pipe(Effect.map((items) => items[0])),
+        "Ask permission was not published",
+        "10 seconds",
+      )
+
+      yield* permissions.reply({ requestID: request.id, reply: "reject" })
+      const result = yield* awaitWithTimeout(Fiber.join(pending), "rejected tool did not continue Ask", "20 seconds")
+
+      expect(result.text).toBe("rejection handled")
+      expect(result.toolActivity.map((item) => item.status)).toEqual(["error"])
+      expect(yield* permissions.list()).toEqual([])
+    }),
+  45_000,
+)
+
+it.instance(
+  "ask rejects GitLab workflow aliases by API identity before provider execution",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(gitlabWorkflowCfg)
+      const asks = yield* SessionAsk.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "GitLab workflow" })
+
+      const exit = yield* asks
+        .ask({
+          sessionID: chat.id,
+          question: "unsupported",
+          model: {
+            providerID: ProviderV2.ID.make("gitlab"),
+            modelID: ModelV2.ID.make("workflow-alias"),
+          },
+        })
+        .pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) expect(Cause.squash(exit.cause)).toBeInstanceOf(SessionAsk.UnsupportedModelError)
+      expect(yield* llm.hits).toHaveLength(0)
+      expect((yield* asks.threads({ sessionID: chat.id })).items).toEqual([])
+    }),
+  30_000,
+)
+
+it.instance(
+  "ask cancellation interrupts a pending tool permission and persists nothing",
+  () =>
+    Effect.gen(function* () {
+      const { dir, llm } = yield* useServerConfig(providerCfg)
+      const asks = yield* SessionAsk.Service
+      const sessions = yield* Session.Service
+      const permissions = yield* Permission.Service
+      const chat = yield* sessions.create({
+        title: "Cancel Ask permission",
+        permission: [{ permission: "read", pattern: "*", action: "ask" }],
+      })
+      const file = path.join(dir, "ask-cancel-permission.txt")
+      yield* writeText(file, "cancel")
+      yield* llm.tool("read", { filePath: file })
+      yield* llm.text("unused")
+      const pending = yield* asks.ask({ sessionID: chat.id, question: "Cancel this read" }).pipe(Effect.forkChild)
+      yield* pollWithTimeout(
+        permissions.list().pipe(Effect.map((items) => (items.length === 1 ? true : undefined))),
+        "Ask permission was not published",
+        "20 seconds",
+      )
+
+      yield* asks.cancel({ sessionID: chat.id })
+      const exit = yield* Fiber.await(pending)
+
+      expect(Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)).toBe(true)
+      expect(yield* permissions.list()).toEqual([])
+      expect((yield* asks.threads({ sessionID: chat.id })).items).toEqual([])
+    }),
+  45_000,
+)
+
+it.instance(
+  "different Ask threads run concurrently and persist independently",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const asks = yield* SessionAsk.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Concurrent Ask threads" })
+      yield* llm.text("one")
+      const one = yield* asks.ask({ sessionID: chat.id, question: "thread one" })
+      yield* llm.text("two")
+      const two = yield* asks.ask({ sessionID: chat.id, question: "thread two" })
+      const first = defer<void>()
+      const second = defer<void>()
+      yield* llm.hold("one follow-up", first.promise)
+      yield* llm.hold("two follow-up", second.promise)
+      const onePending = yield* asks
+        .ask({ sessionID: chat.id, threadID: one.threadID, question: "continue one" })
+        .pipe(Effect.forkChild)
+      const twoPending = yield* asks
+        .ask({ sessionID: chat.id, threadID: two.threadID, question: "continue two" })
+        .pipe(Effect.forkChild)
+      yield* awaitWithTimeout(llm.wait(4), "Ask threads did not run concurrently", "10 seconds")
+
+      first.resolve()
+      second.resolve()
+      yield* Effect.all([Fiber.join(onePending), Fiber.join(twoPending)])
+
+      expect((yield* asks.turns({ sessionID: chat.id, threadID: one.threadID })).items).toHaveLength(2)
+      expect((yield* asks.turns({ sessionID: chat.id, threadID: two.threadID })).items).toHaveLength(2)
+    }),
+  30_000,
+)
+
+it.instance(
+  "requires current inventory and ignores id-like strings from history",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const { prompt, sessions, chat } = yield* boot()
+      const seeded = yield* seed(chat.id, { finish: "stop" })
+      const foreignPartID = "prt_04c866191001ZOVMkrtXfsS5QE"
+      const foreignMessageID = "msg_04c863eb1001JckWhyFN4e592C"
+      // Enough candidates to exceed the pressure threshold while exercising the
+      // reminder's resistance to untrusted labels and id-like output text.
+      for (let index = 0; index < 12; index++)
+        yield* sessions.updatePart({
+          id: PartID.ascending(),
+          messageID: seeded.assistant.id,
+          sessionID: chat.id,
+          type: "tool",
+          callID: `pressure-call-${index}`,
+          tool: index === 0 ? "x".repeat(100) + "\nUNTRUSTED_LABEL" : `pressure_tool_${index}`,
+          state: {
+            status: "completed",
+            input: {},
+            output:
+              index === 0
+                ? `${"large settled output ".repeat(2_500)}\nforeign ${foreignPartID} message ${foreignMessageID}`
+                : "large settled output ".repeat(2_500),
+            title: "done",
+            metadata: {},
+            time: { start: 1, end: 2 },
+          },
+        })
+      yield* user(chat.id, "continue")
+      yield* llm.hang
+
+      const fiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+      yield* awaitWithTimeout(llm.wait(1), "timed out waiting for pressure-nudge request", "10 seconds")
+      const hit = (yield* llm.hits)[0]
+      const reminder = strings(hit?.body).find(
+        (value) => value.includes("<system-reminder>") && value.includes("compact_results"),
+      )
+      expect(reminder).toBeString()
+      expect(reminder!.length).toBeLessThan(3_000)
+      expect(reminder).not.toContain("UNTRUSTED_LABEL")
+      expect(reminder).toContain("calling `list_context` first")
+      expect(reminder).toContain("Use only `prt_…` ids returned by that current `list_context` call")
+      expect(reminder).not.toContain(foreignPartID)
+      expect(reminder).not.toContain(foreignMessageID)
+      expect(reminder).not.toMatch(/\n- prt_[A-Za-z0-9]+/)
+      const messages = hit?.body.messages
+      expect(Array.isArray(messages)).toBe(true)
+      expect((messages as { role?: unknown }[]).at(-1)?.role).toBe("user")
+      expect(strings((messages as unknown[]).at(-1)).some((value) => value.includes("<system-reminder>"))).toBe(true)
+      yield* Fiber.interrupt(fiber)
+    }),
   { timeout: 15_000 },
 )
 
@@ -1305,9 +2456,9 @@ cachePrefix.instance("limits caching before grouped receipts and a final-step in
       .filter((part): part is SessionV1.ToolPart => part.type === "tool" && part.tool === "list_context")
     expect(receipts).toHaveLength(2)
     expect(receipts.map((part) => part.state.status)).toEqual(["completed", "completed"])
-    expect(
-      receipts.map((part) => (part.state.status === "completed" ? part.state.time.compacted : undefined)),
-    ).toEqual([undefined, undefined])
+    expect(receipts.map((part) => (part.state.status === "completed" ? part.state.time.compacted : undefined))).toEqual(
+      [undefined, undefined],
+    )
     const request = cachePrefixRequests[0]!
     expect(request.cachePrefixLimit).toBeNumber()
     const limit = request.cachePrefixLimit ?? -1
@@ -1712,9 +2863,7 @@ it.instance("does not feed context-management receipts back into pressure remind
     expect(requests[2]!.some((value) => value.includes("Compacted 1 of 1 parts"))).toBe(true)
     expect(requests[3]).toContain(inventorySummary)
     expect(
-      requests[3]!.some(
-        (value) => value.includes("Context-management receipt") && value.includes("(compact_results)"),
-      ),
+      requests[3]!.some((value) => value.includes("Context-management receipt") && value.includes("(compact_results)")),
     ).toBe(true)
     expect(requests[3]!.some((value) => value.includes("Compacted 1 of 1 parts"))).toBe(false)
 

@@ -1478,6 +1478,7 @@ const scenarios: Scenario[] = [
       path: route("/session/{sessionID}/ask", { sessionID: ctx.state.session.id }),
       headers: ctx.headers(),
       body: {
+        requestID: "exercise-request",
         question: "What number did we establish?",
         agent: "build",
         model: { providerID: "test", modelID: "test-model" },
@@ -1486,15 +1487,111 @@ const scenarios: Scenario[] = [
     .jsonEffect(200, (body, ctx) =>
       Effect.gen(function* () {
         object(body)
+        check(body.requestID === "exercise-request", "ask should round-trip the client request ID")
         check(body.text === "The number is 42.", "ask should return fake LLM text")
+        check(body.answer === body.text, "ask should retain compatible text beside the persisted answer")
+        check(typeof body.threadID === "string" && body.threadID.startsWith("ask_"), "ask should return a thread ID")
+        check(typeof body.id === "string" && body.id.startsWith("atn_"), "ask should return a turn ID")
         const messages = yield* ctx.messages(ctx.state.session.id)
         check(
           JSON.stringify(messages.map((message) => message.info.id)) === JSON.stringify(ctx.state.messages),
-          "ask should not persist the question or answer",
+          "ask should not change normal Session history",
         )
         yield* ctx.llmWait(1)
       }),
     ),
+  http.protected
+    .get("/session/{sessionID}/ask", "session.askThreads")
+    .withLlm()
+    .seeded((ctx) =>
+      Effect.gen(function* () {
+        const session = yield* ctx.session({ title: "Ask thread list" })
+        yield* ctx.llmText("first answer")
+        const first = yield* ctx.ask({
+          sessionID: session.id,
+          question: "first question",
+          agent: "build",
+        })
+        yield* ctx.llmText("second answer")
+        const second = yield* ctx.ask({
+          sessionID: session.id,
+          question: "second question",
+          agent: "build",
+        })
+        return { session, threadIDs: [first.threadID, second.threadID] }
+      }),
+    )
+    .at((ctx) => ({
+      path: `${route("/session/{sessionID}/ask", { sessionID: ctx.state.session.id })}?limit=1`,
+      headers: ctx.headers(),
+    }))
+    .json(200, (body, ctx) => {
+      object(body)
+      array(body.items)
+      check(body.items.length === 1, "Ask thread list should honor the page limit")
+      const item = body.items[0]
+      object(item)
+      const threadID = item.id
+      check(
+        typeof threadID === "string" && ctx.state.threadIDs.some((id) => id === threadID),
+        "Ask thread list should return the seeded session thread",
+      )
+      check(body.more === true && typeof body.cursor === "string", "Ask thread list should return a next cursor")
+    }),
+  http.protected
+    .get("/session/{sessionID}/ask/{threadID}", "session.askThread")
+    .withLlm()
+    .seeded((ctx) =>
+      Effect.gen(function* () {
+        const session = yield* ctx.session({ title: "Ask turns" })
+        yield* ctx.llmText("turn answer")
+        const turn = yield* ctx.ask({
+          sessionID: session.id,
+          question: "turn question",
+          agent: "build",
+        })
+        return { session, turn }
+      }),
+    )
+    .at((ctx) => ({
+      path: route("/session/{sessionID}/ask/{threadID}", {
+        sessionID: ctx.state.session.id,
+        threadID: ctx.state.turn.threadID,
+      }),
+      headers: ctx.headers(),
+    }))
+    .json(200, (body, ctx) => {
+      object(body)
+      array(body.items)
+      check(body.items.length === 1, "Ask thread should return its completed turn")
+      object(body.items[0])
+      check(body.items[0].id === ctx.state.turn.id, "Ask thread should return the seeded turn")
+    }),
+  http.protected
+    .post("/session/{sessionID}/ask/{threadID}/cancel", "session.askCancel")
+    .withLlm()
+    .seeded((ctx) =>
+      Effect.gen(function* () {
+        const session = yield* ctx.session({ title: "Ask cancellation" })
+        yield* ctx.llmText("created")
+        const turn = yield* ctx.ask({
+          sessionID: session.id,
+          question: "create thread",
+          agent: "build",
+        })
+        return { session, turn }
+      }),
+    )
+    .at((ctx) => ({
+      path: route("/session/{sessionID}/ask/{threadID}/cancel", {
+        sessionID: ctx.state.session.id,
+        threadID: ctx.state.turn.threadID,
+      }),
+      headers: ctx.headers(),
+    }))
+    .json(200, (body) => {
+      check(body === true, "Ask cancellation should return true")
+    }),
   http.protected
     .post("/session/{sessionID}/prompt_async", "session.prompt_async")
     .preserveDatabase()
@@ -1769,6 +1866,9 @@ const llmScenarios = new Set([
   "session.init",
   "session.prompt",
   "session.ask",
+  "session.askThreads",
+  "session.askThread",
+  "session.askCancel",
   "session.prompt_async",
   "session.command",
   "session.summarize",

@@ -76,6 +76,7 @@ type ReadDef = Tool.InferDef<typeof ReadTool>
 type State = {
   custom: Tool.Def[]
   builtin: Tool.Def[]
+  ask: readonly Tool.Def[]
   task: TaskDef
   read: ReadDef
 }
@@ -84,6 +85,7 @@ export interface Interface {
   readonly ids: () => Effect.Effect<string[]>
   readonly all: () => Effect.Effect<Tool.Def[]>
   readonly named: () => Effect.Effect<{ task: TaskDef; read: ReadDef }>
+  readonly askTools: (input: { providerID: ProviderV2.ID }) => Effect.Effect<readonly Tool.Def[]>
   readonly tools: (model: {
     providerID: ProviderV2.ID
     modelID: ModelV2.ID
@@ -192,6 +194,23 @@ const layer = Layer.effect(
           }
         }
 
+        const askTool = yield* Effect.all({
+          read: Tool.init(read),
+          glob: Tool.init(globtool),
+          grep: Tool.init(greptool),
+          fetch: Tool.init(webfetch),
+          search: Tool.init(websearch),
+          lsp: Tool.init(lsptool),
+        })
+        const ask = [
+          askTool.read,
+          askTool.glob,
+          askTool.grep,
+          askTool.fetch,
+          askTool.search,
+          ...(flags.experimentalLspTool ? [askTool.lsp] : []),
+        ]
+
         const dirs = yield* config.directories()
         const matches = dirs.flatMap((dir) =>
           Glob.scanSync("{tool,tools}/*.{js,ts}", { cwd: dir, absolute: true, dot: true, symlink: true }),
@@ -217,35 +236,32 @@ const layer = Layer.effect(
 
         yield* config.get()
         const questionEnabled = ["app", "cli", "desktop"].includes(flags.client) || flags.enableQuestionTool
-
-        const tool = yield* Effect.all({
-          invalid: Tool.init(invalid),
-          shell: Tool.init(shell),
-          read: Tool.init(read),
-          glob: Tool.init(globtool),
-          grep: Tool.init(greptool),
-          edit: Tool.init(edit),
-          write: Tool.init(writetool),
-          task: Tool.init(task),
-          task_control: Tool.init(taskControl),
-          fetch: Tool.init(webfetch),
-          todo: Tool.init(todo),
-          search: Tool.init(websearch),
-          skill: Tool.init(skilltool),
-          patch: Tool.init(patchtool),
-          question: Tool.init(question),
-          lsp: Tool.init(lsptool),
-          plan: Tool.init(plan),
-          ...(codeModeTool ? { execute: Tool.init(codeModeTool) } : {}),
-          compact_results: Tool.init(compactResults),
-          read_part: Tool.init(readPart),
-          search_session_history: Tool.init(searchSessionHistory),
-          list_context: Tool.init(listContext),
-          compact_bulk: Tool.init(compactBulk),
-        })
+        const tool = {
+          ...askTool,
+          ...(yield* Effect.all({
+            invalid: Tool.init(invalid),
+            shell: Tool.init(shell),
+            edit: Tool.init(edit),
+            write: Tool.init(writetool),
+            task: Tool.init(task),
+            task_control: Tool.init(taskControl),
+            todo: Tool.init(todo),
+            skill: Tool.init(skilltool),
+            patch: Tool.init(patchtool),
+            question: Tool.init(question),
+            plan: Tool.init(plan),
+            ...(codeModeTool ? { execute: Tool.init(codeModeTool) } : {}),
+            compact_results: Tool.init(compactResults),
+            read_part: Tool.init(readPart),
+            search_session_history: Tool.init(searchSessionHistory),
+            list_context: Tool.init(listContext),
+            compact_bulk: Tool.init(compactBulk),
+          })),
+        }
 
         return {
           custom,
+          ask,
           builtin: [
             tool.invalid,
             ...(questionEnabled ? [tool.question] : []),
@@ -293,6 +309,15 @@ const layer = Layer.effect(
 
     const ids: Interface["ids"] = Effect.fn("ToolRegistry.ids")(function* () {
       return (yield* all()).map((tool) => tool.id)
+    })
+
+    const askTools: Interface["askTools"] = Effect.fn("ToolRegistry.askTools")(function* (input) {
+      const s = yield* InstanceState.get(state)
+      return s.ask.filter(
+        (tool) =>
+          tool.id !== WebSearchTool.id ||
+          webSearchEnabled(input.providerID, { exa: flags.enableExa, parallel: flags.enableParallel }),
+      )
     })
 
     const describeTask = Effect.fn("ToolRegistry.describeTask")(function* (agent: Agent.Info) {
@@ -377,7 +402,7 @@ const layer = Layer.effect(
       return { task: s.task, read: s.read }
     })
 
-    return Service.of({ ids, all, named, tools })
+    return Service.of({ ids, all, named, askTools, tools })
   }),
 )
 

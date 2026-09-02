@@ -53,7 +53,7 @@ import { Truncate } from "@/tool/truncate"
 import { Image } from "@/image/image"
 import { decodeDataUrl } from "@/util/data-url"
 import { Process } from "@/util/process"
-import { Cause, Deferred, Effect, Exit, Latch, Layer, Option, Scope, Context, Schema, Types } from "effect"
+import { Cause, Effect, Exit, Latch, Layer, Option, Scope, Context, Schema, Types } from "effect"
 import { InstanceState } from "@/effect/instance-state"
 import { TaskTool, type TaskPromptOps } from "@/tool/task"
 import { SessionRunState } from "./run-state"
@@ -67,6 +67,7 @@ import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionReminders } from "./reminders"
 import { SessionTools } from "./tools"
 import { LLMEvent } from "@opencode-ai/llm"
+import { SessionAsk } from "./ask"
 
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -162,7 +163,7 @@ const CONTEXT_PRESSURE_TARGET = 0.45
 const COMPACTION_MIN_RECLAIM_CHARS = 8_000
 
 // Context-pressure nudge: once usage crosses CONTEXT_PRESSURE_SOFT of the usable
-  // window, remind the model to inspect a fresh inventory before compacting. Returns a
+// window, remind the model to inspect a fresh inventory before compacting. Returns a
 // candidate fingerprint alongside the text so the caller can dedupe across
 // completed runs. Suppressed when compaction is disabled.
 // What the request about to be sent actually costs, rather than what the last
@@ -340,6 +341,7 @@ const layer = Layer.effect(
     const events = yield* EventV2Bridge.Service
     const flags = yield* RuntimeFlags.Service
     const database = yield* Database.Service
+    const asks = yield* SessionAsk.Service
     const { db } = database
     type ContextState = {
       calibration?: { estimated: number; actual: number }
@@ -348,7 +350,6 @@ const layer = Layer.effect(
       reminder?: string
     }
     const contextStates = new Map<SessionID, ContextState>()
-    const activeAsks = new Map<SessionID, Set<Deferred.Deferred<void>>>()
     const contextState = (sessionID: SessionID) => {
       const hit = contextStates.get(sessionID)
       if (hit) return hit
@@ -377,11 +378,10 @@ const layer = Layer.effect(
 
     const cancel = Effect.fn("SessionPrompt.cancel")(function* (sessionID: SessionID) {
       yield* Effect.logInfo("cancel", { "session.id": sessionID })
-      yield* state.cancel(sessionID)
-      const pending = activeAsks.get(sessionID)
-      activeAsks.delete(sessionID)
-      if (pending)
-        yield* Effect.forEach(pending, (deferred) => Deferred.succeed(deferred, undefined), { discard: true })
+      yield* Effect.all([state.cancel(sessionID), asks.cancel({ sessionID }).pipe(Effect.orDie)], {
+        concurrency: "unbounded",
+        discard: true,
+      })
     })
 
     const resolvePromptParts = Effect.fn("SessionPrompt.resolvePromptParts")(function* (template: string) {
@@ -860,94 +860,6 @@ const layer = Layer.effect(
         .pipe(Effect.orDie)
       if (Option.isSome(match) && match.value.info.role === "user") return match.value.info.model
       return yield* provider.defaultModel().pipe(Effect.orDie)
-    })
-
-    const askImpl = Effect.fn("SessionPrompt.askImpl")(function* (input: AskInput) {
-      const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
-      const msgs = yield* MessageV2.filterCompactedEffect(input.sessionID).pipe(
-        Effect.provideService(Database.Service, database),
-      )
-      const previous = msgs.findLast((message) => message.info.role === "user")
-      const agentName = input.agent ?? previous?.info.agent ?? session.agent
-      const ag = agentName ? yield* agents.get(agentName) : yield* agents.defaultInfo()
-      if (!ag) return yield* Effect.fail(new Error(`Agent not found: "${agentName}"`))
-
-      const selected = input.model ?? (yield* currentModel(input.sessionID))
-      const model = yield* provider.getModel(selected.providerID, selected.modelID)
-      const variant =
-        input.variant ?? ("variant" in selected && typeof selected.variant === "string" ? selected.variant : undefined)
-      const user: SessionV1.User = {
-        id: MessageID.ascending(),
-        role: "user",
-        sessionID: input.sessionID,
-        time: { created: Date.now() },
-        agent: ag.name,
-        model: {
-          providerID: selected.providerID,
-          modelID: selected.modelID,
-          variant,
-        },
-      }
-
-      msgs.push({
-        info: user,
-        parts: [
-          {
-            id: PartID.ascending(),
-            messageID: user.id,
-            sessionID: input.sessionID,
-            type: "text",
-            text: input.question,
-          },
-        ],
-      })
-      yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
-      const [skills, env, instructions, mcpInstructions, modelMsgs] = yield* Effect.all([
-        sys.skills(ag),
-        sys.environment(model),
-        instruction.system().pipe(Effect.orDie),
-        sys.mcp(ag, session.permission),
-        MessageV2.toModelMessagesEffect(msgs, model, { stampUser: true }),
-      ])
-      const text = yield* llm
-        .stream({
-          agent: ag,
-          user,
-          system: [...env, ...instructions, ...(mcpInstructions ? [mcpInstructions] : []), ...(skills ? [skills] : [])],
-          tools: {},
-          toolChoice: "none",
-          model,
-          sessionID: input.sessionID,
-          retries: 2,
-          messages: modelMsgs,
-        })
-        .pipe(
-          Stream.mapEffect((event) => {
-            if (LLMEvent.is.providerError(event)) return Effect.fail(event.message)
-            return Effect.succeed(LLMEvent.is.textDelta(event) ? event.text : "")
-          }),
-          Stream.mkString,
-          Effect.mapError((error) => MessageV2.fromError(error, { providerID: model.providerID })),
-        )
-      return { text }
-    })
-
-    const ask = Effect.fn("SessionPrompt.ask")(function* (input: AskInput) {
-      const cancelled = yield* Deferred.make<void>()
-      const pending = activeAsks.get(input.sessionID) ?? new Set<Deferred.Deferred<void>>()
-      pending.add(cancelled)
-      activeAsks.set(input.sessionID, pending)
-      return yield* Effect.raceFirst(
-        askImpl(input),
-        Deferred.await(cancelled).pipe(Effect.flatMap(() => Effect.interrupt)),
-      ).pipe(
-        Effect.ensuring(
-          Effect.sync(() => {
-            pending.delete(cancelled)
-            if (pending.size === 0 && activeAsks.get(input.sessionID) === pending) activeAsks.delete(input.sessionID)
-          }),
-        ),
-      )
     })
 
     const prepareUserMessage = Effect.fn("SessionPrompt.prepareUserMessage")(function* (input: PromptInput) {
@@ -1707,8 +1619,7 @@ const layer = Layer.effect(
             // Candidate identity, generation, and conservative savings are the
             // reminder clock. Unchanged high-pressure context stays quiet across
             // both provider steps and completed user-message runs.
-            const progressed =
-              lastAssistant?.parentID === lastUser.id && successfulContextCompaction(lastAssistantMsg)
+            const progressed = lastAssistant?.parentID === lastUser.id && successfulContextCompaction(lastAssistantMsg)
             const pressureText =
               pressure && !progressed && pressure.fingerprint !== remembered.reminder ? pressure.text : undefined
             if (pressure && (pressureText || progressed)) remembered.reminder = pressure.fingerprint
@@ -2013,7 +1924,7 @@ const layer = Layer.effect(
     return Service.of({
       cancel,
       checkpoint: state.checkpoint,
-      ask,
+      ask: asks.ask,
       prompt,
       admitNotification,
       notify,
@@ -2030,19 +1941,11 @@ const ModelRef = Schema.Struct({
   modelID: ModelV2.ID,
 })
 
-export const AskInput = Schema.Struct({
-  sessionID: SessionID,
-  question: Schema.String.check(Schema.isMinLength(1)),
-  model: Schema.optional(ModelRef),
-  agent: Schema.optional(Schema.String),
-  variant: Schema.optional(Schema.String),
-})
-export type AskInput = Schema.Schema.Type<typeof AskInput>
+export const AskInput = SessionAsk.AskInput
+export type AskInput = SessionAsk.AskInput
 
-export const AskOutput = Schema.Struct({
-  text: Schema.String,
-})
-export type AskOutput = Schema.Schema.Type<typeof AskOutput>
+export const AskOutput = SessionAsk.AskOutput
+export type AskOutput = SessionAsk.AskOutput
 
 export const PromptInput = Schema.Struct({
   sessionID: SessionID,
@@ -2173,6 +2076,7 @@ export const node = LayerNode.make({
     EventV2Bridge.node,
     RuntimeFlags.node,
     Database.node,
+    SessionAsk.node,
   ],
 })
 

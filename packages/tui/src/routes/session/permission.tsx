@@ -19,6 +19,32 @@ import { usePathFormatter } from "../../context/path-format"
 
 type PermissionStage = "permission" | "always" | "reject"
 
+export function askPermissionMetadata(request?: PermissionRequest) {
+  if (!request) return
+  const ask = request.metadata?.ask
+  if (typeof ask !== "object" || ask === null) return
+  if (!("requestID" in ask) || typeof ask.requestID !== "string") return
+  if (!("threadID" in ask) || typeof ask.threadID !== "string") return
+  if (!("turnID" in ask) || typeof ask.turnID !== "string") return
+  if (!("callID" in ask) || typeof ask.callID !== "string") return
+  if (!("tool" in ask) || typeof ask.tool !== "string") return
+  return {
+    requestID: ask.requestID,
+    threadID: ask.threadID,
+    turnID: ask.turnID,
+    callID: ask.callID,
+    tool: ask.tool,
+  }
+}
+
+export function isAskPermission(request: PermissionRequest) {
+  return askPermissionMetadata(request) !== undefined
+}
+
+export function normalPermissionCallID(requests: PermissionRequest[] | undefined) {
+  return requests?.find((request) => !isAskPermission(request))?.tool?.callID
+}
+
 function EditBody(props: { request: PermissionRequest }) {
   const themeState = useTheme()
   const theme = themeState.theme
@@ -108,7 +134,7 @@ function TextBody(props: { title: string; description?: string; icon?: string })
   )
 }
 
-export function PermissionPrompt(props: { request: PermissionRequest; directory?: string }) {
+export function PermissionPrompt(props: { request: PermissionRequest; directory?: string; modal?: boolean }) {
   const sdk = useSDK()
   const project = useProject()
   const sync = useSync()
@@ -121,14 +147,19 @@ export function PermissionPrompt(props: { request: PermissionRequest; directory?
 
   const input = createMemo(() => {
     const tool = props.request.tool
-    if (!tool) return {}
-    const parts = sync.data.part[tool.messageID] ?? []
-    for (const part of parts) {
-      if (part.type === "tool" && part.callID === tool.callID && part.state.status !== "pending") {
-        return part.state.input ?? {}
+    if (tool) {
+      const parts = sync.data.part[tool.messageID] ?? []
+      for (const part of parts) {
+        if (part.type === "tool" && part.callID === tool.callID && part.state.status !== "pending") {
+          return part.state.input ?? {}
+        }
       }
     }
-    return {}
+    const metadata = props.request.metadata ?? {}
+    if (props.request.permission === "read" && typeof metadata.filePath !== "string") {
+      return { ...metadata, filePath: props.request.patterns[0] }
+    }
+    return metadata
   })
 
   const { theme } = useTheme()
@@ -162,6 +193,7 @@ export function PermissionPrompt(props: { request: PermissionRequest; directory?
           }
           options={{ confirm: "Confirm", cancel: "Cancel" }}
           escapeKey="cancel"
+          modal={props.modal}
           onSelect={(option) => {
             setStore("stage", "permission")
             if (option === "cancel") return
@@ -176,6 +208,7 @@ export function PermissionPrompt(props: { request: PermissionRequest; directory?
       </Match>
       <Match when={store.stage === "reject"}>
         <RejectPrompt
+          modal={props.modal}
           onConfirm={(message) => {
             void sdk.client.permission.reply({
               reply: "reject",
@@ -405,6 +438,7 @@ export function PermissionPrompt(props: { request: PermissionRequest; directory?
               options={{ once: "Allow once", always: "Allow always", reject: "Reject" }}
               escapeKey="reject"
               fullscreen
+              modal={props.modal}
               onSelect={(option) => {
                 if (option === "always") {
                   setStore("stage", "always")
@@ -440,14 +474,15 @@ export function PermissionPrompt(props: { request: PermissionRequest; directory?
   )
 }
 
-function RejectPrompt(props: { onConfirm: (message: string) => void; onCancel: () => void }) {
+function RejectPrompt(props: { onConfirm: (message: string) => void; onCancel: () => void; modal?: boolean }) {
   let input: TextareaRenderable
   const { theme } = useTheme()
   const tuiConfig = useTuiConfig()
   const dimensions = useTerminalDimensions()
   const narrow = createMemo(() => dimensions().width < 80)
   useBindings(() => ({
-    mode: OPENCODE_BASE_MODE,
+    mode: props.modal ? "modal" : OPENCODE_BASE_MODE,
+    priority: props.modal ? 1 : undefined,
     commands: [
       {
         name: "app.exit",
@@ -529,6 +564,7 @@ function Prompt<const T extends Record<string, string>>(props: {
   options: T
   escapeKey?: keyof T
   fullscreen?: boolean
+  modal?: boolean
   onSelect: (option: keyof T) => void
 }) {
   const { theme } = useTheme()
@@ -543,7 +579,8 @@ function Prompt<const T extends Record<string, string>>(props: {
   const fullscreenHint = useCommandShortcut("permission.prompt.fullscreen")
 
   useBindings(() => ({
-    mode: OPENCODE_BASE_MODE,
+    mode: props.modal ? "modal" : OPENCODE_BASE_MODE,
+    priority: props.modal ? 1 : undefined,
     commands: [
       {
         name: "app.exit",

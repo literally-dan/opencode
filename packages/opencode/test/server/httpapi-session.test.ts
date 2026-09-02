@@ -21,10 +21,13 @@ import { InstanceStore } from "../../src/project/instance-store"
 import { Project } from "../../src/project/project"
 import { Plugin } from "../../src/plugin"
 import { HttpApiApp } from "../../src/server/routes/instance/httpapi/server"
+import type { rpc } from "../../src/cli/tui/worker"
+import { Rpc } from "../../src/util/rpc"
 import * as HttpSessionError from "../../src/server/routes/instance/httpapi/handlers/session-errors"
 import { ExperimentalPaths } from "../../src/server/routes/instance/httpapi/groups/experimental"
 import { SessionPaths } from "../../src/server/routes/instance/httpapi/groups/session"
 import { Session } from "@/session/session"
+import { SessionAsk } from "@/session/ask"
 import { MessageID, PartID, SessionID, type SessionID as SessionIDType } from "../../src/session/schema"
 import { Database } from "@opencode-ai/core/database/database"
 import { SessionInputTable, SessionMessageTable, SessionTable } from "@opencode-ai/core/session/sql"
@@ -37,7 +40,7 @@ import { resetDatabase } from "../fixture/db"
 import { disposeAllInstances, provideInstanceEffect, TestInstance, tmpdirScoped } from "../fixture/fixture"
 import { TestLLMServer } from "../lib/llm-server"
 import { testProviderConfig } from "../lib/test-provider"
-import { pollWithTimeout, testEffect } from "../lib/effect"
+import { awaitWithTimeout, pollWithTimeout, testEffect } from "../lib/effect"
 
 const originalWorkspaces = Flag.OPENCODE_EXPERIMENTAL_WORKSPACES
 const noopBootstrapLayer = Layer.succeed(
@@ -53,6 +56,12 @@ const blockingPromptPreparation = Layer.succeed(
   Plugin.Service.of({
     trigger: (name, _input, output) =>
       Effect.gen(function* () {
+        if (name === "experimental.chat.messages.transform") {
+          const messages = (output as unknown as { messages: SessionV1.WithParts[] }).messages
+          const index = messages.findIndex((message) => JSON.stringify(message).includes("remove-current-ask-message"))
+          if (index >= 0) messages.splice(index, 1)
+          return output
+        }
         if (name !== "chat.message") return output
         const gate = promptPreparationGates.shift()
         if (!gate) return output
@@ -543,6 +552,597 @@ describe("session HttpApi", () => {
           message: expect.stringContaining("Agent not found: provider unavailable"),
           status: 503,
         })
+      }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+    30_000,
+  )
+
+  it.live(
+    "maps an explicit unknown Ask agent to InvalidRequest",
+    () =>
+      Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        const directory = yield* tmpdirScoped({ git: true, config: testProviderConfig(llm.url) })
+        const session = yield* createSession({ title: "ask unknown agent" }).pipe(provideInstanceEffect(directory))
+        const marker = "secret-internal-agent"
+        const response = yield* request(
+          `${pathFor(SessionPaths.ask, { sessionID: session.id })}?directory=${encodeURIComponent(directory)}`,
+          {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              question: "what changed?",
+              agent: marker,
+              model: { providerID: "test", modelID: "test-model" },
+            }),
+          },
+        )
+
+        expect(response.status).toBe(400)
+        expect(yield* responseJson(response)).toEqual({
+          _tag: "InvalidRequestError",
+          message: `Agent not found: "${marker}"`,
+          kind: "UnknownAgent",
+          field: "agent",
+        })
+      }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+    30_000,
+  )
+
+  it.live(
+    "returns a sanitized 500 for an internal Ask defect",
+    () =>
+      Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        const marker = "secret-default-agent"
+        const directory = yield* tmpdirScoped({
+          git: true,
+          config: { ...testProviderConfig(llm.url), default_agent: marker },
+        })
+        const session = yield* createSession({ title: "ask internal defect" }).pipe(provideInstanceEffect(directory))
+        const response = yield* request(
+          `${pathFor(SessionPaths.ask, { sessionID: session.id })}?directory=${encodeURIComponent(directory)}`,
+          {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              question: "what changed?",
+              model: { providerID: "test", modelID: "test-model" },
+            }),
+          },
+        )
+
+        expect(response.status).toBe(500)
+        const body = yield* responseJson(response)
+        expect(body).toMatchObject({
+          name: "UnknownError",
+          data: {
+            message: "Unexpected server error. Check server logs for details.",
+            ref: expect.stringMatching(/^err_[0-9a-f-]{8}$/),
+          },
+        })
+        expect(JSON.stringify(body)).not.toContain(marker)
+        expect(JSON.stringify(body)).not.toContain("default agent")
+      }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+    30_000,
+  )
+
+  it.live(
+    "returns a sanitized 500 when an Ask transform removes the current message",
+    () =>
+      Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        const directory = yield* tmpdirScoped({ git: true, config: testProviderConfig(llm.url) })
+        const session = yield* createSession({ title: "ask missing current message" }).pipe(
+          provideInstanceEffect(directory),
+        )
+        const response = yield* request(
+          `${pathFor(SessionPaths.ask, { sessionID: session.id })}?directory=${encodeURIComponent(directory)}`,
+          {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              question: "remove-current-ask-message",
+              model: { providerID: "test", modelID: "test-model" },
+            }),
+          },
+        )
+
+        expect(response.status).toBe(500)
+        const body = yield* responseJson(response)
+        expect(body).toMatchObject({
+          name: "UnknownError",
+          data: {
+            message: "Unexpected server error. Check server logs for details.",
+            ref: expect.stringMatching(/^err_[0-9a-f-]{8}$/),
+          },
+        })
+        expect(JSON.stringify(body)).not.toContain("SessionAskCurrentMessageMissingError")
+        expect(JSON.stringify(body)).not.toContain("remove-current-ask-message")
+      }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+    30_000,
+  )
+
+  it.live(
+    "maps duplicate active Ask request IDs to Conflict",
+    () =>
+      Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        const directory = yield* tmpdirScoped({ git: true, config: testProviderConfig(llm.url) })
+        const session = yield* createSession({ title: "Ask request conflict" }).pipe(provideInstanceEffect(directory))
+        const headers = { "content-type": "application/json" }
+        const directoryQuery = `directory=${encodeURIComponent(directory)}`
+        const askPath = `${pathFor(SessionPaths.ask, { sessionID: session.id })}?${directoryQuery}`
+        const body = JSON.stringify({
+          requestID: "duplicate-request",
+          question: "hold this request",
+          agent: "build",
+          model: { providerID: "test", modelID: "test-model" },
+        })
+
+        yield* llm.hang
+        const pending = yield* request(askPath, { method: "POST", headers, body }).pipe(Effect.forkChild)
+        yield* llm.wait(1).pipe(Effect.timeout("10 seconds"))
+        const duplicate = yield* request(askPath, { method: "POST", headers, body })
+        expect(duplicate.status).toBe(409)
+        expect(yield* responseJson(duplicate)).toMatchObject({
+          _tag: "ConflictError",
+          resource: "duplicate-request",
+        })
+
+        const aborted = yield* request(`${pathFor(SessionPaths.abort, { sessionID: session.id })}?${directoryQuery}`, {
+          method: "POST",
+        })
+        expect(aborted.status).toBe(200)
+        yield* Fiber.await(pending).pipe(Effect.timeout("10 seconds"))
+        const threads = yield* requestJson<SessionAsk.ThreadsOutput>(
+          `${pathFor(SessionPaths.askThreads, { sessionID: session.id })}?${directoryQuery}`,
+        )
+        expect(threads.items).toEqual([])
+      }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+    30_000,
+  )
+
+  it.live(
+    "serves isolated Ask threads with follow-ups, pagination, and session ownership",
+    () =>
+      Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        const directory = yield* tmpdirScoped({ git: true, config: testProviderConfig(llm.url) })
+        const session = yield* createSession({ title: "Ask HTTP" }).pipe(provideInstanceEffect(directory))
+        const other = yield* createSession({ title: "Other session" }).pipe(provideInstanceEffect(directory))
+        yield* createTextMessage(session.id, "Normal session context").pipe(provideInstanceEffect(directory))
+        const beforeMessages = yield* Session.use
+          .messages({ sessionID: session.id })
+          .pipe(provideInstanceEffect(directory), Effect.orDie)
+        const beforeSession = yield* Session.use.get(session.id).pipe(provideInstanceEffect(directory))
+        const headers = { "content-type": "application/json" }
+        const askPath = `${pathFor(SessionPaths.ask, { sessionID: session.id })}?directory=${encodeURIComponent(directory)}`
+        const postAsk = (body: Record<string, unknown>) =>
+          requestJson<SessionAsk.AskOutput>(askPath, {
+            method: "POST",
+            headers,
+            body: JSON.stringify({
+              agent: "build",
+              model: { providerID: "test", modelID: "test-model" },
+              ...body,
+            }),
+          })
+
+        yield* llm.text("first answer")
+        const first = yield* postAsk({ requestID: "client-request", question: "first question" })
+        expect(first).toMatchObject({
+          requestID: "client-request",
+          question: "first question",
+          answer: "first answer",
+          text: "first answer",
+          toolActivity: [],
+        })
+
+        yield* llm.text("follow-up answer")
+        const followUp = yield* postAsk({ threadID: first.threadID, question: "follow-up question" })
+        expect(followUp).toMatchObject({ threadID: first.threadID, text: "follow-up answer" })
+        expect(followUp.requestID).toBeTruthy()
+
+        yield* llm.text("second answer")
+        const second = yield* postAsk({ question: "second question" })
+
+        const threadsPath = pathFor(SessionPaths.askThreads, { sessionID: session.id })
+        const firstPage = yield* requestJson<SessionAsk.ThreadsOutput>(
+          `${threadsPath}?directory=${encodeURIComponent(directory)}&limit=1`,
+        )
+        expect(firstPage.items).toHaveLength(1)
+        expect(firstPage.more).toBe(true)
+        expect(firstPage.cursor).toBeTruthy()
+        if (!firstPage.cursor) return yield* Effect.die("Ask thread page did not return a cursor")
+        const secondPage = yield* requestJson<SessionAsk.ThreadsOutput>(
+          `${threadsPath}?directory=${encodeURIComponent(directory)}&limit=1&before=${encodeURIComponent(firstPage.cursor)}`,
+        )
+        expect([...firstPage.items, ...secondPage.items].map((item) => item.id)).toEqual(
+          expect.arrayContaining([first.threadID, second.threadID]),
+        )
+        expect(secondPage.more).toBe(false)
+        expect(
+          (yield* request(`${threadsPath}?directory=${encodeURIComponent(directory)}&before=invalid`)).status,
+        ).toBe(400)
+        expect(
+          yield* Effect.forEach(["limit=0", "limit=101", "limit=1.5", `before=${"x".repeat(513)}`], (query) =>
+            request(`${threadsPath}?directory=${encodeURIComponent(directory)}&${query}`).pipe(
+              Effect.map((response) => response.status),
+            ),
+          ),
+        ).toEqual([400, 400, 400, 400])
+        expect((yield* request(`${threadsPath}?directory=${encodeURIComponent(directory)}&limit=100`)).status).toBe(200)
+
+        const turnsPath = pathFor(SessionPaths.askThread, {
+          sessionID: session.id,
+          threadID: first.threadID,
+        })
+        const latestTurn = yield* requestJson<SessionAsk.TurnsOutput>(
+          `${turnsPath}?directory=${encodeURIComponent(directory)}&limit=1`,
+        )
+        expect(latestTurn.items.map((item) => item.id)).toEqual([followUp.id])
+        expect(latestTurn.more).toBe(true)
+        if (!latestTurn.cursor) return yield* Effect.die("Ask turn page did not return a cursor")
+        const olderTurn = yield* requestJson<SessionAsk.TurnsOutput>(
+          `${turnsPath}?directory=${encodeURIComponent(directory)}&limit=1&before=${encodeURIComponent(latestTurn.cursor)}`,
+        )
+        expect(olderTurn.items.map((item) => item.id)).toEqual([first.id])
+        expect(olderTurn.more).toBe(false)
+        expect((yield* request(`${turnsPath}?directory=${encodeURIComponent(directory)}&before=invalid`)).status).toBe(
+          400,
+        )
+        expect(
+          yield* Effect.forEach(["limit=0", "limit=101", "limit=1.5", `before=${"x".repeat(513)}`], (query) =>
+            request(`${turnsPath}?directory=${encodeURIComponent(directory)}&${query}`).pipe(
+              Effect.map((response) => response.status),
+            ),
+          ),
+        ).toEqual([400, 400, 400, 400])
+        expect((yield* request(`${turnsPath}?directory=${encodeURIComponent(directory)}&limit=100`)).status).toBe(200)
+
+        const otherThreads = yield* requestJson<SessionAsk.ThreadsOutput>(
+          `${pathFor(SessionPaths.askThreads, { sessionID: other.id })}?directory=${encodeURIComponent(directory)}`,
+        )
+        expect(otherThreads.items).toEqual([])
+        const crossSession = yield* request(
+          `${pathFor(SessionPaths.askThread, {
+            sessionID: other.id,
+            threadID: first.threadID,
+          })}?directory=${encodeURIComponent(directory)}`,
+        )
+        expect(crossSession.status).toBe(404)
+        expect(yield* responseJson(crossSession)).toEqual({
+          name: "NotFoundError",
+          data: { message: `Ask thread not found: ${first.threadID}` },
+        })
+
+        const afterMessages = yield* Session.use
+          .messages({ sessionID: session.id })
+          .pipe(provideInstanceEffect(directory), Effect.orDie)
+        const afterSession = yield* Session.use.get(session.id).pipe(provideInstanceEffect(directory))
+        expect(afterMessages.map((message) => message.info.id)).toEqual(
+          beforeMessages.map((message) => message.info.id),
+        )
+        expect(afterSession.time.updated).toBe(beforeSession.time.updated)
+      }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+    30_000,
+  )
+
+  it.live(
+    "interrupts an embedded RPC Ask without affecting concurrent Ask or normal Session state",
+    () =>
+      Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        const directory = yield* tmpdirScoped({ git: true, config: testProviderConfig(llm.url) })
+        const cancelledQuestion = "cancel through embedded RPC"
+        const cancelledDispatched = Promise.withResolvers<void>()
+        const cancelledTerminal = Promise.withResolvers<unknown>()
+        const worker = new Worker(new URL("../../src/cli/tui/worker.ts", import.meta.url), { type: "module" })
+        yield* Effect.addFinalizer(() => Effect.sync(() => worker.terminate()))
+        let cancelledRequestID: number | undefined
+        const target: Rpc.Target = {
+          onmessage: null,
+          postMessage(data) {
+            const message = JSON.parse(data)
+            if (
+              message.type === "rpc.request" &&
+              message.method === "fetch" &&
+              typeof message.input?.body === "string" &&
+              message.input.body.includes(cancelledQuestion)
+            ) {
+              cancelledRequestID = message.id
+              cancelledDispatched.resolve()
+            }
+            worker.postMessage(data)
+          },
+        }
+        worker.onmessage = (event) => {
+          const message = JSON.parse(event.data)
+          if (message.id === cancelledRequestID && (message.type === "rpc.result" || message.type === "rpc.error")) {
+            cancelledTerminal.resolve(message)
+          }
+          target.onmessage?.(event)
+        }
+        const client = Rpc.client<typeof rpc>(target)
+        // The rendered dialog separately tests that Cancel aborts this exact local request signal.
+        const embeddedFetch = async (input: RequestInfo | URL, init?: RequestInit) => {
+          const request = new Request(input, init)
+          request.signal.throwIfAborted()
+          const body = request.body ? await request.text() : undefined
+          const response = await client.call(
+            "fetch",
+            {
+              url: request.url,
+              method: request.method,
+              headers: Object.fromEntries(request.headers.entries()),
+              body,
+            },
+            { signal: request.signal },
+          )
+          return new Response(response.body, { status: response.status, headers: response.headers })
+        }
+        const fetchJson = async (url: string, init?: RequestInit) => {
+          const response = await embeddedFetch(url, init)
+          if (response.status !== 200) throw new Error(`${response.status}: ${await response.text()}`)
+          return response.json()
+        }
+        const directoryQuery = `directory=${encodeURIComponent(directory)}`
+        const url = (path: string) => `http://opencode.local${path}?${directoryQuery}`
+        const askUrl = (sessionID: SessionIDType) => url(pathFor(SessionPaths.ask, { sessionID }))
+        const askBody = (question: string, requestID: string) =>
+          JSON.stringify({
+            question,
+            requestID,
+            agent: "build",
+            model: { providerID: "test", modelID: "test-model" },
+          })
+        const headers = { "content-type": "application/json" }
+        const statusUrl = url(SessionPaths.status)
+        const session = yield* Effect.promise(() =>
+          fetchJson(url(SessionPaths.create), {
+            method: "POST",
+            headers,
+            body: JSON.stringify({ title: "Embedded Ask abort" }),
+          }),
+        )
+        const other = yield* Effect.promise(() =>
+          fetchJson(url(SessionPaths.create), {
+            method: "POST",
+            headers,
+            body: JSON.stringify({ title: "Concurrent embedded Ask" }),
+          }),
+        )
+        yield* llm.text("normal baseline answer")
+        yield* Effect.promise(() =>
+          fetchJson(url(pathFor(SessionPaths.prompt, { sessionID: session.id })), {
+            method: "POST",
+            headers,
+            body: JSON.stringify({
+              agent: "build",
+              model: { providerID: "test", modelID: "test-model" },
+              parts: [{ type: "text", text: "normal baseline question" }],
+            }),
+          }),
+        )
+        yield* llm.reset
+        const beforeMessages = yield* Effect.promise(() =>
+          fetchJson(url(pathFor(SessionPaths.messages, { sessionID: session.id }))),
+        )
+        const beforeOtherMessages = yield* Effect.promise(() =>
+          fetchJson(url(pathFor(SessionPaths.messages, { sessionID: other.id }))),
+        )
+        const beforeSession = yield* Effect.promise(() =>
+          fetchJson(url(pathFor(SessionPaths.get, { sessionID: session.id }))),
+        )
+        const beforeOther = yield* Effect.promise(() =>
+          fetchJson(url(pathFor(SessionPaths.get, { sessionID: other.id }))),
+        )
+        const beforeStatus = yield* Effect.promise(() => fetchJson(statusUrl))
+        yield* llm.hang
+        const controller = new AbortController()
+        const cancelled = yield* Effect.promise(() =>
+          embeddedFetch(askUrl(session.id), {
+            method: "POST",
+            headers,
+            body: askBody(cancelledQuestion, "cancelled-rpc-request"),
+            signal: controller.signal,
+          }),
+        ).pipe(Effect.exit, Effect.forkChild)
+        yield* awaitWithTimeout(
+          Effect.promise(() => cancelledDispatched.promise),
+          "Cancelled embedded Ask did not dispatch over RPC",
+          "10 seconds",
+        )
+        const cancelledStart = yield* awaitWithTimeout(
+          Effect.raceFirst(
+            llm.wait(1).pipe(Effect.as({ type: "provider" as const })),
+            Effect.promise(() => cancelledTerminal.promise).pipe(
+              Effect.map((message) => ({ type: "terminal" as const, message })),
+            ),
+          ),
+          "Cancelled embedded Ask neither reached the provider nor terminated",
+          "20 seconds",
+        )
+        if (cancelledStart.type === "terminal")
+          return yield* Effect.die(
+            new Error(
+              `Cancelled embedded Ask terminated before the provider: ${JSON.stringify(cancelledStart.message)}`,
+            ),
+          )
+
+        const releaseOther = Promise.withResolvers<void>()
+        yield* llm.hold("unaffected answer", releaseOther.promise)
+        const unaffected = yield* Effect.promise(() =>
+          embeddedFetch(askUrl(other.id), {
+            method: "POST",
+            headers,
+            body: askBody("continue unaffected", "unaffected-rpc-request"),
+          }),
+        ).pipe(Effect.forkChild)
+        yield* awaitWithTimeout(llm.wait(2), "Concurrent embedded Ask did not reach the provider", "10 seconds")
+
+        expect(yield* Effect.promise(() => fetchJson(statusUrl))).toEqual(beforeStatus)
+        controller.abort()
+        expect(
+          Exit.isFailure(
+            yield* awaitWithTimeout(Fiber.join(cancelled), "Local embedded Ask fetch did not abort", "10 seconds"),
+          ),
+        ).toBe(true)
+        yield* awaitWithTimeout(
+          Effect.promise(() => cancelledTerminal.promise),
+          "Cancelled embedded Ask HTTP handler did not terminate",
+          "10 seconds",
+        )
+        const interruptedProbe = yield* Effect.promise(() =>
+          embeddedFetch(askUrl(session.id), {
+            method: "POST",
+            headers,
+            body: JSON.stringify({
+              question: cancelledQuestion,
+              requestID: "cancelled-rpc-request",
+              agent: "build",
+              model: { providerID: "test", modelID: "missing-model" },
+            }),
+          }),
+        )
+        expect(interruptedProbe.status).toBe(404)
+        expect(yield* Effect.promise(() => fetchJson(statusUrl))).toEqual(beforeStatus)
+
+        releaseOther.resolve()
+        const unaffectedResponse = yield* awaitWithTimeout(
+          Fiber.join(unaffected),
+          "Concurrent embedded Ask did not complete",
+          "10 seconds",
+        )
+        expect(unaffectedResponse.status).toBe(200)
+        const unaffectedOutput = JSON.parse(yield* Effect.promise(() => unaffectedResponse.text()))
+        expect(unaffectedOutput).toMatchObject({
+          question: "continue unaffected",
+          answer: "unaffected answer",
+        })
+
+        const afterMessages = yield* Effect.promise(() =>
+          fetchJson(url(pathFor(SessionPaths.messages, { sessionID: session.id }))),
+        )
+        const afterOtherMessages = yield* Effect.promise(() =>
+          fetchJson(url(pathFor(SessionPaths.messages, { sessionID: other.id }))),
+        )
+        const afterSession = yield* Effect.promise(() =>
+          fetchJson(url(pathFor(SessionPaths.get, { sessionID: session.id }))),
+        )
+        const afterOther = yield* Effect.promise(() =>
+          fetchJson(url(pathFor(SessionPaths.get, { sessionID: other.id }))),
+        )
+        expect(afterMessages).toEqual(beforeMessages)
+        expect(afterOtherMessages).toEqual(beforeOtherMessages)
+        expect(afterSession.time.updated).toBe(beforeSession.time.updated)
+        expect(afterOther.time.updated).toBe(beforeOther.time.updated)
+        expect(yield* Effect.promise(() => fetchJson(statusUrl))).toEqual(beforeStatus)
+
+        const cancelledThreads = yield* Effect.promise(() =>
+          fetchJson(url(pathFor(SessionPaths.askThreads, { sessionID: session.id }))),
+        )
+        const otherThreads = yield* Effect.promise(() =>
+          fetchJson(url(pathFor(SessionPaths.askThreads, { sessionID: other.id }))),
+        )
+        // Ask turns have a foreign key to their thread, so no thread means no cancelled turn survived either.
+        expect(cancelledThreads.items).toEqual([])
+        expect(otherThreads.items).toHaveLength(1)
+        if (typeof unaffectedOutput.threadID !== "string")
+          return yield* Effect.die(new Error("Concurrent embedded Ask did not return a thread ID"))
+        const otherTurns = yield* Effect.promise(() =>
+          fetchJson(
+            url(
+              pathFor(SessionPaths.askThread, {
+                sessionID: other.id,
+                threadID: unaffectedOutput.threadID,
+              }),
+            ),
+          ),
+        )
+        expect(otherTurns.items).toHaveLength(1)
+        expect(otherTurns.items[0]).toMatchObject({ question: "continue unaffected", answer: "unaffected answer" })
+      }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+    60_000,
+  )
+
+  it.live(
+    "cancels only an active Ask follow-up and persists no cancelled turn",
+    () =>
+      Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        const directory = yield* tmpdirScoped({ git: true, config: testProviderConfig(llm.url) })
+        const session = yield* createSession({ title: "Cancel Ask HTTP" }).pipe(provideInstanceEffect(directory))
+        const headers = { "content-type": "application/json" }
+        const askPath = `${pathFor(SessionPaths.ask, { sessionID: session.id })}?directory=${encodeURIComponent(directory)}`
+        const body = (question: string, threadID?: string) =>
+          JSON.stringify({
+            question,
+            threadID,
+            agent: "build",
+            model: { providerID: "test", modelID: "test-model" },
+          })
+
+        const invalid = yield* request(
+          `${pathFor(SessionPaths.askCancel, { sessionID: session.id, threadID: "invalid" })}?directory=${encodeURIComponent(directory)}`,
+          { method: "POST" },
+        )
+        expect(invalid.status).toBe(400)
+        expect(yield* responseJson(invalid)).toMatchObject({
+          name: "BadRequest",
+          data: { kind: "Params" },
+        })
+
+        yield* llm.text("created")
+        const first = yield* requestJson<SessionAsk.AskOutput>(askPath, {
+          method: "POST",
+          headers,
+          body: body("create thread"),
+        })
+        yield* llm.hang
+        const pending = yield* request(askPath, {
+          method: "POST",
+          headers,
+          body: body("cancelled follow-up", first.threadID),
+        }).pipe(Effect.forkChild)
+        yield* llm.wait(2).pipe(Effect.timeout("10 seconds"))
+
+        const busy = yield* request(askPath, {
+          method: "POST",
+          headers,
+          body: body("conflicting follow-up", first.threadID),
+        })
+        expect(busy.status).toBe(409)
+        expect(yield* responseJson(busy)).toMatchObject({
+          _tag: "ConflictError",
+          resource: first.threadID,
+        })
+
+        const cancelled = yield* request(
+          `${pathFor(SessionPaths.askCancel, {
+            sessionID: session.id,
+            threadID: first.threadID,
+          })}?directory=${encodeURIComponent(directory)}`,
+          { method: "POST", headers },
+        )
+        expect(cancelled.status).toBe(200)
+        expect(yield* responseJson(cancelled)).toBe(true)
+        yield* Fiber.await(pending).pipe(Effect.timeout("10 seconds"))
+
+        yield* llm.text("after cancel")
+        const completed = yield* requestJson<SessionAsk.AskOutput>(askPath, {
+          method: "POST",
+          headers,
+          body: body("completed follow-up", first.threadID),
+        })
+        expect(completed.text).toBe("after cancel")
+        const turns = yield* requestJson<SessionAsk.TurnsOutput>(
+          `${pathFor(SessionPaths.askThread, {
+            sessionID: session.id,
+            threadID: first.threadID,
+          })}?directory=${encodeURIComponent(directory)}`,
+        )
+        expect(turns.items.map((turn) => turn.question)).toEqual(["create thread", "completed follow-up"])
       }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
     30_000,
   )

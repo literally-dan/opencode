@@ -1,4 +1,5 @@
-import { sqliteTable, text, integer, index, primaryKey, real, uniqueIndex } from "drizzle-orm/sqlite-core"
+import { sql } from "drizzle-orm"
+import { check, sqliteTable, text, integer, index, primaryKey, real, uniqueIndex } from "drizzle-orm/sqlite-core"
 import * as DatabasePath from "../database/path"
 import { ProjectTable } from "../project/sql"
 import type { SessionMessage } from "./message"
@@ -18,6 +19,18 @@ import type { Revert } from "@opencode-ai/schema/revert"
 type SessionMessageData = Omit<(typeof SessionMessage.Message)["Encoded"], "type" | "id">
 type V1MessageData = Omit<SessionV1.Info, "id" | "sessionID">
 type V1PartData = Omit<SessionV1.Part, "id" | "sessionID" | "messageID">
+
+export const SESSION_ASK_TITLE_MAX_CHARS = 256
+export const SESSION_ASK_TOOL_ACTIVITY_MAX_BYTES = 1024 * 1024
+
+export interface SessionAskToolActivity {
+  readonly callID: string
+  readonly tool: string
+  readonly status: "completed" | "error"
+  readonly input: string
+  readonly output?: string
+  readonly error?: string
+}
 
 export const SessionTable = sqliteTable(
   "session",
@@ -65,6 +78,58 @@ export const SessionTable = sqliteTable(
     index("session_parent_idx").on(table.parent_id, table.time_updated, table.id),
     index("session_task_parent_idx").on(table.task_parent_id),
     index("session_time_updated_idx").on(table.time_updated, table.id),
+  ],
+)
+
+export const SessionAskThreadTable = sqliteTable(
+  "session_ask_thread",
+  {
+    id: text().primaryKey(),
+    session_id: text()
+      .$type<SessionSchema.ID>()
+      .notNull()
+      .references(() => SessionTable.id, { onDelete: "cascade" }),
+    title: text().notNull(),
+    created_at: integer()
+      .notNull()
+      .$default(() => Date.now()),
+    updated_at: integer()
+      .notNull()
+      .$default(() => Date.now()),
+  },
+  (table) => [
+    index("session_ask_thread_session_updated_id_idx").on(table.session_id, table.updated_at, table.id),
+    check(
+      "session_ask_thread_title_length_check",
+      sql`length(${table.title}) <= ${sql.raw(String(SESSION_ASK_TITLE_MAX_CHARS))}`,
+    ),
+  ],
+)
+
+export const SessionAskTurnTable = sqliteTable(
+  "session_ask_turn",
+  {
+    id: text().primaryKey(),
+    thread_id: text()
+      .notNull()
+      .references(() => SessionAskThreadTable.id, { onDelete: "cascade" }),
+    question: text().notNull(),
+    answer: text().notNull(),
+    tool_activity: text({ mode: "json" }).notNull().$type<SessionAskToolActivity[]>(),
+    created_at: integer()
+      .notNull()
+      .$default(() => Date.now()),
+  },
+  (table) => [
+    index("session_ask_turn_thread_id_id_idx").on(table.thread_id, table.id),
+    check(
+      "session_ask_turn_tool_activity_json_check",
+      sql`json_valid(${table.tool_activity}) AND json_type(${table.tool_activity}) = 'array'`,
+    ),
+    check(
+      "session_ask_turn_tool_activity_size_check",
+      sql`length(cast(${table.tool_activity} as blob)) <= ${sql.raw(String(SESSION_ASK_TOOL_ACTIVITY_MAX_BYTES))}`,
+    ),
   ],
 )
 
