@@ -434,9 +434,13 @@ export const make = <A, E = never>(
         }
       }
     }),
+  ).pipe(
+    // Once a cancellation is enqueued, only its effect moves the runner out of Cancelling. It must finish even if its
+    // caller is interrupted, for example by instance disposal, or later cancels wait forever.
+    Effect.map(Effect.uninterruptible),
   )
 
-  const cancel = enqueueCancel.pipe(Effect.flatten)
+  const cancel = enqueueCancel.pipe(Effect.flatten, Effect.uninterruptible)
 
   return {
     get state() {

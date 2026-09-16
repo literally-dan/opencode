@@ -1,6 +1,7 @@
 import * as Tool from "./tool"
 import DESCRIPTION from "./search_session_history.txt"
 import { Session } from "@/session/session"
+import { SessionTaskState } from "@/session/task-state"
 import { SessionID } from "../session/schema"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { isCanonicalSessionID, isReadableSession } from "./history-scope"
@@ -46,10 +47,15 @@ type Metadata = {
   truncated: boolean
 }
 
-export const SearchSessionHistoryTool = Tool.define<typeof Parameters, Metadata, Session.Service>(
+export const SearchSessionHistoryTool = Tool.define<
+  typeof Parameters,
+  Metadata,
+  Session.Service | SessionTaskState.Service
+>(
   id,
   Effect.gen(function* () {
     const sessions = yield* Session.Service
+    const taskState = yield* SessionTaskState.Service
 
     return {
       description: DESCRIPTION,
@@ -70,11 +76,11 @@ export const SearchSessionHistoryTool = Tool.define<typeof Parameters, Metadata,
             }
           }
           const sessionID = params.session_id ? SessionID.make(params.session_id) : ctx.sessionID
-          if (params.session_id && !(yield* isReadableSession(sessions, sessionID, ctx.sessionID))) {
+          if (params.session_id && !(yield* isReadableSession(taskState, sessionID, ctx.sessionID))) {
             return {
               title: `Session not accessible: ${sessionID}`,
               metadata: { sessionID, pattern: params.pattern, matched: 0, truncated: false },
-              output: `Session ${sessionID} is not the current session or one of its ancestors; cross-session search is not allowed.`,
+              output: `Session ${sessionID} is not accessible from this session; cross-session searches require explicit ancestor history access.`,
             }
           }
           const limit = params.limit ?? DEFAULT_LIMIT

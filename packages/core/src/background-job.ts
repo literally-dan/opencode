@@ -1,6 +1,6 @@
 export * as BackgroundJob from "./background-job"
 
-import { Cause, Clock, Context, Deferred, Effect, Exit, Layer, Scope, SynchronizedRef } from "effect"
+import { Cause, Clock, Context, Deferred, Effect, Exit, Layer, Option, Scope, SynchronizedRef } from "effect"
 import { Identifier } from "./id/id"
 import { makeGlobalNode } from "./effect/app-node"
 
@@ -13,6 +13,7 @@ export type Info = {
   status: Status
   started_at: number
   completed_at?: number
+  /** While running, the output of the latest settled run. */
   output?: string
   error?: string
   metadata?: Record<string, unknown>
@@ -102,6 +103,11 @@ export type ExtendInput = {
   run: Effect.Effect<string, unknown>
 }
 
+export type HoldInput = {
+  id: string
+  expectedType?: string
+}
+
 export type WaitInput = {
   id: string
   timeout?: number
@@ -117,7 +123,13 @@ export interface Interface {
   readonly get: (id: string) => Effect.Effect<Info | undefined>
   readonly start: (input: StartInput) => Effect.Effect<Info>
   readonly extend: (input: ExtendInput) => Effect.Effect<boolean>
+  /**
+   * Keeps a running generation from settling until the returned release runs. A hold runs no work and does not
+   * change output. The release is idempotent and does not wait for completion delivery.
+   */
+  readonly hold: (input: HoldInput) => Effect.Effect<Option.Option<Effect.Effect<void>>>
   readonly wait: (input: WaitInput) => Effect.Effect<WaitResult>
+  /** Marks a running generation cancelled. It does not wait for an awaited completion callback; use `wait` for that. */
   readonly cancel: (id: string) => Effect.Effect<Info | undefined>
 }
 
@@ -126,6 +138,7 @@ export class Service extends Context.Service<Service, Interface>()("@opencode/Ba
 function snapshot(job: Active): Info {
   return {
     ...job.info,
+    ...(job.info.status === "running" && job.output ? { output: job.output.text } : {}),
     ...(job.info.metadata ? { metadata: { ...job.info.metadata } } : {}),
   }
 }
@@ -186,7 +199,8 @@ export const make = Effect.gen(function* () {
   })
 
   const settle = Effect.fn("BackgroundJob.settle")(
-    (id: string, token: object, sequence: number, exit: Exit.Exit<string, unknown>) =>
+    // A hold release settles without a run result.
+    (id: string, token: object, outcome?: { sequence: number; exit: Exit.Exit<string, unknown> }) =>
       Effect.uninterruptibleMask((restore) =>
         Effect.gen(function* () {
           const completed_at = yield* Clock.currentTimeMillis
@@ -198,22 +212,22 @@ export const make = Effect.gen(function* () {
               if (job.info.status !== "running" || job.settling !== "running") return [{ info: snapshot(job) }, jobs]
               const pending = job.pending - 1
               const output =
-                Exit.isSuccess(exit) && (!job.output || sequence > job.output.sequence)
-                  ? { sequence, text: exit.value }
+                outcome && Exit.isSuccess(outcome.exit) && (!job.output || outcome.sequence > job.output.sequence)
+                  ? { sequence: outcome.sequence, text: outcome.exit.value }
                   : job.output
-              const status: Exclude<Status, "running"> = Exit.isSuccess(exit)
-                ? "completed"
-                : Cause.hasInterruptsOnly(exit.cause)
-                  ? "cancelled"
-                  : "error"
-              const settled: Settlement = {
-                sequence,
-                status,
-                ...(Exit.isFailure(exit) ? { error: errorText(Cause.squash(exit.cause)) } : {}),
+              const settled: Settlement | undefined = outcome && {
+                sequence: outcome.sequence,
+                status: Exit.isSuccess(outcome.exit)
+                  ? "completed"
+                  : Cause.hasInterruptsOnly(outcome.exit.cause)
+                    ? "cancelled"
+                    : "error",
+                ...(Exit.isFailure(outcome.exit) ? { error: errorText(Cause.squash(outcome.exit.cause)) } : {}),
               }
-              // Tail wakeups can invert completion timing, so terminal state follows accepted sequence.
-              const settlement = !job.settlement || sequence > job.settlement.sequence ? settled : job.settlement
-              if (pending > 0) {
+              // Terminal state follows the highest accepted sequence, not settle order.
+              const settlement =
+                settled && (!job.settlement || settled.sequence > job.settlement.sequence) ? settled : job.settlement
+              if (pending > 0 || !settlement) {
                 return [{}, new Map(jobs).set(id, { ...job, pending, output, settlement })]
               }
               const next = {
@@ -278,12 +292,16 @@ export const make = Effect.gen(function* () {
     token: object,
     sequence: number,
     run: Effect.Effect<string, unknown>,
+    tail: Deferred.Deferred<void>,
   ) {
     return yield* run.pipe(
       Effect.matchCauseEffect({
-        onSuccess: (output) => settle(id, token, sequence, Exit.succeed(output)),
-        onFailure: (cause) => settle(id, token, sequence, Exit.failCause(cause)),
+        onSuccess: (output) => settle(id, token, { sequence, exit: Exit.succeed(output) }),
+        onFailure: (cause) => settle(id, token, { sequence, exit: Exit.failCause(cause) }),
       }),
+      // The next queued run starts when this tail resolves, so it must see the output that settle recorded.
+      // A queued run keeps `pending` above zero, so this settle cannot finalize while one waits.
+      Effect.ensuring(Deferred.succeed(tail, undefined)),
       Effect.asVoid,
       Effect.forkIn(scope, { startImmediately: true }),
     )
@@ -347,14 +365,7 @@ export const make = Effect.gen(function* () {
             ]
           }),
         )
-        if ("scope" in result)
-          yield* fork(
-            result.scope,
-            id,
-            result.token,
-            0,
-            restore(input.run).pipe(Effect.ensuring(Deferred.succeed(tail, undefined))),
-          )
+        if ("scope" in result) yield* fork(result.scope, id, result.token, 0, restore(input.run), tail)
         return result
       }),
     )
@@ -401,10 +412,40 @@ export const make = Effect.gen(function* () {
           Deferred.await(result.previous).pipe(
             Effect.andThen(restore(input.run)),
             Effect.ensuring(input.onFinalize ?? Effect.void),
-            Effect.ensuring(Deferred.succeed(result.tail, undefined)),
           ),
+          result.tail,
         )
         return true
+      }),
+    )
+  })
+
+  const hold: Interface["hold"] = Effect.fn("BackgroundJob.hold")(function* (input) {
+    const token = yield* SynchronizedRef.modifyEffect(state.jobs, (jobs) =>
+      Effect.sync((): readonly [object | undefined, Map<string, Active>] => {
+        const job = jobs.get(input.id)
+        if (
+          !job ||
+          job.info.status !== "running" ||
+          job.settling === "finalizing" ||
+          (input.expectedType !== undefined && job.info.type !== input.expectedType)
+        )
+          return [undefined, jobs]
+        // Like an extension, a hold invalidates a claimable settlement that has not taken delivery yet.
+        return [
+          job.token,
+          new Map(jobs).set(input.id, { ...job, settling: "running", pending: job.pending + 1, next: job.next + 1 }),
+        ]
+      }),
+    )
+    if (!token) return Option.none()
+    const released = { value: false }
+    return Option.some(
+      Effect.suspend(() => {
+        if (released.value) return Effect.void
+        released.value = true
+        // The last release can finalize the generation. Its completion delivery must not run in the releasing fiber.
+        return settle(input.id, token).pipe(Effect.forkIn(state.scope, { startImmediately: true }), Effect.asVoid)
       }),
     )
   })
@@ -456,13 +497,20 @@ export const make = Effect.gen(function* () {
             ]
           }),
         )
-        if (result.finalize) yield* finalize(id, result.finalize, restore)
+        if (!result.finalize) return result.info
+        // An awaited completion callback can wait for other work, such as an ancestor turn. Cancellation returns once
+        // the generation is marked. Delivery and scope cleanup finish in the registry scope.
+        if (result.finalize.onComplete && result.finalize.awaitOnComplete) {
+          yield* finalize(id, result.finalize, restore).pipe(Effect.forkIn(state.scope, { startImmediately: true }))
+          return result.info
+        }
+        yield* finalize(id, result.finalize, restore)
         return result.info
       }),
     ),
   )
 
-  return Service.of({ list, get, start, extend, wait, cancel })
+  return Service.of({ list, get, start, extend, hold, wait, cancel })
 })
 
 const layer = Layer.effect(Service, make)

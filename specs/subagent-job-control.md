@@ -17,7 +17,7 @@ Make running nested subagents visible and cancellable from every owning Task anc
 ## Constraints
 
 - Preserve process-local BackgroundJob execution and durable Session ownership boundaries.
-- Validate ancestry through `taskParentID`, `parentID`, and matching Session location.
+- Validate ancestry through `parentID`, `taskParentID`, and a matching `projectID`. Location is not compared, because moving a Session does not move its Task children. Notification targets and `task_id` resume still require the same location, because their turns run in the caller's Instance.
 - Do not expose or cancel jobs from sibling or unrelated Sessions.
 - Keep the persisted `SubtaskPart.background` field for existing Session data.
 - Keep the `backgroundSubagents` capability because clients still support asynchronous subagents.

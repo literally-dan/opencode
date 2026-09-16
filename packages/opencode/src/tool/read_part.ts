@@ -1,6 +1,7 @@
 import * as Tool from "./tool"
 import DESCRIPTION from "./read_part.txt"
 import { Session } from "@/session/session"
+import { SessionTaskState } from "@/session/task-state"
 import { SessionID, PartID } from "../session/schema"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { compactionOf, isCanonicalPartID } from "@/session/compaction-pruning"
@@ -27,10 +28,11 @@ type Metadata = {
   inline?: boolean
 }
 
-export const ReadPartTool = Tool.define<typeof Parameters, Metadata, Session.Service>(
+export const ReadPartTool = Tool.define<typeof Parameters, Metadata, Session.Service | SessionTaskState.Service>(
   id,
   Effect.gen(function* () {
     const sessions = yield* Session.Service
+    const taskState = yield* SessionTaskState.Service
 
     return {
       description: DESCRIPTION,
@@ -45,11 +47,11 @@ export const ReadPartTool = Tool.define<typeof Parameters, Metadata, Session.Ser
             }
           }
           const sessionID = params.session_id ? SessionID.make(params.session_id) : ctx.sessionID
-          if (params.session_id && !(yield* isReadableSession(sessions, sessionID, ctx.sessionID))) {
+          if (params.session_id && !(yield* isReadableSession(taskState, sessionID, ctx.sessionID))) {
             return {
               title: `Session not accessible: ${sessionID}`,
               metadata: { sessionID, partID: params.part_id, found: false },
-              output: `Session ${sessionID} is not the current session or one of its ancestors; cross-session reads are not allowed.`,
+              output: `Session ${sessionID} is not accessible from this session; cross-session reads require explicit ancestor history access.`,
             }
           }
           if (!isCanonicalPartID(params.part_id)) {

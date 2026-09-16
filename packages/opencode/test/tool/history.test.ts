@@ -8,6 +8,7 @@ import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { Agent } from "@/agent/agent"
 import { Config } from "@/config/config"
 import { Session } from "@/session/session"
+import { SessionTaskState } from "@/session/task-state"
 import { MessageV2 } from "@/session/message-v2"
 import { Truncate } from "@/tool/truncate"
 import { ToolRegistry } from "@/tool/registry"
@@ -62,6 +63,7 @@ const it = testEffect(
       Config.node,
       CrossSpawnSpawner.node,
       Session.node,
+      SessionTaskState.node,
       Truncate.node,
       ToolRegistry.node,
       MessageV2.node,
@@ -447,7 +449,7 @@ describe("tool.read_part", () => {
       // `unrelated` is not chat1 nor an ancestor of it → must be refused
       const result = yield* def.execute({ part_id: bashPart.id, session_id: chat1.id }, ctxFor(unrelated.id, otherMsg))
       expect(result.metadata).toMatchObject({ found: false })
-      expect(result.output).toContain("not the current session or one of its ancestors")
+      expect(result.output).toContain("require explicit ancestor history access")
     }),
   )
 
@@ -657,7 +659,7 @@ describe("tool.search_session_history", () => {
         ctxFor(unrelated.id, otherMsg),
       )
       expect(result.metadata).toMatchObject({ matched: 0 })
-      expect(result.output).toContain("not the current session or one of its ancestors")
+      expect(result.output).toContain("require explicit ancestor history access")
     }),
   )
 })
@@ -666,39 +668,28 @@ describe("tool.history-scope", () => {
   const sessionID = (index: number) =>
     SessionID.make(`ses_${index.toString(16).padStart(12, "0")}${index.toString().padStart(14, "0")}`)
 
-  it.effect("bounds ancestry depth and permits the last reachable ancestor", () =>
+  it.effect("delegates canonical ids to the task visibility policy", () =>
     Effect.gen(function* () {
-      const chain = Array.from({ length: 66 }, (_, index) => sessionID(index))
-      const parents = new Map(chain.slice(0, -1).map((id, index) => [id, chain[index + 1]]))
-      const sessions = {
-        get: (id: SessionID) => Effect.succeed({ parentID: parents.get(id) } as Session.Info),
+      const current = sessionID(0)
+      const requested = sessionID(1)
+      const taskState = {
+        canReadHistory: (input: { sessionID: SessionID; ancestorID: SessionID }) =>
+          Effect.succeed(input.sessionID === current && input.ancestorID === requested),
       }
 
-      expect(yield* isReadableSession(sessions, chain[64], chain[0])).toBe(true)
-      expect(yield* isReadableSession(sessions, chain[65], chain[0])).toBe(false)
+      expect(yield* isReadableSession(taskState, requested, current)).toBe(true)
     }),
   )
 
-  it.effect("stops ancestry cycles and rejects malformed ids before lookup", () =>
+  it.effect("rejects malformed ids before visibility lookup", () =>
     Effect.gen(function* () {
       const current = sessionID(100)
-      const first = sessionID(101)
-      const second = sessionID(102)
-      const requested = sessionID(103)
-      const parents = new Map([
-        [current, first],
-        [first, second],
-        [second, first],
-      ])
       let calls = 0
-      const sessions = {
-        get: (id: SessionID) => Effect.sync(() => (calls++, { parentID: parents.get(id) }) as Session.Info),
+      const taskState = {
+        canReadHistory: () => Effect.sync(() => (calls++, false)),
       }
 
-      expect(yield* isReadableSession(sessions, requested, current)).toBe(false)
-      expect(calls).toBe(3)
-      calls = 0
-      expect(yield* isReadableSession(sessions, SessionID.make("ses_bad"), current)).toBe(false)
+      expect(yield* isReadableSession(taskState, SessionID.make("ses_bad"), current)).toBe(false)
       expect(calls).toBe(0)
     }),
   )

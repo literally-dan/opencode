@@ -15,8 +15,14 @@ import type { SessionPrompt } from "../../src/session/prompt"
 import { MessageID, PartID, SessionID } from "../../src/session/schema"
 import { SessionRunState } from "@/session/run-state"
 import { SessionStatus } from "@/session/status"
+import { SessionActivity } from "@/session/activity"
+import { SessionTaskState } from "@/session/task-state"
+import { Permission } from "@/permission"
+import { Provider } from "@/provider/provider"
+import { Question } from "@/question"
 
 import { TaskTool, type TaskPromptOps } from "../../src/tool/task"
+import { TaskControlTool } from "@/tool/task_control"
 import { Truncate } from "@/tool/truncate"
 import { ToolRegistry } from "@/tool/registry"
 import { RuntimeFlags } from "@/effect/runtime-flags"
@@ -46,7 +52,12 @@ const layer = (flags: Partial<RuntimeFlags.Info> = {}) =>
       Session.node,
       SessionProjector.node,
       SessionRunState.node,
+      SessionActivity.node,
       SessionStatus.node,
+      SessionTaskState.node,
+      Permission.node,
+      Provider.node,
+      Question.node,
       Truncate.node,
       ToolRegistry.node,
       Database.node,
@@ -116,11 +127,11 @@ function stubOps(opts?: {
         opts?.onPrompt?.(input)
         return reply(input, opts?.text ?? "done", opts?.error, opts?.toolError)
       }),
-    admitNotification: (input) =>
-      Effect.sync(() => {
-        opts?.onNotify?.(input)
-        return Option.some(Effect.succeed(undefined))
-      }),
+    admitNotification: (input, _checkpoint, _source, onAdmitted) =>
+      Effect.sync(() => opts?.onNotify?.(input)).pipe(
+        Effect.andThen(onAdmitted ?? Effect.void),
+        Effect.as(Option.some(Effect.succeed(undefined))),
+      ),
     notify: (input) => Effect.sync(() => opts?.onNotify?.(input)),
   }
 }
@@ -387,41 +398,83 @@ describe("tool.task", () => {
     }),
   )
 
-  it.instance("execute uses an explicit model override", () =>
+  it.instance(
+    "execute uses an explicit model override",
+    () =>
+      Effect.gen(function* () {
+        const { chat, assistant } = yield* seed()
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+        let seen: SessionPrompt.PromptInput | undefined
+
+        const result = yield* def.execute(
+          {
+            description: "inspect bug",
+            prompt: "look into the cache key path",
+            subagent_type: "general",
+            model: "other/nested/model",
+          },
+          {
+            sessionID: chat.id,
+            messageID: assistant.id,
+            agent: "build",
+            abort: new AbortController().signal,
+            extra: { promptOps: stubOps({ onPrompt: (input) => (seen = input) }) },
+            messages: [],
+            metadata: () => Effect.void,
+            ask: () => Effect.void,
+          },
+        )
+
+        expect(result.metadata.model).toEqual({
+          providerID: ProviderV2.ID.make("other"),
+          modelID: ModelV2.ID.make("nested/model"),
+        })
+        expect(seen?.model).toEqual({
+          providerID: ProviderV2.ID.make("other"),
+          modelID: ModelV2.ID.make("nested/model"),
+        })
+        expect(seen?.variant).toBeUndefined()
+      }),
+    { config: { provider: { other: { models: { "nested/model": { name: "Nested model" } } } } } },
+  )
+
+  it.instance("execute rejects an unknown model before creating or resuming a child", () =>
     Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const sessions = yield* Session.Service
       const { chat, assistant } = yield* seed()
+      const existing = yield* sessions.create({ parentID: chat.id, title: "Existing child", agent: "general" })
       const tool = yield* TaskTool
       const def = yield* tool.init()
-      let seen: SessionPrompt.PromptInput | undefined
+      let prompts = 0
+      const context = {
+        sessionID: chat.id,
+        messageID: assistant.id,
+        agent: "build",
+        abort: new AbortController().signal,
+        extra: { promptOps: stubOps({ onPrompt: () => prompts++ }) },
+        messages: [],
+        metadata: () => Effect.void,
+        ask: () => Effect.void,
+      }
+      const params = {
+        description: "inspect bug",
+        prompt: "look into the cache key path",
+        subagent_type: "general",
+        model: "missing/model",
+      }
 
-      const result = yield* def.execute(
-        {
-          description: "inspect bug",
-          prompt: "look into the cache key path",
-          subagent_type: "general",
-          model: "other/nested/model",
-        },
-        {
-          sessionID: chat.id,
-          messageID: assistant.id,
-          agent: "build",
-          abort: new AbortController().signal,
-          extra: { promptOps: stubOps({ onPrompt: (input) => (seen = input) }) },
-          messages: [],
-          metadata: () => Effect.void,
-          ask: () => Effect.void,
-        },
+      expect(failureMessage(yield* def.execute(params, context).pipe(Effect.exit))).toStartWith(
+        "Model not found: missing/model.",
       )
-
-      expect(result.metadata.model).toEqual({
-        providerID: ProviderV2.ID.make("other"),
-        modelID: ModelV2.ID.make("nested/model"),
-      })
-      expect(seen?.model).toEqual({
-        providerID: ProviderV2.ID.make("other"),
-        modelID: ModelV2.ID.make("nested/model"),
-      })
-      expect(seen?.variant).toBeUndefined()
+      expect(
+        failureMessage(yield* def.execute({ ...params, task_id: existing.id }, context).pipe(Effect.exit)),
+      ).toStartWith("Model not found: missing/model.")
+      expect(yield* sessions.children(chat.id)).toEqual([existing])
+      expect((yield* sessions.get(existing.id)).taskParentID).toBeUndefined()
+      expect(yield* jobs.list()).toEqual([])
+      expect(prompts).toBe(0)
     }),
   )
 
@@ -466,6 +519,7 @@ describe("tool.task", () => {
             model: "configured/model",
           },
         },
+        provider: { override: { models: { model: { name: "Override model" } } } },
       },
     },
   )
@@ -1134,9 +1188,292 @@ describe("tool.task", () => {
     }),
   )
 
+  background.instance("caps legacy task descendants to compatibility history access", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const tasks = yield* SessionTaskState.Service
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const legacy = yield* sessions.createTask({
+        parentID: chat.id,
+        title: "Legacy task",
+        agent: "general",
+        model: { providerID: ref.providerID, id: ref.modelID },
+      })
+      const legacyAssistant = yield* sessions.updateMessage({
+        ...assistant,
+        id: MessageID.ascending(),
+        parentID: MessageID.ascending(),
+        sessionID: legacy.id,
+        mode: "general",
+        agent: "general",
+      })
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const promptOps: TaskPromptOps = { ...stubOps(), prompt: () => Effect.never }
+
+      const result = yield* def.execute(
+        {
+          description: "legacy nested investigation",
+          prompt: "do not amplify ancestor access",
+          subagent_type: "general",
+          ancestor_access: "all",
+        },
+        {
+          sessionID: legacy.id,
+          messageID: legacyAssistant.id,
+          agent: "general",
+          abort: new AbortController().signal,
+          extra: { promptOps, bypassAgentCheck: true },
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        },
+      )
+
+      expect(yield* tasks.get(legacy.id)).toBeUndefined()
+      expect((yield* tasks.get(result.metadata.sessionId))?.ancestor_access).toBe("history")
+      yield* jobs.cancel(result.metadata.sessionId)
+    }),
+  )
+
+  background.instance("blind tasks omit ancestor context and preserve access on resume", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const tasks = yield* SessionTaskState.Service
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const prompted = yield* Deferred.make<SessionPrompt.PromptInput>()
+      const promptOps: TaskPromptOps = {
+        ...stubOps(),
+        prompt: (input) => Deferred.succeed(prompted, input).pipe(Effect.andThen(Effect.never)),
+      }
+      const context = {
+        sessionID: chat.id,
+        messageID: assistant.id,
+        agent: "build",
+        abort: new AbortController().signal,
+        extra: { promptOps },
+        messages: [],
+        metadata: () => Effect.void,
+        ask: () => Effect.void,
+      }
+
+      const started = yield* def.execute(
+        {
+          description: "blind investigation",
+          prompt: "inspect only the supplied context",
+          subagent_type: "general",
+          ancestor_access: "none",
+        },
+        context,
+      )
+      expect((yield* Deferred.await(prompted)).parts).toEqual([
+        { type: "text", text: "inspect only the supplied context" },
+      ])
+      expect((yield* tasks.get(started.metadata.sessionId))?.ancestor_access).toBe("none")
+
+      yield* def.execute(
+        {
+          description: "continue blind investigation",
+          prompt: "also inspect the fallback path",
+          subagent_type: "general",
+          task_id: started.metadata.sessionId,
+        },
+        context,
+      )
+      expect((yield* tasks.get(started.metadata.sessionId))?.ancestor_access).toBe("none")
+
+      const nestedAssistant = yield* sessions.updateMessage({
+        ...assistant,
+        id: MessageID.ascending(),
+        parentID: MessageID.ascending(),
+        sessionID: started.metadata.sessionId,
+      })
+      const nested = yield* def.execute(
+        {
+          description: "nested blind investigation",
+          prompt: "inspect without amplified access",
+          subagent_type: "general",
+          ancestor_access: "all",
+        },
+        {
+          ...context,
+          sessionID: started.metadata.sessionId,
+          messageID: nestedAssistant.id,
+          agent: "general",
+          extra: { promptOps, bypassAgentCheck: true },
+        },
+      )
+      expect((yield* tasks.get(nested.metadata.sessionId))?.ancestor_access).toBe("none")
+      yield* Effect.all([jobs.cancel(nested.metadata.sessionId), jobs.cancel(started.metadata.sessionId)], {
+        concurrency: "unbounded",
+        discard: true,
+      })
+    }),
+  )
+
+  background.instance("resume waits for prior result delivery before starting a new generation", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const tasks = yield* SessionTaskState.Service
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const deliveryStarted = yield* Deferred.make<void>()
+      const releaseDelivery = yield* Deferred.make<void>()
+      const secondStarted = yield* Deferred.make<void>()
+      const promptOps: TaskPromptOps = {
+        ...stubOps(),
+        prompt: (input) => {
+          const text = input.parts.find((part) => part.type === "text")
+          if (text?.type === "text" && text.text.startsWith("first")) return Effect.succeed(reply(input, "first done"))
+          return Deferred.succeed(secondStarted, undefined).pipe(Effect.andThen(Effect.never))
+        },
+        admitNotification: () =>
+          Deferred.succeed(deliveryStarted, undefined).pipe(
+            Effect.andThen(Deferred.await(releaseDelivery)),
+            Effect.as(Option.some(Effect.succeed(undefined))),
+          ),
+      }
+      const context = {
+        sessionID: chat.id,
+        messageID: assistant.id,
+        agent: "build",
+        abort: new AbortController().signal,
+        extra: { promptOps },
+        messages: [],
+        metadata: () => Effect.void,
+        ask: () => Effect.void,
+      }
+
+      const started = yield* def.execute(
+        { description: "first generation", prompt: "first run", subagent_type: "general" },
+        context,
+      )
+      yield* Deferred.await(deliveryStarted)
+      const resumed = yield* def
+        .execute(
+          {
+            description: "second generation",
+            prompt: "second run",
+            subagent_type: "general",
+            task_id: started.metadata.sessionId,
+          },
+          context,
+        )
+        .pipe(Effect.forkChild)
+      yield* Effect.yieldNow
+      expect(resumed.pollUnsafe()).toBeUndefined()
+
+      yield* Deferred.succeed(releaseDelivery, undefined)
+      expect((yield* Fiber.join(resumed)).metadata.sessionId).toBe(started.metadata.sessionId)
+      yield* Deferred.await(secondStarted)
+      expect(yield* tasks.get(started.metadata.sessionId)).toMatchObject({
+        generation: 2,
+        status: "running",
+        delivery_session_id: null,
+      })
+      yield* jobs.cancel(started.metadata.sessionId)
+    }),
+  )
+
+  background.instance(
+    "resume can be interrupted while its child result waits for another ancestor turn",
+    () =>
+      Effect.gen(function* () {
+        const jobs = yield* BackgroundJob.Service
+        const sessions = yield* Session.Service
+        const tasks = yield* SessionTaskState.Service
+        const { chat, assistant } = yield* seed()
+        const outer = yield* sessions.createTask({ parentID: chat.id, title: "Outer task", agent: "general" })
+        const releaseOuter = yield* Deferred.make<void>()
+        yield* jobs.start({
+          id: outer.id,
+          type: "task",
+          metadata: { parentSessionId: chat.id, sessionId: outer.id },
+          run: Deferred.await(releaseOuter).pipe(Effect.as("outer done")),
+        })
+        const middle = yield* sessions.createTask({ parentID: outer.id, title: "Middle task", agent: "general" })
+        const middleAssistant = yield* sessions.updateMessage({
+          ...assistant,
+          id: MessageID.ascending(),
+          parentID: MessageID.ascending(),
+          sessionID: middle.id,
+          mode: "general",
+          agent: "general",
+        })
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+        const notifications: SessionPrompt.PromptInput[] = []
+        const promptOps: TaskPromptOps = {
+          ...stubOps({ text: "nested done" }),
+          admitNotification: (input, _checkpoint, _source, onAdmitted) =>
+            Effect.sync(() => notifications.push(input)).pipe(
+              Effect.andThen(onAdmitted ?? Effect.void),
+              Effect.as(Option.some(Effect.succeed(undefined))),
+            ),
+        }
+        const context = {
+          sessionID: middle.id,
+          messageID: middleAssistant.id,
+          agent: "general",
+          abort: new AbortController().signal,
+          extra: { promptOps },
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        }
+
+        const nested = yield* def.execute(
+          { description: "nested investigation", prompt: "inspect the nested path", subagent_type: "general" },
+          context,
+        )
+        yield* pollWithTimeout(
+          Effect.gen(function* () {
+            const lifecycle = yield* tasks.get(nested.metadata.sessionId)
+            const job = yield* jobs.get(nested.metadata.sessionId)
+            if (lifecycle?.status === "completed" && job?.status === "running") return true
+          }),
+          "nested task never started finalizing",
+        )
+        const resumed = yield* def
+          .execute(
+            {
+              description: "continue nested investigation",
+              prompt: "continue the nested path",
+              subagent_type: "general",
+              task_id: nested.metadata.sessionId,
+            },
+            context,
+          )
+          .pipe(Effect.forkChild)
+        yield* Effect.sleep("20 millis")
+        expect(resumed.pollUnsafe()).toBeUndefined()
+
+        const interrupted = yield* Fiber.interrupt(resumed).pipe(
+          Effect.timeout("2 seconds"),
+          Effect.ensuring(Deferred.succeed(releaseOuter, undefined)),
+        )
+        expect(interrupted).toBeUndefined()
+        expect(Exit.hasInterrupts(yield* Fiber.await(resumed))).toBe(true)
+        expect((yield* jobs.wait({ id: nested.metadata.sessionId, timeout: 2_000 })).info?.status).toBe("completed")
+        expect(yield* tasks.get(nested.metadata.sessionId)).toMatchObject({
+          generation: 1,
+          status: "completed",
+          delivery_session_id: outer.id,
+        })
+        expect(notifications[0]?.sessionID).toBe(outer.id)
+      }),
+    { config: { subagent_depth: 3 } },
+  )
+
   background.instance("background tasks complete through the background job service", () =>
     Effect.gen(function* () {
       const jobs = yield* BackgroundJob.Service
+      const tasks = yield* SessionTaskState.Service
       const { chat, assistant } = yield* seed()
       const tool = yield* TaskTool
       const def = yield* tool.init()
@@ -1163,6 +1500,120 @@ describe("tool.task", () => {
       expect(waited.timedOut).toBe(false)
       expect(waited.info?.status).toBe("completed")
       expect(waited.info?.output).toBe("background done")
+      expect(yield* tasks.get(result.metadata.sessionId)).toMatchObject({
+        status: "completed",
+        delivery_session_id: chat.id,
+        time_completed: expect.any(Number),
+        time_delivered: expect.any(Number),
+      })
+    }),
+  )
+
+  background.instance("a rejected resume keeps the previous task state", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const tasks = yield* SessionTaskState.Service
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const context = {
+        sessionID: chat.id,
+        messageID: assistant.id,
+        agent: "build",
+        abort: new AbortController().signal,
+        extra: { promptOps: stubOps({ text: "first done" }) },
+        messages: [],
+        metadata: () => Effect.void,
+        ask: () => Effect.void,
+      }
+
+      const started = yield* def.execute(
+        { description: "first generation", prompt: "first run", subagent_type: "general" },
+        context,
+      )
+      expect((yield* jobs.wait({ id: started.metadata.sessionId, timeout: 1_000 })).info?.status).toBe("completed")
+      const previous = yield* tasks.get(started.metadata.sessionId)
+      expect(previous).toMatchObject({ generation: 1, status: "completed", delivery_session_id: chat.id })
+
+      const exit = yield* def
+        .execute(
+          {
+            description: "second generation",
+            prompt: "second run",
+            subagent_type: "general",
+            task_id: started.metadata.sessionId,
+          },
+          {
+            ...context,
+            extra: {
+              promptOps: { ...stubOps(), admitChild: () => Effect.succeed(Option.none()) } satisfies TaskPromptOps,
+            },
+          },
+        )
+        .pipe(Effect.exit)
+
+      expect(Exit.hasInterrupts(exit)).toBe(true)
+      expect(yield* tasks.get(started.metadata.sessionId)).toEqual(previous)
+    }),
+  )
+
+  background.instance("cancelling a task job while it forwards a result also stops the forwarded turn", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const outer = yield* sessions.createTask({ parentID: chat.id, title: "Outer task", agent: "general" })
+      const releaseOuter = yield* Deferred.make<void>()
+      yield* jobs.start({
+        id: outer.id,
+        type: "task",
+        metadata: { parentSessionId: chat.id, sessionId: outer.id },
+        run: Deferred.await(releaseOuter).pipe(Effect.as("outer done")),
+      })
+      const nestedAssistant = yield* sessions.updateMessage({
+        ...assistant,
+        id: MessageID.ascending(),
+        parentID: MessageID.ascending(),
+        sessionID: outer.id,
+        mode: "general",
+        agent: "general",
+      })
+      const continuationStarted = yield* Deferred.make<void>()
+      const cancelled: SessionID[] = []
+      const promptOps: TaskPromptOps = {
+        ...stubOps({ text: "nested done" }),
+        cancel: (sessionID) => Effect.sync(() => cancelled.push(sessionID)),
+        // The continuation stands for runNotification waiting for the outer Session runner.
+        admitNotification: () =>
+          Effect.succeed(
+            Option.some(Deferred.succeed(continuationStarted, undefined).pipe(Effect.andThen(Effect.never))),
+          ),
+      }
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+
+      yield* def.execute(
+        { description: "nested investigation", prompt: "inspect the nested path", subagent_type: "general" },
+        {
+          sessionID: outer.id,
+          messageID: nestedAssistant.id,
+          agent: "general",
+          abort: new AbortController().signal,
+          extra: { promptOps },
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        },
+      )
+      yield* Deferred.succeed(releaseOuter, undefined)
+      yield* Deferred.await(continuationStarted).pipe(Effect.timeout("2 seconds"))
+      expect(cancelled).toEqual([])
+
+      expect((yield* jobs.cancel(outer.id))?.status).toBe("cancelled")
+      yield* pollWithTimeout(
+        Effect.sync(() => (cancelled.includes(outer.id) ? true : undefined)),
+        "cancelling the outer job did not stop its forwarded turn",
+      )
     }),
   )
 
@@ -1200,7 +1651,8 @@ describe("tool.task", () => {
             if (input.sessionID === outerSessionID) {
               yield* Deferred.succeed(ancestorAdmission, undefined)
               yield* Deferred.await(releaseAdmission)
-              return Option.some(Effect.succeed(undefined))
+              // The outer turn answers the nested result without text.
+              return Option.some(Effect.succeed(reply(input, "")))
             }
             yield* Deferred.succeed(rootAdmission, undefined)
             return Option.some(Effect.succeed(undefined))
@@ -1270,16 +1722,134 @@ describe("tool.task", () => {
 
       yield* Deferred.succeed(releaseAdmission, undefined)
       expect((yield* jobs.wait({ id: nested.metadata.sessionId })).info?.output).toBe("nested done")
+      // The continuation reply has no text, so the outer job keeps its own reply.
       const outerJob = yield* jobs.wait({ id: outerSessionID })
-      expect(outerJob.info?.output).toBe("nested done")
+      expect(outerJob.info?.output).toBe("outer done")
       yield* Deferred.await(rootAdmission)
 
       expect(notifications).toHaveLength(2)
       expect(notifications[1]?.input.sessionID).toBe(chat.id)
       expect(notifications[1]?.checkpoint).toBe(11)
       expect(notifications[1]?.input.parts[0]?.type).toBe("text")
-      if (notifications[1]?.input.parts[0]?.type === "text")
-        expect(notifications[1].input.parts[0].text).toContain("nested done")
+      if (notifications[1]?.input.parts[0]?.type === "text") {
+        expect(notifications[1].input.parts[0].text).toContain("outer done")
+        expect(notifications[1].input.parts[0].text).not.toContain("nested done")
+      }
+    }),
+  )
+
+  background.instance("an intermediate task fails when its continuation turn fails", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const outer = yield* sessions.createTask({ parentID: chat.id, title: "Outer task", agent: "general" })
+      const releaseOuter = yield* Deferred.make<void>()
+      yield* jobs.start({
+        id: outer.id,
+        type: "task",
+        metadata: { parentSessionId: chat.id, sessionId: outer.id },
+        run: Deferred.await(releaseOuter).pipe(Effect.as("outer interim reply")),
+      })
+      const nestedAssistant = yield* sessions.updateMessage({
+        ...assistant,
+        id: MessageID.ascending(),
+        parentID: MessageID.ascending(),
+        sessionID: outer.id,
+        mode: "general",
+        agent: "general",
+      })
+      const promptOps: TaskPromptOps = {
+        ...stubOps({ text: "nested done" }),
+        admitNotification: (input) =>
+          Effect.succeed(
+            Option.some(
+              Effect.succeed(
+                reply(
+                  input,
+                  "partial coordinator text",
+                  new SessionV1.APIError({ message: "Coordinator provider failed", isRetryable: false }).toObject(),
+                ),
+              ),
+            ),
+          ),
+      }
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+
+      yield* def.execute(
+        { description: "nested investigation", prompt: "inspect the nested path", subagent_type: "general" },
+        {
+          sessionID: outer.id,
+          messageID: nestedAssistant.id,
+          agent: "general",
+          abort: new AbortController().signal,
+          extra: { promptOps },
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        },
+      )
+      yield* Deferred.succeed(releaseOuter, undefined)
+
+      const failure = (yield* jobs.wait({ id: outer.id, timeout: 2_000 })).info
+      expect(failure?.status).toBe("error")
+      expect(failure?.error).toContain(`Subagent failed (task_id: ${outer.id}):`)
+      expect(failure?.error).toContain("The subagent stopped with APIError: Coordinator provider failed")
+      expect(failure?.error).toContain("partial coordinator text")
+    }),
+  )
+
+  background.instance("an intermediate task keeps its reply and labels a nested result it could not receive", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const outer = yield* sessions.createTask({ parentID: chat.id, title: "Outer task", agent: "general" })
+      const releaseOuter = yield* Deferred.make<void>()
+      yield* jobs.start({
+        id: outer.id,
+        type: "task",
+        metadata: { parentSessionId: chat.id, sessionId: outer.id },
+        run: Deferred.await(releaseOuter).pipe(Effect.as("outer interim reply")),
+      })
+      const nestedAssistant = yield* sessions.updateMessage({
+        ...assistant,
+        id: MessageID.ascending(),
+        parentID: MessageID.ascending(),
+        sessionID: outer.id,
+        mode: "general",
+        agent: "general",
+      })
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+
+      const nested = yield* def.execute(
+        { description: "nested investigation", prompt: "inspect the nested path", subagent_type: "general" },
+        {
+          sessionID: outer.id,
+          messageID: nestedAssistant.id,
+          agent: "general",
+          abort: new AbortController().signal,
+          // The outer Session cannot take notifications, for example because a revert is staged.
+          extra: {
+            promptOps: {
+              ...stubOps({ text: "nested raw output" }),
+              admitNotification: () => Effect.succeed(Option.none()),
+            },
+          },
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        },
+      )
+      yield* Deferred.succeed(releaseOuter, undefined)
+
+      expect((yield* jobs.wait({ id: nested.metadata.sessionId, timeout: 2_000 })).info?.status).toBe("completed")
+      const output = (yield* jobs.wait({ id: outer.id, timeout: 2_000 })).info?.output ?? ""
+      expect(output.startsWith("outer interim reply")).toBe(true)
+      expect(output).toContain(`<task id="${nested.metadata.sessionId}" state="completed">`)
+      expect(output).toContain("nested raw output")
     }),
   )
 
@@ -1357,6 +1927,737 @@ describe("tool.task", () => {
     }),
   )
 
+  background.instance("a coordinator task receives its worker result after its own turn ends", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const sessions = yield* Session.Service
+      const tasks = yield* SessionTaskState.Service
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const coordinatorStarted = yield* Deferred.make<void>()
+      const workerLaunched = yield* Deferred.make<void>()
+      const coordinatorTurnEnded = yield* Deferred.make<void>()
+      const releaseWorker = yield* Deferred.make<void>()
+      const notifications: SessionPrompt.PromptInput[] = []
+      let coordinatorID: SessionID | undefined
+      let continuations = 0
+      const promptOps: TaskPromptOps = {
+        ...stubOps(),
+        checkpoint: (sessionID) => Effect.succeed(sessionID === chat.id ? 11 : 7),
+        prompt: (input) =>
+          Effect.gen(function* () {
+            const text = input.parts.find((part) => part.type === "text")
+            if (text?.type === "text" && text.text === "inspect the worker path") {
+              yield* Deferred.await(releaseWorker)
+              return reply(input, "worker raw output")
+            }
+            yield* Deferred.succeed(coordinatorStarted, undefined)
+            yield* Deferred.await(workerLaunched)
+            yield* Deferred.succeed(coordinatorTurnEnded, undefined)
+            return reply(input, "coordinator is waiting for the worker")
+          }),
+        admitNotification: (input, _checkpoint, _source, onAdmitted) =>
+          Effect.gen(function* () {
+            notifications.push(input)
+            if (onAdmitted) yield* onAdmitted
+            if (input.sessionID !== coordinatorID) return Option.some(Effect.succeed(undefined))
+            return Option.some(
+              Effect.sync(() => {
+                continuations++
+                return reply(input, "coordinator final reply")
+              }),
+            )
+          }),
+      }
+      const rootContext = {
+        sessionID: chat.id,
+        messageID: assistant.id,
+        agent: "build",
+        abort: new AbortController().signal,
+        extra: { promptOps },
+        messages: [],
+        metadata: () => Effect.void,
+        ask: () => Effect.void,
+      }
+
+      const coordinator = yield* def.execute(
+        { description: "coordinate target", prompt: "coordinate the target", subagent_type: "general" },
+        rootContext,
+      )
+      coordinatorID = coordinator.metadata.sessionId
+      yield* Deferred.await(coordinatorStarted)
+      const coordinatorAssistant = yield* sessions.updateMessage({
+        ...assistant,
+        id: MessageID.ascending(),
+        parentID: MessageID.ascending(),
+        sessionID: coordinator.metadata.sessionId,
+        mode: "general",
+        agent: "general",
+      })
+      const worker = yield* def.execute(
+        { description: "implement target", prompt: "inspect the worker path", subagent_type: "general" },
+        {
+          ...rootContext,
+          sessionID: coordinator.metadata.sessionId,
+          messageID: coordinatorAssistant.id,
+          agent: "general",
+        },
+      )
+      expect((yield* sessions.get(worker.metadata.sessionId)).taskParentID).toBe(coordinator.metadata.sessionId)
+      yield* Deferred.succeed(workerLaunched, undefined)
+      yield* Deferred.await(coordinatorTurnEnded)
+      yield* Effect.sleep("50 millis")
+      // The root must not receive a final-looking completion while the coordinator still waits for its worker.
+      expect(notifications.filter((input) => input.sessionID === chat.id)).toEqual([])
+
+      yield* Deferred.succeed(releaseWorker, undefined)
+      expect((yield* jobs.wait({ id: worker.metadata.sessionId, timeout: 2_000 })).info?.status).toBe("completed")
+      const delivered = yield* pollWithTimeout(
+        Effect.sync(() => notifications.find((input) => input.sessionID === chat.id)),
+        "the coordinator final reply never reached the root session",
+      )
+
+      const texts = (input: SessionPrompt.PromptInput) =>
+        input.parts.flatMap((part) => (part.type === "text" ? [part.text] : [])).join("\n")
+      expect(notifications[0]?.sessionID).toBe(coordinator.metadata.sessionId)
+      expect(texts(notifications[0]!)).toContain("worker raw output")
+      expect(continuations).toBe(1)
+      expect(texts(delivered)).toContain("coordinator final reply")
+      expect(texts(delivered)).not.toContain("worker raw output")
+      expect((yield* jobs.wait({ id: coordinator.metadata.sessionId, timeout: 2_000 })).info?.status).toBe("completed")
+      expect(yield* tasks.get(worker.metadata.sessionId)).toMatchObject({
+        status: "completed",
+        delivery_session_id: coordinator.metadata.sessionId,
+      })
+      expect(yield* tasks.get(coordinator.metadata.sessionId)).toMatchObject({
+        status: "completed",
+        delivery_session_id: chat.id,
+      })
+      yield* Effect.sleep("50 millis")
+      expect(notifications.filter((input) => input.sessionID === chat.id)).toHaveLength(1)
+    }),
+  )
+
+  background.instance("an intermediate task stops its running child from inside its own turn", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const sessions = yield* Session.Service
+      const tasks = yield* SessionTaskState.Service
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const controlTool = yield* TaskControlTool
+      const control = yield* controlTool.init()
+      const outerStarted = yield* Deferred.make<void>()
+      const stopRequested = yield* Deferred.make<SessionID>()
+      const stopReturned = yield* Deferred.make<string>()
+      const notifications: SessionPrompt.PromptInput[] = []
+      const promptOps: TaskPromptOps = {
+        ...stubOps(),
+        prompt: (input) =>
+          Effect.gen(function* () {
+            const text = input.parts.find((part) => part.type === "text")
+            if (text?.type === "text" && text.text === "inspect the nested path") return yield* Effect.never
+            yield* Deferred.succeed(outerStarted, undefined)
+            // The outer turn stays inside the task_control call until stop returns.
+            const taskID = yield* Deferred.await(stopRequested)
+            const result = yield* control.execute(
+              { action: "stop", task_id: taskID },
+              {
+                sessionID: input.sessionID,
+                messageID: MessageID.ascending(),
+                agent: "general",
+                abort: new AbortController().signal,
+                messages: [],
+                metadata: () => Effect.void,
+                ask: () => Effect.void,
+              },
+            )
+            yield* Deferred.succeed(stopReturned, result.output)
+            return reply(input, "outer done")
+          }),
+        admitNotification: (input, _checkpoint, _source, onAdmitted) =>
+          Effect.sync(() => notifications.push(input)).pipe(
+            Effect.andThen(onAdmitted ?? Effect.void),
+            Effect.as(Option.some(Effect.succeed(undefined))),
+          ),
+      }
+      const rootContext = {
+        sessionID: chat.id,
+        messageID: assistant.id,
+        agent: "build",
+        abort: new AbortController().signal,
+        extra: { promptOps },
+        messages: [],
+        metadata: () => Effect.void,
+        ask: () => Effect.void,
+      }
+
+      const outer = yield* def.execute(
+        { description: "outer investigation", prompt: "coordinate the investigation", subagent_type: "general" },
+        rootContext,
+      )
+      yield* Deferred.await(outerStarted)
+      const nestedAssistant = yield* sessions.updateMessage({
+        ...assistant,
+        id: MessageID.ascending(),
+        parentID: MessageID.ascending(),
+        sessionID: outer.metadata.sessionId,
+        mode: "general",
+        agent: "general",
+      })
+      const nested = yield* def.execute(
+        { description: "nested investigation", prompt: "inspect the nested path", subagent_type: "general" },
+        { ...rootContext, sessionID: outer.metadata.sessionId, messageID: nestedAssistant.id, agent: "general" },
+      )
+
+      yield* Deferred.succeed(stopRequested, nested.metadata.sessionId)
+      expect(yield* Deferred.await(stopReturned).pipe(Effect.timeout("2 seconds"))).toBe(
+        `Stopped task ${nested.metadata.sessionId}.`,
+      )
+      expect((yield* jobs.wait({ id: nested.metadata.sessionId, timeout: 2_000 })).info?.status).toBe("cancelled")
+      expect(yield* tasks.get(nested.metadata.sessionId)).toMatchObject({
+        status: "cancelled",
+        delivery_session_id: outer.metadata.sessionId,
+      })
+      expect(notifications[0]?.sessionID).toBe(outer.metadata.sessionId)
+      expect(notifications[0]?.parts[0]).toMatchObject({
+        type: "text",
+        text: expect.stringContaining("Task cancelled"),
+      })
+    }),
+  )
+
+  background.instance("stopping a held coordinator sends one cancellation notice to the root", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const controlTool = yield* TaskControlTool
+      const control = yield* controlTool.init()
+      const turnEnded = yield* Deferred.make<{ coordinator: SessionID; worker: SessionID }>()
+      const notifications: SessionPrompt.PromptInput[] = []
+      const promptOps: TaskPromptOps = {
+        ...stubOps(),
+        prompt: (input) =>
+          Effect.gen(function* () {
+            const text = input.parts.find((part) => part.type === "text")
+            if (text?.type === "text" && text.text === "inspect the worker path") return yield* Effect.never
+            const coordinatorAssistant = yield* sessions.updateMessage({
+              ...assistant,
+              id: MessageID.ascending(),
+              parentID: MessageID.ascending(),
+              sessionID: input.sessionID,
+              mode: "general",
+              agent: "general",
+            })
+            const worker = yield* def.execute(
+              { description: "implement target", prompt: "inspect the worker path", subagent_type: "general" },
+              { ...rootContext, sessionID: input.sessionID, messageID: coordinatorAssistant.id, agent: "general" },
+            )
+            yield* Deferred.succeed(turnEnded, { coordinator: input.sessionID, worker: worker.metadata.sessionId })
+            return reply(input, "coordinator is waiting for the worker")
+          }),
+        admitNotification: (input, _checkpoint, _source, onAdmitted) =>
+          Effect.sync(() => notifications.push(input)).pipe(
+            Effect.andThen(onAdmitted ?? Effect.void),
+            Effect.as(Option.some(Effect.succeed(undefined))),
+          ),
+      }
+      const rootContext = {
+        sessionID: chat.id,
+        messageID: assistant.id,
+        agent: "build",
+        abort: new AbortController().signal,
+        extra: { promptOps },
+        messages: [],
+        metadata: () => Effect.void,
+        ask: () => Effect.void,
+      }
+
+      yield* def.execute(
+        { description: "coordinate target", prompt: "coordinate the target", subagent_type: "general" },
+        rootContext,
+      )
+      const ids = yield* Deferred.await(turnEnded)
+      yield* Effect.sleep("50 millis")
+      expect((yield* jobs.get(ids.coordinator))?.status).toBe("running")
+
+      const stop = yield* control.execute({ action: "stop", task_id: ids.coordinator }, rootContext)
+      expect(stop.output).toBe(`Stopped task ${ids.coordinator} and 1 active descendant.`)
+      expect((yield* jobs.wait({ id: ids.coordinator, timeout: 2_000 })).info?.status).toBe("cancelled")
+      expect((yield* jobs.wait({ id: ids.worker, timeout: 2_000 })).info?.status).toBe("cancelled")
+      yield* Effect.sleep("100 millis")
+
+      const rootTexts = notifications
+        .filter((input) => input.sessionID === chat.id)
+        .map((input) => input.parts.flatMap((part) => (part.type === "text" ? [part.text] : [])).join("\n"))
+      expect(rootTexts).toHaveLength(1)
+      expect(rootTexts[0]).toContain("Background task failed: coordinate target")
+    }),
+  )
+
+  background.instance("a nested task stopped from its parent turn stops running before that turn ends", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const controlTool = yield* TaskControlTool
+      const control = yield* controlTool.init()
+      const outerStarted = yield* Deferred.make<void>()
+      const stopRequested = yield* Deferred.make<SessionID>()
+      const stopReturned = yield* Deferred.make<string>()
+      const releaseOuter = yield* Deferred.make<void>()
+      const nestedCancelled = yield* Deferred.make<void>()
+      const nestedStopped = yield* Deferred.make<void>()
+      const notifications: SessionPrompt.PromptInput[] = []
+      let nestedID: SessionID | undefined
+      const promptOps: TaskPromptOps = {
+        ...stubOps(),
+        // Like SessionPrompt.cancel, cancelling the nested Session ends its running prompt.
+        cancel: (sessionID) => (sessionID === nestedID ? Deferred.succeed(nestedCancelled, undefined) : Effect.void),
+        prompt: (input) =>
+          Effect.gen(function* () {
+            const text = input.parts.find((part) => part.type === "text")
+            if (text?.type === "text" && text.text === "inspect the nested path") {
+              yield* Deferred.await(nestedCancelled)
+              yield* Deferred.succeed(nestedStopped, undefined)
+              return reply(input, "partial nested output")
+            }
+            yield* Deferred.succeed(outerStarted, undefined)
+            const taskID = yield* Deferred.await(stopRequested)
+            const result = yield* control.execute(
+              { action: "stop", task_id: taskID },
+              {
+                sessionID: input.sessionID,
+                messageID: MessageID.ascending(),
+                agent: "general",
+                abort: new AbortController().signal,
+                messages: [],
+                metadata: () => Effect.void,
+                ask: () => Effect.void,
+              },
+            )
+            yield* Deferred.succeed(stopReturned, result.output)
+            // The outer turn keeps working after the stop.
+            yield* Deferred.await(releaseOuter)
+            return reply(input, "outer done")
+          }),
+        admitNotification: (input, _checkpoint, _source, onAdmitted) =>
+          Effect.sync(() => notifications.push(input)).pipe(
+            Effect.andThen(onAdmitted ?? Effect.void),
+            Effect.as(Option.some(Effect.succeed(undefined))),
+          ),
+      }
+      const rootContext = {
+        sessionID: chat.id,
+        messageID: assistant.id,
+        agent: "build",
+        abort: new AbortController().signal,
+        extra: { promptOps },
+        messages: [],
+        metadata: () => Effect.void,
+        ask: () => Effect.void,
+      }
+
+      const outer = yield* def.execute(
+        { description: "outer investigation", prompt: "coordinate the investigation", subagent_type: "general" },
+        rootContext,
+      )
+      yield* Deferred.await(outerStarted)
+      const nestedAssistant = yield* sessions.updateMessage({
+        ...assistant,
+        id: MessageID.ascending(),
+        parentID: MessageID.ascending(),
+        sessionID: outer.metadata.sessionId,
+        mode: "general",
+        agent: "general",
+      })
+      const nested = yield* def.execute(
+        { description: "nested investigation", prompt: "inspect the nested path", subagent_type: "general" },
+        { ...rootContext, sessionID: outer.metadata.sessionId, messageID: nestedAssistant.id, agent: "general" },
+      )
+      nestedID = nested.metadata.sessionId
+
+      yield* Deferred.succeed(stopRequested, nested.metadata.sessionId)
+      expect(yield* Deferred.await(stopReturned).pipe(Effect.timeout("2 seconds"))).toBe(
+        `Stopped task ${nested.metadata.sessionId}.`,
+      )
+      yield* Deferred.await(nestedStopped).pipe(Effect.timeout("2 seconds"))
+      expect(yield* Deferred.isDone(releaseOuter)).toBe(false)
+      expect(notifications).toEqual([])
+
+      yield* Deferred.succeed(releaseOuter, undefined)
+      expect((yield* jobs.wait({ id: nested.metadata.sessionId, timeout: 2_000 })).info?.status).toBe("cancelled")
+      expect(notifications[0]?.sessionID).toBe(outer.metadata.sessionId)
+      expect(notifications[0]?.parts[0]).toMatchObject({
+        type: "text",
+        text: expect.stringContaining("Task cancelled"),
+      })
+    }),
+  )
+
+  background.instance("aborting a nested task returns while its parent task turn is still running", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const sessions = yield* Session.Service
+      const runState = yield* SessionRunState.Service
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const outerStarted = yield* Deferred.make<void>()
+      const releaseOuter = yield* Deferred.make<void>()
+      const notifications: SessionPrompt.PromptInput[] = []
+      const promptOps: TaskPromptOps = {
+        ...stubOps(),
+        prompt: (input) =>
+          Effect.gen(function* () {
+            const text = input.parts.find((part) => part.type === "text")
+            if (text?.type === "text" && text.text === "inspect the nested path") return yield* Effect.never
+            yield* Deferred.succeed(outerStarted, undefined)
+            yield* Deferred.await(releaseOuter)
+            return reply(input, "outer done")
+          }),
+        admitNotification: (input, _checkpoint, _source, onAdmitted) =>
+          Effect.sync(() => notifications.push(input)).pipe(
+            Effect.andThen(onAdmitted ?? Effect.void),
+            Effect.as(Option.some(Effect.succeed(undefined))),
+          ),
+      }
+      const rootContext = {
+        sessionID: chat.id,
+        messageID: assistant.id,
+        agent: "build",
+        abort: new AbortController().signal,
+        extra: { promptOps },
+        messages: [],
+        metadata: () => Effect.void,
+        ask: () => Effect.void,
+      }
+
+      const outer = yield* def.execute(
+        { description: "outer investigation", prompt: "coordinate the investigation", subagent_type: "general" },
+        rootContext,
+      )
+      yield* Deferred.await(outerStarted)
+      const nestedAssistant = yield* sessions.updateMessage({
+        ...assistant,
+        id: MessageID.ascending(),
+        parentID: MessageID.ascending(),
+        sessionID: outer.metadata.sessionId,
+        mode: "general",
+        agent: "general",
+      })
+      const nested = yield* def.execute(
+        { description: "nested investigation", prompt: "inspect the nested path", subagent_type: "general" },
+        { ...rootContext, sessionID: outer.metadata.sessionId, messageID: nestedAssistant.id, agent: "general" },
+      )
+
+      yield* runState.cancel(nested.metadata.sessionId).pipe(Effect.timeout("2 seconds"))
+      // The cancellation notice waits for the parent task turn, but abort does not.
+      expect(notifications).toEqual([])
+      expect(yield* Deferred.isDone(releaseOuter)).toBe(false)
+
+      yield* Deferred.succeed(releaseOuter, undefined)
+      expect((yield* jobs.wait({ id: nested.metadata.sessionId, timeout: 2_000 })).info?.status).toBe("cancelled")
+      const delivered = yield* pollWithTimeout(
+        Effect.sync(() => notifications.find((input) => input.sessionID === outer.metadata.sessionId)),
+        "the cancellation notice never reached the parent task",
+      )
+      expect(delivered.parts[0]).toMatchObject({ type: "text", text: expect.stringContaining("Task cancelled") })
+    }),
+  )
+
+  background.instance("an intermediate task resuming a finalizing child fails fast", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const sessions = yield* Session.Service
+      const tasks = yield* SessionTaskState.Service
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const outerStarted = yield* Deferred.make<void>()
+      const resumeRequested = yield* Deferred.make<{ taskID: SessionID; messageID: MessageID }>()
+      const resumeReturned = yield* Deferred.make<Exit.Exit<unknown, unknown>>()
+      const notifications: SessionPrompt.PromptInput[] = []
+      const promptOps: TaskPromptOps = {
+        ...stubOps(),
+        prompt: (input) =>
+          Effect.gen(function* () {
+            const text = input.parts.find((part) => part.type === "text")
+            if (text?.type === "text" && text.text !== "coordinate the investigation")
+              return reply(input, "nested done")
+            yield* Deferred.succeed(outerStarted, undefined)
+            // The outer turn resumes its child while the child's result waits for this turn to end.
+            const request = yield* Deferred.await(resumeRequested)
+            const exit = yield* def
+              .execute(
+                {
+                  description: "continue nested investigation",
+                  prompt: "continue the nested path",
+                  subagent_type: "general",
+                  task_id: request.taskID,
+                },
+                { ...rootContext, sessionID: input.sessionID, messageID: request.messageID, agent: "general" },
+              )
+              .pipe(Effect.exit)
+            yield* Deferred.succeed(resumeReturned, exit)
+            return reply(input, "outer done")
+          }),
+        admitNotification: (input, _checkpoint, _source, onAdmitted) =>
+          Effect.sync(() => notifications.push(input)).pipe(
+            Effect.andThen(onAdmitted ?? Effect.void),
+            Effect.as(Option.some(Effect.succeed(undefined))),
+          ),
+      }
+      const rootContext = {
+        sessionID: chat.id,
+        messageID: assistant.id,
+        agent: "build",
+        abort: new AbortController().signal,
+        extra: { promptOps },
+        messages: [],
+        metadata: () => Effect.void,
+        ask: () => Effect.void,
+      }
+
+      const outer = yield* def.execute(
+        { description: "outer investigation", prompt: "coordinate the investigation", subagent_type: "general" },
+        rootContext,
+      )
+      yield* Deferred.await(outerStarted)
+      const nestedAssistant = yield* sessions.updateMessage({
+        ...assistant,
+        id: MessageID.ascending(),
+        parentID: MessageID.ascending(),
+        sessionID: outer.metadata.sessionId,
+        mode: "general",
+        agent: "general",
+      })
+      const nested = yield* def.execute(
+        { description: "nested investigation", prompt: "inspect the nested path", subagent_type: "general" },
+        { ...rootContext, sessionID: outer.metadata.sessionId, messageID: nestedAssistant.id, agent: "general" },
+      )
+      yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const lifecycle = yield* tasks.get(nested.metadata.sessionId)
+          const job = yield* jobs.get(nested.metadata.sessionId)
+          if (lifecycle?.status === "completed" && job?.status === "running") return true
+        }),
+        "nested task never started finalizing",
+      )
+
+      yield* Deferred.succeed(resumeRequested, { taskID: nested.metadata.sessionId, messageID: nestedAssistant.id })
+      const exit = yield* Deferred.await(resumeReturned).pipe(Effect.timeout("2 seconds"))
+      expect(failureMessage(exit)).toBe(
+        `Task ${nested.metadata.sessionId} finished; its result is queued for this session. End this turn, then resume it.`,
+      )
+      expect((yield* jobs.wait({ id: nested.metadata.sessionId, timeout: 2_000 })).info).toMatchObject({
+        status: "completed",
+        output: "nested done",
+      })
+      expect(yield* tasks.get(nested.metadata.sessionId)).toMatchObject({
+        generation: 1,
+        status: "completed",
+        delivery_session_id: outer.metadata.sessionId,
+      })
+      expect(notifications[0]?.sessionID).toBe(outer.metadata.sessionId)
+    }),
+  )
+
+  background.instance("an intermediate task resuming a child it just stopped reports the cancellation", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const sessions = yield* Session.Service
+      const { chat, assistant } = yield* seed()
+      const tool = yield* TaskTool
+      const def = yield* tool.init()
+      const controlTool = yield* TaskControlTool
+      const control = yield* controlTool.init()
+      const outerStarted = yield* Deferred.make<void>()
+      const resumeRequested = yield* Deferred.make<{ taskID: SessionID; messageID: MessageID }>()
+      const resumeReturned = yield* Deferred.make<Exit.Exit<unknown, unknown>>()
+      const promptOps: TaskPromptOps = {
+        ...stubOps(),
+        prompt: (input) =>
+          Effect.gen(function* () {
+            const text = input.parts.find((part) => part.type === "text")
+            if (text?.type === "text" && text.text === "inspect the nested path") return yield* Effect.never
+            yield* Deferred.succeed(outerStarted, undefined)
+            const request = yield* Deferred.await(resumeRequested)
+            const context = {
+              ...rootContext,
+              sessionID: input.sessionID,
+              messageID: request.messageID,
+              agent: "general",
+            }
+            yield* control.execute({ action: "stop", task_id: request.taskID }, context)
+            const exit = yield* def
+              .execute(
+                {
+                  description: "continue nested investigation",
+                  prompt: "continue the nested path",
+                  subagent_type: "general",
+                  task_id: request.taskID,
+                },
+                context,
+              )
+              .pipe(Effect.exit)
+            yield* Deferred.succeed(resumeReturned, exit)
+            return reply(input, "outer done")
+          }),
+      }
+      const rootContext = {
+        sessionID: chat.id,
+        messageID: assistant.id,
+        agent: "build",
+        abort: new AbortController().signal,
+        extra: { promptOps },
+        messages: [],
+        metadata: () => Effect.void,
+        ask: () => Effect.void,
+      }
+
+      const outer = yield* def.execute(
+        { description: "outer investigation", prompt: "coordinate the investigation", subagent_type: "general" },
+        rootContext,
+      )
+      yield* Deferred.await(outerStarted)
+      const nestedAssistant = yield* sessions.updateMessage({
+        ...assistant,
+        id: MessageID.ascending(),
+        parentID: MessageID.ascending(),
+        sessionID: outer.metadata.sessionId,
+        mode: "general",
+        agent: "general",
+      })
+      const nested = yield* def.execute(
+        { description: "nested investigation", prompt: "inspect the nested path", subagent_type: "general" },
+        { ...rootContext, sessionID: outer.metadata.sessionId, messageID: nestedAssistant.id, agent: "general" },
+      )
+
+      yield* Deferred.succeed(resumeRequested, { taskID: nested.metadata.sessionId, messageID: nestedAssistant.id })
+      const exit = yield* Deferred.await(resumeReturned).pipe(Effect.timeout("2 seconds"))
+      expect(failureMessage(exit)).toBe(
+        `Task ${nested.metadata.sessionId} was cancelled; its cancellation notice is queued for this session. End this turn, then resume it.`,
+      )
+      expect((yield* jobs.wait({ id: nested.metadata.sessionId, timeout: 2_000 })).info?.status).toBe("cancelled")
+    }),
+  )
+
+  background.instance(
+    "resuming a finalizing child waits when its result goes past a settling caller job",
+    () =>
+      Effect.gen(function* () {
+        const jobs = yield* BackgroundJob.Service
+        const sessions = yield* Session.Service
+        const tasks = yield* SessionTaskState.Service
+        const { chat, assistant } = yield* seed()
+        const ancestor = yield* sessions.createTask({ parentID: chat.id, title: "Ancestor task", agent: "general" })
+        const releaseAncestor = yield* Deferred.make<void>()
+        yield* jobs.start({
+          id: ancestor.id,
+          type: "task",
+          metadata: { parentSessionId: chat.id, sessionId: ancestor.id },
+          run: Deferred.await(releaseAncestor).pipe(Effect.as("ancestor done")),
+        })
+        const outer = yield* sessions.createTask({ parentID: ancestor.id, title: "Outer task", agent: "general" })
+        const outerDelivering = yield* Deferred.make<void>()
+        const releaseOuterDelivery = yield* Deferred.make<void>()
+        yield* jobs.start({
+          id: outer.id,
+          type: "task",
+          metadata: { parentSessionId: ancestor.id, sessionId: outer.id },
+          notifyOnComplete: true,
+          awaitOnComplete: true,
+          onComplete: () =>
+            Deferred.succeed(outerDelivering, undefined).pipe(Effect.andThen(Deferred.await(releaseOuterDelivery))),
+          run: Effect.succeed("outer done"),
+        })
+        yield* Deferred.await(outerDelivering)
+        const nestedAssistant = yield* sessions.updateMessage({
+          ...assistant,
+          id: MessageID.ascending(),
+          parentID: MessageID.ascending(),
+          sessionID: outer.id,
+          mode: "general",
+          agent: "general",
+        })
+        const notifications: SessionPrompt.PromptInput[] = []
+        const prompts: string[] = []
+        const promptOps: TaskPromptOps = {
+          ...stubOps(),
+          prompt: (input) =>
+            Effect.sync(() => {
+              const text = input.parts.find((part) => part.type === "text")
+              prompts.push(text?.type === "text" ? text.text : "")
+              return reply(input, "nested done")
+            }),
+          admitNotification: (input, _checkpoint, _source, onAdmitted) =>
+            Effect.sync(() => notifications.push(input)).pipe(
+              Effect.andThen(onAdmitted ?? Effect.void),
+              Effect.as(Option.some(Effect.succeed(undefined))),
+            ),
+        }
+        const context = {
+          sessionID: outer.id,
+          messageID: nestedAssistant.id,
+          agent: "general",
+          abort: new AbortController().signal,
+          extra: { promptOps },
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        }
+        const tool = yield* TaskTool
+        const def = yield* tool.init()
+
+        const nested = yield* def.execute(
+          { description: "nested investigation", prompt: "inspect the nested path", subagent_type: "general" },
+          context,
+        )
+        // The settling caller job cannot take the result, so it waits for the ancestor turn instead.
+        yield* pollWithTimeout(
+          Effect.gen(function* () {
+            const lifecycle = yield* tasks.get(nested.metadata.sessionId)
+            const job = yield* jobs.get(nested.metadata.sessionId)
+            if (lifecycle?.status === "completed" && job?.status === "running") return true
+          }),
+          "nested task never started finalizing",
+        )
+        const resumed = yield* def
+          .execute(
+            {
+              description: "continue nested investigation",
+              prompt: "continue the nested path",
+              subagent_type: "general",
+              task_id: nested.metadata.sessionId,
+            },
+            context,
+          )
+          .pipe(Effect.exit, Effect.forkChild)
+        yield* Effect.sleep("50 millis")
+        expect(resumed.pollUnsafe()).toBeUndefined()
+
+        yield* Deferred.succeed(releaseAncestor, undefined)
+        const exit = yield* Fiber.join(resumed).pipe(Effect.timeout("2 seconds"))
+        expect(Exit.isSuccess(exit)).toBe(true)
+        expect(notifications[0]?.sessionID).toBe(ancestor.id)
+        yield* pollWithTimeout(
+          Effect.sync(() => (prompts.length === 2 ? true : undefined)),
+          "the resumed task never started",
+        )
+        expect(yield* tasks.get(nested.metadata.sessionId)).toMatchObject({ generation: 2 })
+        yield* Deferred.succeed(releaseOuterDelivery, undefined)
+      }),
+    { config: { subagent_depth: 3 } },
+  )
+
   background.instance("does not route completion through an unproven same-location parent", () =>
     Effect.gen(function* () {
       const jobs = yield* BackgroundJob.Service
@@ -1390,8 +2691,16 @@ describe("tool.task", () => {
           extra: {
             promptOps: {
               ...stubOps({ text: "nested done" }),
-              admitNotification: (input: SessionPrompt.PromptInput) =>
-                Effect.sync(() => notifications.push(input)).pipe(Effect.as(Option.some(Effect.succeed(undefined)))),
+              admitNotification: (
+                input: SessionPrompt.PromptInput,
+                _checkpoint: number,
+                _source?: SessionPrompt.NotificationSource,
+                onAdmitted?: Effect.Effect<void>,
+              ) =>
+                Effect.sync(() => notifications.push(input)).pipe(
+                  Effect.andThen(onAdmitted ?? Effect.void),
+                  Effect.as(Option.some(Effect.succeed(undefined))),
+                ),
             },
           },
           messages: [],
@@ -1455,8 +2764,16 @@ describe("tool.task", () => {
           extra: {
             promptOps: {
               ...stubOps({ text: "nested done" }),
-              admitNotification: (input: SessionPrompt.PromptInput) =>
-                Effect.sync(() => notifications.push(input)).pipe(Effect.as(Option.some(Effect.succeed(undefined)))),
+              admitNotification: (
+                input: SessionPrompt.PromptInput,
+                _checkpoint: number,
+                _source?: SessionPrompt.NotificationSource,
+                onAdmitted?: Effect.Effect<void>,
+              ) =>
+                Effect.sync(() => notifications.push(input)).pipe(
+                  Effect.andThen(onAdmitted ?? Effect.void),
+                  Effect.as(Option.some(Effect.succeed(undefined))),
+                ),
             },
           },
           messages: [],
@@ -1509,8 +2826,16 @@ describe("tool.task", () => {
           extra: {
             promptOps: {
               ...stubOps({ text: "nested done" }),
-              admitNotification: (input: SessionPrompt.PromptInput) =>
-                Effect.sync(() => notifications.push(input)).pipe(Effect.as(Option.some(Effect.succeed(undefined)))),
+              admitNotification: (
+                input: SessionPrompt.PromptInput,
+                _checkpoint: number,
+                _source?: SessionPrompt.NotificationSource,
+                onAdmitted?: Effect.Effect<void>,
+              ) =>
+                Effect.sync(() => notifications.push(input)).pipe(
+                  Effect.andThen(onAdmitted ?? Effect.void),
+                  Effect.as(Option.some(Effect.succeed(undefined))),
+                ),
             },
           },
           messages: [],

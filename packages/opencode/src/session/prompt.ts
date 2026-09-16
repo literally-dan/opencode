@@ -315,10 +315,15 @@ export interface Interface {
   readonly checkpoint: (sessionID: SessionID) => Effect.Effect<number>
   readonly ask: (input: AskInput) => Effect.Effect<AskOutput, unknown>
   readonly prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error | Session.RemovingError>
+  /**
+   * `onAdmitted` runs inside the admission when the notification message is saved. A held result can be dropped
+   * later, so the returned continuation alone does not prove that the result was admitted.
+   */
   readonly admitNotification: (
     input: PromptInput,
     checkpoint: number,
     source?: NotificationSource,
+    onAdmitted?: Effect.Effect<void>,
   ) => Effect.Effect<Option.Option<NotificationContinuation>, Image.Error>
   readonly notify: (
     input: PromptInput,
@@ -391,8 +396,12 @@ const layer = Layer.effect(
           state.admit([{ sessionID, checkpoint }, { sessionID: childID }], effect),
         resolvePromptParts: (template: string) => resolvePromptParts(template),
         prompt: (input: PromptInput) => prompt(input).pipe(Effect.catch(Effect.die)),
-        admitNotification: (input: PromptInput, checkpoint: number, source?: NotificationSource) =>
-          admitNotification(input, checkpoint, source).pipe(Effect.catch(Effect.die)),
+        admitNotification: (
+          input: PromptInput,
+          checkpoint: number,
+          source?: NotificationSource,
+          onAdmitted?: Effect.Effect<void>,
+        ) => admitNotification(input, checkpoint, source, onAdmitted).pipe(Effect.catch(Effect.die)),
         notify: (input: PromptInput, checkpoint: number) => notify(input, checkpoint).pipe(Effect.catch(Effect.die)),
       } satisfies TaskPromptOps
     })
@@ -1295,20 +1304,22 @@ const layer = Layer.effect(
         session.model?.id !== message.info.model.modelID ||
         (session.model?.variant === "default" ? undefined : session.model?.variant) !== message.info.model.variant
       ) {
-        yield* sessions.setAgentModel({
-          sessionID: input.sessionID,
-          agent: message.info.agent,
-          model: {
-            id: message.info.model.modelID,
-            providerID: message.info.model.providerID,
-            variant: message.info.model.variant ?? "default",
-          },
-          time: message.info.time.created,
-        })
+        yield* Database.retryLockTimeout(
+          sessions.setAgentModel({
+            sessionID: input.sessionID,
+            agent: message.info.agent,
+            model: {
+              id: message.info.model.modelID,
+              providerID: message.info.model.providerID,
+              variant: message.info.model.variant ?? "default",
+            },
+            time: message.info.time.created,
+          }),
+        )
       }
-      yield* sessions.updateMessage(message.info)
-      for (const part of message.parts) yield* sessions.updatePart(part)
-      yield* sessions.touch(input.sessionID)
+      yield* Database.retryLockTimeout(sessions.updateMessage(message.info))
+      for (const part of message.parts) yield* Database.retryLockTimeout(sessions.updatePart(part))
+      yield* Database.retryLockTimeout(sessions.touch(input.sessionID))
 
       const permissions: PermissionV1.Rule[] = []
       for (const [t, enabled] of Object.entries(input.tools ?? {})) {
@@ -1316,7 +1327,7 @@ const layer = Layer.effect(
       }
       if (permissions.length > 0) {
         session.permission = permissions
-        yield* sessions.setPermission({ sessionID: session.id, permission: permissions })
+        yield* Database.retryLockTimeout(sessions.setPermission({ sessionID: session.id, permission: permissions }))
       }
 
       return message
@@ -1822,9 +1833,10 @@ const layer = Layer.effect(
       input: PromptInput,
       checkpoint: number,
       source?: NotificationSource,
+      onAdmitted?: Effect.Effect<void>,
     ) {
       if (!(yield* state.isCurrent(input.sessionID, checkpoint))) return Option.none()
-      return yield* admitPrepared(input, checkpoint, yield* prepareUserMessage(input), source)
+      return yield* admitPrepared(input, checkpoint, yield* prepareUserMessage(input), source, onAdmitted)
     })
 
     const admitPrepared = Effect.fn("SessionPrompt.admitPrepared")(function* (
@@ -1832,6 +1844,7 @@ const layer = Layer.effect(
       checkpoint: number,
       prepared: SessionV1.WithParts & { info: SessionV1.User },
       source: NotificationSource | undefined,
+      onAdmitted: Effect.Effect<void> | undefined,
     ): Effect.fn.Return<Option.Option<NotificationContinuation>> {
       const admitted = yield* state.admitIfCurrent(
         input.sessionID,
@@ -1850,7 +1863,7 @@ const layer = Layer.effect(
           // persistPrompt switches the session to the message's agent and model,
           // so use the session's current values. Read them inside the admission,
           // so a prompt admitted while this notification was prepared is not reverted.
-          return yield* persistPrompt(
+          const saved = yield* persistPrompt(
             {
               info: {
                 ...prepared.info,
@@ -1871,6 +1884,8 @@ const layer = Layer.effect(
             },
             input,
           )
+          if (onAdmitted) yield* onAdmitted
+          return saved
         }),
       )
       if (Option.isNone(admitted)) return Option.none()
@@ -1878,9 +1893,11 @@ const layer = Layer.effect(
       // Hold the result until the revert is committed or cleared, then admit the same prepared message.
       // The caller keeps its lease while this waits.
       if ("held" in message)
-        return Option.some(message.held.pipe(Effect.andThen(admitAgain(input, checkpoint, prepared, source))))
+        return Option.some(
+          message.held.pipe(Effect.andThen(admitAgain(input, checkpoint, prepared, source, onAdmitted))),
+        )
       if (input.noReply === true) return Option.some(Effect.succeed(undefined))
-      return Option.some(deliverNotification(input, checkpoint, prepared, source, message))
+      return Option.some(deliverNotification(input, checkpoint, prepared, source, message, onAdmitted))
     })
 
     // Admits a result again after a revert changed. Drops it when the revert removed the message that started the Task.
@@ -1889,9 +1906,10 @@ const layer = Layer.effect(
       checkpoint: number,
       prepared: SessionV1.WithParts & { info: SessionV1.User },
       source: NotificationSource | undefined,
+      onAdmitted: Effect.Effect<void> | undefined,
     ): Effect.fn.Return<SessionV1.WithParts | undefined, Image.Error> {
       if (source && !(yield* messageExists(source.sessionID, source.messageID))) return
-      const continuation = yield* admitPrepared(input, checkpoint, prepared, source)
+      const continuation = yield* admitPrepared(input, checkpoint, prepared, source, onAdmitted)
       if (Option.isNone(continuation)) return
       return yield* continuation.value
     })
@@ -1905,23 +1923,27 @@ const layer = Layer.effect(
       prepared: SessionV1.WithParts & { info: SessionV1.User },
       source: NotificationSource | undefined,
       message: SessionV1.WithParts,
+      onAdmitted: Effect.Effect<void> | undefined,
     ): Effect.fn.Return<SessionV1.WithParts | undefined, Image.Error> {
       const result = yield* runNotification(message, checkpoint)
       if (!result) return
       const waited = yield* awaitRevertEnd(input.sessionID, checkpoint)
       if (waited) {
         if (yield* messageExists(message.info.sessionID, message.info.id))
-          return yield* deliverNotification(input, checkpoint, prepared, source, message)
+          return yield* deliverNotification(input, checkpoint, prepared, source, message, onAdmitted)
         // A revert that starts at the notification itself, such as undo of its turn, drops the result, as it does
         // after the turn finished.
         if (waited.point === message.info.id) return
-        return yield* admitAgain(input, checkpoint, prepared, source)
+        return yield* admitAgain(input, checkpoint, prepared, source, onAdmitted)
       }
       if (result.info.role === "assistant" && result.info.parentID === message.info.id) return result
       const latest = MessageV2.latest(
         yield* MessageV2.filterCompactedEffect(input.sessionID).pipe(Effect.provideService(Database.Service, database)),
       )
-      if (latest.user?.id !== message.info.id) return
+      // The run can end on a newer user message, such as a user steer or the compaction message. Its reply answers the
+      // notification too, and the caller must not fall back to older output.
+      if (latest.user?.id !== message.info.id)
+        return result.info.role === "assistant" && result.info.id > message.info.id ? result : undefined
       return yield* runNotification(message, checkpoint)
     })
 

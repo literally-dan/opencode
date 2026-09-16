@@ -81,6 +81,21 @@ export const SessionTable = sqliteTable(
   ],
 )
 
+export const SessionTaskTable = sqliteTable("session_task", {
+  session_id: text()
+    .$type<SessionSchema.ID>()
+    .primaryKey()
+    .references(() => SessionTable.id, { onDelete: "cascade" }),
+  ancestor_access: text().$type<"none" | "history" | "status" | "all">().notNull().default("history"),
+  generation: integer().notNull().default(1),
+  status: text().$type<"running" | "completed" | "error" | "cancelled">().notNull().default("running"),
+  error: text(),
+  ...Timestamps,
+  time_completed: integer(),
+  delivery_session_id: text().$type<SessionSchema.ID>(),
+  time_delivered: integer(),
+})
+
 export const SessionAskThreadTable = sqliteTable(
   "session_ask_thread",
   {

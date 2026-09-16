@@ -27,7 +27,12 @@ import { Image } from "../../src/image/image"
 import { Question } from "../../src/question"
 import { Todo } from "../../src/session/todo"
 import { Session } from "@/session/session"
-import { SessionContextEpochTable, SessionInputTable, SessionMessageTable } from "@opencode-ai/core/session/sql"
+import {
+  SessionContextEpochTable,
+  SessionInputTable,
+  SessionMessageTable,
+  SessionTaskTable,
+} from "@opencode-ai/core/session/sql"
 import { EventTable } from "@opencode-ai/core/event/sql"
 import { LLM } from "../../src/session/llm"
 import { MessageV2 } from "../../src/session/message-v2"
@@ -1051,6 +1056,88 @@ noLLMServer.instance("run-state publishes idle once after the runner and every l
     )
     expect(statuses).toEqual(["busy", "idle", "busy", "idle"])
     expect(yield* run.isCurrent(chat.id, checkpoint)).toBe(false)
+  }),
+)
+
+// Starts a busy runner for a background Task Session that needs a moment to stop, and a job for that Task whose
+// completion callback cancels the Task Session, as the task tool does.
+const startStoppingTask = Effect.fn("test.startStoppingTask")(function* (
+  run: SessionRunState.Interface,
+  chat: Session.Info,
+  messageID: MessageID,
+) {
+  const sessions = yield* Session.Service
+  const jobs = yield* BackgroundJob.Service
+  const child = yield* sessions.create({ parentID: chat.id, title: "Task" })
+  const message = yield* sessions.updateMessage({
+    id: MessageID.ascending(),
+    role: "user",
+    sessionID: child.id,
+    agent: "general",
+    model: ref,
+    time: { created: Date.now() },
+  })
+  const started = yield* Deferred.make<void>()
+  const releaseStop = yield* Deferred.make<void>()
+  const turn = yield* run
+    .ensureRunning(
+      child.id,
+      Effect.succeed({ info: message, parts: [] }),
+      Deferred.succeed(started, undefined).pipe(
+        Effect.andThen(Effect.never),
+        Effect.onInterrupt(() => Deferred.await(releaseStop)),
+      ),
+    )
+    .pipe(Effect.exit, Effect.forkChild)
+  yield* Deferred.await(started)
+  yield* jobs.start({
+    id: child.id,
+    type: "task",
+    metadata: { parentSessionId: chat.id, sessionId: child.id, messageId: messageID },
+    notifyOnComplete: true,
+    awaitOnComplete: true,
+    onComplete: () => run.cancel(child.id),
+    run: Effect.never,
+  })
+  return { child, releaseStop, turn }
+})
+
+noLLMServer.instance("cancel returns after cancelled background task runners stop", () =>
+  Effect.gen(function* () {
+    const { run, chat } = yield* boot()
+    const task = yield* startStoppingTask(run, chat, MessageID.ascending())
+
+    yield* Effect.gen(function* () {
+      const cancelling = yield* run.cancel(chat.id).pipe(Effect.forkChild)
+      yield* Effect.sleep("50 millis")
+      // The Task runner has not stopped, so cancel has not returned.
+      expect(cancelling.pollUnsafe()).toBeUndefined()
+
+      yield* Deferred.succeed(task.releaseStop, undefined)
+      yield* Fiber.join(cancelling).pipe(Effect.timeout("2 seconds"))
+      expect(Exit.isSuccess(yield* run.assertNotBusy(task.child.id).pipe(Effect.exit))).toBe(true)
+      yield* Fiber.join(task.turn)
+    }).pipe(Effect.ensuring(Deferred.succeed(task.releaseStop, undefined)))
+  }),
+)
+
+noLLMServer.instance("revert task cancellation returns after the cancelled task runners stop", () =>
+  Effect.gen(function* () {
+    const { run, chat } = yield* boot()
+    const messageID = MessageID.ascending()
+    const task = yield* startStoppingTask(run, chat, messageID)
+
+    yield* Effect.gen(function* () {
+      const cancelling = yield* run.cancelTasks(chat.id, new Set([messageID])).pipe(Effect.forkChild)
+      yield* Effect.sleep("50 millis")
+      // Revert restores files after this returns, so the Task must have stopped working first.
+      expect(cancelling.pollUnsafe()).toBeUndefined()
+
+      yield* Deferred.succeed(task.releaseStop, undefined)
+      yield* Fiber.join(cancelling).pipe(Effect.timeout("2 seconds"))
+      expect(Exit.isSuccess(yield* run.assertNotBusy(task.child.id).pipe(Effect.exit))).toBe(true)
+      yield* Fiber.join(task.turn)
+    }).pipe(Effect.ensuring(Deferred.succeed(task.releaseStop, undefined)))
   }),
 )
 
@@ -3372,7 +3459,7 @@ it.instance("reserves reminder headroom at the soft pressure boundary", () =>
         time: { start: 1, end: 2 },
       },
     })
-    yield* user(chat.id, "x".repeat(178_500))
+    yield* user(chat.id, "x".repeat(177_200))
     yield* llm.hang
 
     const fiber = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
@@ -4151,10 +4238,11 @@ it.instance(
       const tool = yield* pollWithTimeout(
         Effect.gen(function* () {
           const msgs = yield* MessageV2.filterCompactedEffect(chat.id)
-          const assistant = msgs.findLast((item) => item.info.role === "assistant" && item.info.agent === "build")
-          const tool = assistant?.parts.find(
-            (part): part is SessionV1.ToolPart => part.type === "tool" && part.tool === "task",
-          )
+          // The loop can start the next build turn before this poll observes the completed task call.
+          const tool = msgs
+            .filter((item) => item.info.role === "assistant" && item.info.agent === "build")
+            .flatMap((item) => item.parts)
+            .find((part): part is SessionV1.ToolPart => part.type === "tool" && part.tool === "task")
           if (tool?.state.status === "completed" && tool.state.metadata?.sessionId) return tool
         }),
         "timed out waiting for background task metadata",
@@ -5195,7 +5283,27 @@ it.instance(
 
       expect((yield* status.get(chat.id)).type).toBe("idle")
       expect(statuses.at(-1)).toBe("idle")
-      expect((yield* jobs.get(job.id))?.status).toBe("cancelled")
+      // Cancellation returns once the job is marked. Its completion delivery closes the job afterwards.
+      expect((yield* jobs.wait({ id: job.id, timeout: 5_000 })).info?.status).toBe("cancelled")
+    }),
+  30_000,
+)
+
+it.instance(
+  "instance disposal right after a root abort finishes while a background task stops",
+  () =>
+    Effect.gen(function* () {
+      const { llm, prompt, chat } = yield* launchBackgroundTask(reply().hang())
+      yield* pollWithTimeout(
+        llm.hits.pipe(
+          Effect.map((hits) => (hits.some((hit) => JSON.stringify(hit.body).includes(chat.id)) ? true : undefined)),
+        ),
+        "background task never reached the model",
+        "10 seconds",
+      )
+      yield* prompt.cancel(chat.id)
+      // Disposal interrupts the cancellation delivery while it cancels the busy child runner.
+      yield* disposeAllInstancesEffect.pipe(Effect.timeout("10 seconds"))
     }),
   30_000,
 )
@@ -5276,7 +5384,10 @@ it.instance(
 
       if (second.info.role !== "assistant") return yield* Effect.die(new Error("second prompt did not answer"))
       yield* revert.revert({ sessionID: chat.id, messageID: second.info.parentID })
-      expect(yield* job("second task")).toBe("cancelled")
+      // Cancellation returns once the job is marked. Its completion delivery closes the job afterwards.
+      const secondID = (yield* jobs.list()).find((item) => item.title === "second task")?.id
+      if (!secondID) return yield* Effect.die(new Error("second task job was not found"))
+      expect((yield* jobs.wait({ id: secondID, timeout: 5_000 })).info?.status).toBe("cancelled")
       expect(yield* job("first task")).toBe("running")
       yield* revert.unrevert({ sessionID: chat.id })
       expect(yield* job("first task")).toBe("running")
@@ -5630,6 +5741,7 @@ it.instance(
   "a background task result held while a revert is staged is delivered after the revert is committed",
   () =>
     Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
       const { llm, prompt, chat } = yield* finishKeptTaskWhileRevertStaged()
       yield* llm.textMatch((hit) => requestText(hit).includes("Background task completed"), "noted kept")
 
@@ -5646,6 +5758,9 @@ it.instance(
       expect(texts.some((text) => text.includes("kept done"))).toBe(true)
       expect(texts).toContain("noted kept")
       expect(texts.some((text) => text.includes("start reverted task") || text.includes("Task cancelled"))).toBe(false)
+      const kept = (yield* jobs.list()).find((item) => item.title === "inspect bug")
+      if (!kept) return yield* Effect.die(new Error("the kept task job was not found"))
+      expect(yield* taskRow(kept.id)).toMatchObject({ status: "completed", delivery_session_id: chat.id })
     }),
   30_000,
 )
@@ -5718,6 +5833,12 @@ it.instance(
       const texts = textParts(yield* MessageV2.filterCompactedEffect(chat.id))
       expect(texts.some((text) => text.includes("start background task"))).toBe(false)
       expect(texts.some((text) => text.includes("Background task completed"))).toBe(false)
+      // The dropped result was never admitted, so the Task row records no delivery.
+      expect(yield* taskRow(job.id)).toMatchObject({
+        status: "completed",
+        delivery_session_id: null,
+        time_delivered: null,
+      })
     }),
   30_000,
 )
@@ -6083,6 +6204,45 @@ countNotificationPreparations.instance(
   30_000,
 )
 
+const taskRow = (sessionID: string) =>
+  Effect.gen(function* () {
+    const { db } = yield* Database.Service
+    return yield* db
+      .select()
+      .from(SessionTaskTable)
+      .where(eq(SessionTaskTable.session_id, SessionID.make(sessionID)))
+      .get()
+      .pipe(Effect.orDie)
+  })
+
+it.instance(
+  "a background task cancelled by revert records the cancellation without a notification",
+  () =>
+    Effect.gen(function* () {
+      const revert = yield* SessionRevert.Service
+      const jobs = yield* BackgroundJob.Service
+      const { chat, job } = yield* launchBackgroundTask(reply().hang())
+      const start = (yield* MessageV2.filterCompactedEffect(chat.id)).find((message) => message.info.role === "user")
+      if (!start) return yield* Effect.die(new Error("the task was not started by a user message"))
+      expect((yield* taskRow(job.id))?.status).toBe("running")
+
+      yield* revert.revert({ sessionID: chat.id, messageID: start.info.id })
+      expect((yield* jobs.wait({ id: job.id, timeout: 5_000 })).info?.status).toBe("cancelled")
+
+      // The revert claimed the completion, so no notification is sent, but the durable Task row still settles.
+      expect(yield* taskRow(job.id)).toMatchObject({
+        status: "cancelled",
+        error: "Task cancelled",
+        delivery_session_id: null,
+        time_delivered: null,
+      })
+      expect(
+        textParts(yield* MessageV2.filterCompactedEffect(chat.id)).some((text) => text.includes("Task cancelled")),
+      ).toBe(false)
+    }),
+  30_000,
+)
+
 it.instance(
   "revert cancels a background task that a reverted message resumed",
   () =>
@@ -6249,6 +6409,306 @@ it.instance(
       )
     }),
   30_000,
+)
+
+const sessionTexts = (sessionID: SessionID) =>
+  MessageV2.filterCompactedEffect(sessionID).pipe(
+    Effect.map((messages) =>
+      messages.flatMap((message) => message.parts.flatMap((part) => (part.type === "text" ? [part.text] : []))),
+    ),
+  )
+
+// Runs the /target shape with the real runtime: root M launches coordinator T, T launches worker W and ends its
+// turn, and W waits for `workerRelease`. `continuation` answers T's turn for the worker result.
+const launchCoordinatedTask = Effect.fn("test.launchCoordinatedTask")(function* (continuation: Reply) {
+  const { llm } = yield* useServerConfig(providerCfg)
+  const prompt = yield* SessionPrompt.Service
+  const sessions = yield* Session.Service
+  const jobs = yield* BackgroundJob.Service
+  const chat = yield* sessions.create({
+    title: "Pinned",
+    permission: [{ permission: "*", pattern: "*", action: "allow" }],
+  })
+  const workerRelease = defer<void>()
+  const body = (hit: { body: unknown }) => JSON.stringify(hit.body)
+  // Only coordinator requests name the root session, in their subagent-context marker.
+  const inCoordinator = (hit: { body: unknown }) => body(hit).includes(chat.id)
+  yield* llm.toolMatch(
+    (hit) => body(hit).includes("start target workflow") && !body(hit).includes("Background task started"),
+    "task",
+    { description: "coordinate target", prompt: "coordinate the target workflow", subagent_type: "target-coordinator" },
+  )
+  yield* llm.textMatch(
+    (hit) =>
+      !inCoordinator(hit) &&
+      body(hit).includes("Background task started") &&
+      !body(hit).includes("Background task completed:"),
+    "launched coordinator",
+  )
+  yield* llm.toolMatch((hit) => inCoordinator(hit) && !body(hit).includes("Background task started"), "task", {
+    description: "implement target",
+    prompt: "inspect the worker path",
+    subagent_type: "general",
+  })
+  yield* llm.textMatch(
+    (hit) =>
+      inCoordinator(hit) &&
+      body(hit).includes("Background task started") &&
+      !body(hit).includes("Background task completed:"),
+    "coordinator waiting for worker",
+  )
+  yield* llm.pushMatch(
+    (hit) => !inCoordinator(hit) && body(hit).includes("inspect the worker path"),
+    reply().wait(workerRelease.promise).text("worker raw output").stop(),
+  )
+  yield* llm.pushMatch(
+    (hit) => inCoordinator(hit) && body(hit).includes("Background task completed: implement target"),
+    continuation,
+  )
+  yield* llm.textMatch(
+    (hit) => !inCoordinator(hit) && body(hit).includes("Background task completed: coordinate target"),
+    "root noted",
+  )
+
+  yield* prompt.prompt({
+    sessionID: chat.id,
+    agent: "build",
+    model: ref,
+    parts: [{ type: "text", text: "start target workflow" }],
+  })
+  const coordinator = SessionID.make(
+    (yield* pollWithTimeout(
+      jobs.list().pipe(Effect.map((items) => items.find((item) => item.metadata?.parentSessionId === chat.id))),
+      "coordinator job never started",
+      "20 seconds",
+    )).id,
+  )
+  yield* pollWithTimeout(
+    jobs.list().pipe(Effect.map((items) => items.find((item) => item.metadata?.parentSessionId === coordinator))),
+    "worker job never started",
+    "20 seconds",
+  )
+  yield* pollWithTimeout(
+    sessionTexts(coordinator).pipe(
+      Effect.map((texts) => (texts.includes("coordinator waiting for worker") ? true : undefined)),
+    ),
+    "coordinator turn never ended",
+    "20 seconds",
+  )
+  return { llm, prompt, chat, coordinator, workerRelease, inCoordinator, body }
+})
+
+it.instance(
+  "a coordinator task delivers its final reply to the root after its worker result",
+  () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const { chat, coordinator, workerRelease } = yield* launchCoordinatedTask(
+        reply().text("coordinator final reply").stop(),
+      )
+      // The coordinator turn ended, but its job stays open until the worker result is delivered.
+      yield* Effect.sleep("300 millis")
+      expect((yield* jobs.get(coordinator))?.status).toBe("running")
+      workerRelease.resolve()
+
+      const rootText = yield* pollWithTimeout(
+        sessionTexts(chat.id).pipe(
+          Effect.map((texts) => texts.find((text) => text.includes("Background task completed: coordinate target"))),
+        ),
+        "root never received the coordinator completion",
+        "20 seconds",
+      )
+      expect(rootText).toContain("coordinator final reply")
+      expect(rootText).not.toContain("worker raw output")
+      expect((yield* sessionTexts(coordinator)).some((text) => text.includes("worker raw output"))).toBe(true)
+    }),
+  60_000,
+)
+
+it.instance(
+  "root abort stops a coordinator continuation turn",
+  () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const status = yield* SessionStatus.Service
+      const { llm, prompt, chat, coordinator, workerRelease, inCoordinator, body } = yield* launchCoordinatedTask(
+        reply().hang(),
+      )
+      workerRelease.resolve()
+      yield* pollWithTimeout(
+        llm.hits.pipe(
+          Effect.map((hits) =>
+            hits.some((hit) => inCoordinator(hit) && body(hit).includes("Background task completed: implement target"))
+              ? true
+              : undefined,
+          ),
+        ),
+        "coordinator continuation never reached the model",
+        "20 seconds",
+      )
+      yield* waitForBusy(coordinator)
+
+      // TUI Esc-Esc and POST /session/:id/abort cancel the root session.
+      yield* prompt.cancel(chat.id)
+      expect((yield* jobs.wait({ id: coordinator, timeout: 5_000 })).info?.status).toBe("cancelled")
+      yield* pollWithTimeout(
+        status.get(coordinator).pipe(Effect.map((item) => (item.type === "idle" ? true : undefined))),
+        "the coordinator continuation kept running after the root abort",
+        "5 seconds",
+      )
+      expect((yield* jobs.list()).filter((item) => item.metadata?.parentSessionId === coordinator)).toHaveLength(1)
+    }),
+  60_000,
+)
+
+const coordinatorResult = (chatID: SessionID) =>
+  pollWithTimeout(
+    sessionTexts(chatID).pipe(
+      Effect.map((texts) =>
+        texts.find(
+          (text) =>
+            text.includes("Background task completed: coordinate target") ||
+            text.includes("Background task failed: coordinate target"),
+        ),
+      ),
+    ),
+    "root never received the coordinator result",
+    "30 seconds",
+  )
+
+const continuationReachedModel = (
+  llm: { hits: Effect.Effect<{ body: unknown }[]> },
+  inCoordinator: (hit: { body: unknown }) => boolean,
+  body: (hit: { body: unknown }) => string,
+) =>
+  pollWithTimeout(
+    llm.hits.pipe(
+      Effect.map((hits) =>
+        hits.some((hit) => inCoordinator(hit) && body(hit).includes("Background task completed: implement target"))
+          ? true
+          : undefined,
+      ),
+    ),
+    "coordinator continuation never reached the model",
+    "20 seconds",
+  )
+
+it.instance(
+  "a coordinator continuation that ends on a newer user message delivers that reply to the root",
+  () =>
+    Effect.gen(function* () {
+      const steer = defer<void>()
+      const { llm, prompt, chat, coordinator, workerRelease, inCoordinator, body } = yield* launchCoordinatedTask(
+        reply().wait(steer.promise).text("coordinator reply to worker").stop(),
+      )
+      yield* llm.pushMatch(
+        (hit) => inCoordinator(hit) && body(hit).includes("user steer"),
+        reply().text("coordinator final reply after steer").stop(),
+      )
+      workerRelease.resolve()
+      yield* continuationReachedModel(llm, inCoordinator, body)
+
+      // A user steers the coordinator while its continuation turn runs, so the run ends on the newer message.
+      yield* prompt.prompt({
+        sessionID: coordinator,
+        agent: "target-coordinator",
+        model: ref,
+        noReply: true,
+        parts: [{ type: "text", text: "user steer" }],
+      })
+      steer.resolve()
+
+      const rootText = yield* coordinatorResult(chat.id)
+      expect(yield* sessionTexts(coordinator)).toContain("coordinator final reply after steer")
+      expect(rootText).toContain("coordinator final reply after steer")
+      expect(rootText).not.toContain("coordinator waiting for worker")
+    }),
+  60_000,
+)
+
+it.instance(
+  "a turn-only interrupt of a coordinator continuation fails its job instead of delivering stale output",
+  () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const run = yield* SessionRunState.Service
+      const { llm, chat, coordinator, workerRelease, inCoordinator, body } = yield* launchCoordinatedTask(
+        reply().hang(),
+      )
+      workerRelease.resolve()
+      yield* continuationReachedModel(llm, inCoordinator, body)
+
+      // Esc in the coordinator session stops only the running turn.
+      yield* run.interruptTurn(coordinator)
+
+      const rootText = yield* coordinatorResult(chat.id)
+      expect(rootText).toContain("Background task failed: coordinate target")
+      expect(rootText).not.toContain("coordinator waiting for worker")
+      expect((yield* jobs.wait({ id: coordinator, timeout: 5_000 })).info?.status).toBe("error")
+    }),
+  60_000,
+)
+
+it.instance(
+  "a paused coordinator fails its job when a worker result cannot start its turn",
+  () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const run = yield* SessionRunState.Service
+      const { llm, chat, coordinator, workerRelease, inCoordinator, body } = yield* launchCoordinatedTask(
+        reply().text("coordinator final reply").stop(),
+      )
+      // Esc in the idle coordinator session pauses notification turns until the next prompt.
+      yield* run.interruptTurn(coordinator)
+      workerRelease.resolve()
+
+      const rootText = yield* coordinatorResult(chat.id)
+      expect(rootText).toContain("Background task failed: coordinate target")
+      expect(rootText).toContain("interrupted before it answered the worker result")
+      expect(rootText).not.toContain("coordinator waiting for worker")
+      expect((yield* jobs.wait({ id: coordinator, timeout: 5_000 })).info?.status).toBe("error")
+      // The result stays in the coordinator history without a turn.
+      expect(
+        textParts(yield* MessageV2.filterCompactedEffect(coordinator)).some((text) =>
+          text.includes("worker raw output"),
+        ),
+      ).toBe(true)
+      expect(
+        (yield* llm.hits).some(
+          (hit) => inCoordinator(hit) && body(hit).includes("Background task completed: implement target"),
+        ),
+      ).toBe(false)
+    }),
+  60_000,
+)
+
+it.instance(
+  "a coordinator continuation that auto-compacts never delivers stale output to the root",
+  () =>
+    Effect.gen(function* () {
+      const { llm, chat, coordinator, workerRelease, inCoordinator, body } = yield* launchCoordinatedTask(
+        reply().text("coordinator reply before compaction").usage({ input: 99_000, output: 10 }).stop(),
+      )
+      yield* llm.pushMatch(
+        (hit) => inCoordinator(hit) && body(hit).includes("Continue if you have next steps"),
+        reply().text("coordinator final reply after compaction").stop(),
+      )
+      workerRelease.resolve()
+
+      const rootText = yield* coordinatorResult(chat.id)
+      // The run ends on the compaction message, not on the worker result. In this harness the compaction request
+      // overflows, so the coordinator job must fail with that error instead of completing with its old reply.
+      const compaction = (yield* MessageV2.filterCompactedEffect(coordinator)).findLast(
+        (message) => message.info.role === "assistant" && message.info.summary,
+      )
+      expect(compaction).toBeDefined()
+      expect(rootText).not.toContain("coordinator waiting for worker")
+      expect(rootText).not.toContain("coordinator reply before compaction")
+      if (rootText.includes("Background task completed: coordinate target"))
+        expect(rootText).toContain("coordinator final reply after compaction")
+      else expect(rootText).toContain("ContextOverflowError")
+    }),
+  60_000,
 )
 
 promptRemovalRace.instance("notification keeps an agent switch admitted while the notification is prepared", () =>

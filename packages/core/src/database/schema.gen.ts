@@ -238,6 +238,21 @@ export default {
         );
       `)
       yield* tx.run(`
+        CREATE TABLE \`session_task\` (
+          \`session_id\` text PRIMARY KEY,
+          \`ancestor_access\` text DEFAULT 'history' NOT NULL,
+          \`generation\` integer DEFAULT 1 NOT NULL,
+          \`status\` text DEFAULT 'running' NOT NULL,
+          \`error\` text,
+          \`time_created\` integer NOT NULL,
+          \`time_updated\` integer NOT NULL,
+          \`time_completed\` integer,
+          \`delivery_session_id\` text,
+          \`time_delivered\` integer,
+          CONSTRAINT \`fk_session_task_session_id_session_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session\`(\`id\`) ON DELETE CASCADE
+        );
+      `)
+      yield* tx.run(`
         CREATE TABLE \`todo\` (
           \`session_id\` text NOT NULL,
           \`content\` text NOT NULL,

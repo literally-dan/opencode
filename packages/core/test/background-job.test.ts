@@ -1,7 +1,7 @@
 import { describe, expect } from "bun:test"
 import { BackgroundJob } from "@opencode-ai/core/background-job"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { Clock, Deferred, Effect, Exit, Fiber, Scope } from "effect"
+import { Clock, Deferred, Effect, Exit, Fiber, Option, Scope } from "effect"
 import { it } from "./lib/effect"
 
 const jobsLayer = LayerNode.compile(BackgroundJob.node)
@@ -126,7 +126,7 @@ describe("BackgroundJob", () => {
     }).pipe(Effect.provide(jobsLayer)),
   )
 
-  it.live("uses the highest accepted sequence when immediate work settles out of order", () =>
+  it.live("starts accepted work only after the previous run settles", () =>
     Effect.gen(function* () {
       const jobs = yield* BackgroundJob.Service
       const clock = yield* Clock.Clock
@@ -160,8 +160,12 @@ describe("BackgroundJob", () => {
 
         yield* Deferred.await(firstSettlement)
         expect(yield* jobs.extend({ id: job.id, run: Effect.succeed("recovered") })).toBe(true)
-        yield* Deferred.await(extensionSettlement)
+        // The extension waits until the first run has recorded its settlement.
+        expect(Option.isNone(yield* Deferred.await(extensionSettlement).pipe(Effect.timeoutOption("50 millis")))).toBe(
+          true,
+        )
         yield* Deferred.succeed(releaseFirstSettlement, undefined)
+        yield* Deferred.await(extensionSettlement)
         expect((yield* jobs.wait({ id: job.id })).info).toMatchObject({
           status: "completed",
           output: "recovered",
@@ -197,6 +201,100 @@ describe("BackgroundJob", () => {
 
       expect((yield* jobs.wait({ id: job.id })).info?.output).toBe("second")
       expect(notifications).toBe(0)
+    }).pipe(Effect.provide(jobsLayer)),
+  )
+
+  it.live("starts a queued extension after the previous run output is recorded", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const release = yield* Deferred.make<void>()
+      const job = yield* jobs.start({ type: "task", run: Deferred.await(release).pipe(Effect.as("first reply")) })
+      const seen = yield* Deferred.make<string | undefined>()
+      expect(
+        yield* jobs.extend({
+          id: job.id,
+          run: jobs.get(job.id).pipe(
+            Effect.flatMap((info) => Deferred.succeed(seen, info?.output)),
+            Effect.as("second reply"),
+          ),
+        }),
+      ).toBe(true)
+
+      yield* Deferred.succeed(release, undefined)
+      expect(yield* Deferred.await(seen).pipe(Effect.timeout("1 second"))).toBe("first reply")
+      expect((yield* jobs.wait({ id: job.id, timeout: 1_000 })).info).toMatchObject({
+        status: "completed",
+        output: "second reply",
+      })
+    }).pipe(Effect.provide(jobsLayer)),
+  )
+
+  it.live("keeps a generation open until its hold is released", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const first = yield* Deferred.make<void>()
+      let notifications = 0
+      const job = yield* jobs.start({
+        type: "test",
+        notifyOnComplete: true,
+        onComplete: () => Effect.sync(() => notifications++).pipe(Effect.asVoid),
+        run: Deferred.await(first).pipe(Effect.as("first")),
+      })
+
+      const hold = yield* jobs.hold({ id: job.id, expectedType: "test" })
+      if (Option.isNone(hold)) throw new Error("expected a hold on the running job")
+      yield* Deferred.succeed(first, undefined)
+      expect(yield* jobs.wait({ id: job.id, timeout: 50 })).toMatchObject({
+        timedOut: true,
+        info: { status: "running" },
+      })
+      expect(yield* jobs.extend({ id: job.id, run: Effect.succeed("second") })).toBe(true)
+      expect(yield* jobs.wait({ id: job.id, timeout: 50 })).toMatchObject({
+        timedOut: true,
+        info: { status: "running" },
+      })
+
+      yield* hold.value
+      yield* hold.value
+      expect(yield* jobs.wait({ id: job.id })).toMatchObject({ info: { status: "completed", output: "second" } })
+      expect(notifications).toBe(1)
+    }).pipe(Effect.provide(jobsLayer)),
+  )
+
+  it.live("rejects holds on settled, finalizing, or mismatched jobs", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const callbackStarted = yield* Deferred.make<void>()
+      const releaseCallback = yield* Deferred.make<void>()
+      const job = yield* jobs.start({
+        type: "test",
+        notifyOnComplete: true,
+        awaitOnComplete: true,
+        onComplete: () =>
+          Deferred.succeed(callbackStarted, undefined).pipe(Effect.andThen(Deferred.await(releaseCallback))),
+        run: Effect.succeed("done"),
+      })
+
+      expect(Option.isNone(yield* jobs.hold({ id: job.id, expectedType: "other" }))).toBe(true)
+      yield* Deferred.await(callbackStarted)
+      expect(Option.isNone(yield* jobs.hold({ id: job.id }))).toBe(true)
+      yield* Deferred.succeed(releaseCallback, undefined)
+      expect((yield* jobs.wait({ id: job.id })).info?.status).toBe("completed")
+      expect(Option.isNone(yield* jobs.hold({ id: job.id }))).toBe(true)
+      expect(Option.isNone(yield* jobs.hold({ id: "job_missing" }))).toBe(true)
+    }).pipe(Effect.provide(jobsLayer)),
+  )
+
+  it.live("cancels a held generation and ignores its later release", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const job = yield* jobs.start({ type: "test", run: Effect.never })
+      const hold = yield* jobs.hold({ id: job.id })
+      if (Option.isNone(hold)) throw new Error("expected a hold on the running job")
+
+      expect((yield* jobs.cancel(job.id))?.status).toBe("cancelled")
+      yield* hold.value
+      expect((yield* jobs.wait({ id: job.id })).info?.status).toBe("cancelled")
     }).pipe(Effect.provide(jobsLayer)),
   )
 
@@ -346,28 +444,32 @@ describe("BackgroundJob", () => {
     }).pipe(Effect.provide(jobsLayer)),
   )
 
-  it.live("finishes cancellation when the cancelling fiber is interrupted", () =>
+  it.live("returns from cancellation before an awaited completion callback finishes", () =>
     Effect.gen(function* () {
       const jobs = yield* BackgroundJob.Service
       const callbackStarted = yield* Deferred.make<void>()
+      const releaseCallback = yield* Deferred.make<void>()
       const workInterrupted = yield* Deferred.make<void>()
       const finalized: string[] = []
-      const id = "job_interrupted_cancel"
+      const id = "job_cancel_before_delivery"
       yield* jobs.start({
         id,
         type: "test",
         notifyOnComplete: true,
         awaitOnComplete: true,
-        onComplete: () => Deferred.succeed(callbackStarted, undefined).pipe(Effect.andThen(Effect.never)),
+        onComplete: () =>
+          Deferred.succeed(callbackStarted, undefined).pipe(Effect.andThen(Deferred.await(releaseCallback))),
         onFinalize: Effect.sync(() => finalized.push(id)).pipe(Effect.asVoid),
         run: Effect.never.pipe(Effect.ensuring(Deferred.succeed(workInterrupted, undefined))),
       })
       const waiter = yield* jobs.wait({ id }).pipe(Effect.forkChild)
-      const cancelling = yield* jobs.cancel(id).pipe(Effect.forkChild)
 
+      expect((yield* jobs.cancel(id).pipe(Effect.timeout("1 second")))?.status).toBe("cancelled")
       yield* Deferred.await(callbackStarted)
-      cancelling.interruptUnsafe()
-      expect(Exit.hasInterrupts(yield* Fiber.await(cancelling))).toBe(true)
+      expect(waiter.pollUnsafe()).toBeUndefined()
+      expect(finalized).toEqual([])
+
+      yield* Deferred.succeed(releaseCallback, undefined)
       expect((yield* Fiber.join(waiter)).info?.status).toBe("cancelled")
       yield* Deferred.await(workInterrupted).pipe(Effect.timeout("1 second"))
       expect(finalized).toEqual([id])

@@ -168,6 +168,69 @@ describe("Runner", () => {
   )
 
   it.live(
+    "cancel finishes when its caller is interrupted while the run stops",
+    Effect.gen(function* () {
+      const s = yield* Scope.Scope
+      const runner = Runner.make<string>(s, { onInterrupt: Effect.succeed("interrupted") })
+      const started = yield* Deferred.make<void>()
+      const slowStop = yield* Deferred.make<void>()
+      const caller = yield* runner
+        .ensureRunning(
+          Deferred.succeed(started, undefined).pipe(
+            Effect.andThen(Effect.never),
+            // The run needs a moment to stop, like an HTTP stream that is being aborted.
+            Effect.onInterrupt(() => Deferred.await(slowStop)),
+            Effect.as("never"),
+          ),
+        )
+        .pipe(Effect.forkChild)
+      yield* Deferred.await(started)
+      const canceller = yield* runner.cancel.pipe(Effect.forkChild)
+      yield* waitForState(runner, "Cancelling")
+
+      // Like instance disposal interrupting a fiber that runs the cancellation.
+      canceller.interruptUnsafe()
+      yield* Deferred.succeed(slowStop, undefined)
+      yield* Fiber.await(canceller)
+
+      expect(runner.state._tag).toBe("Idle")
+      yield* runner.cancel.pipe(Effect.timeout("1 second"))
+      expect(yield* Fiber.join(caller)).toBe("interrupted")
+    }),
+  )
+
+  it.live(
+    "an enqueued cancellation finishes when its caller is interrupted while the run stops",
+    Effect.gen(function* () {
+      const s = yield* Scope.Scope
+      const runner = Runner.make<string>(s, { onInterrupt: Effect.succeed("interrupted") })
+      const started = yield* Deferred.make<void>()
+      const slowStop = yield* Deferred.make<void>()
+      const caller = yield* runner
+        .ensureRunning(
+          Deferred.succeed(started, undefined).pipe(
+            Effect.andThen(Effect.never),
+            Effect.onInterrupt(() => Deferred.await(slowStop)),
+            Effect.as("never"),
+          ),
+        )
+        .pipe(Effect.forkChild)
+      yield* Deferred.await(started)
+      const cancellation = yield* runner.enqueueCancel
+      const canceller = yield* cancellation.pipe(Effect.forkChild({ startImmediately: true }))
+      expect(runner.state._tag).toBe("Cancelling")
+
+      canceller.interruptUnsafe()
+      yield* Deferred.succeed(slowStop, undefined)
+      yield* Fiber.await(canceller)
+
+      expect(runner.state._tag).toBe("Idle")
+      yield* runner.cancel.pipe(Effect.timeout("1 second"))
+      expect(yield* Fiber.join(caller)).toBe("interrupted")
+    }),
+  )
+
+  it.live(
     "cancel with queued callers resolves all",
     Effect.gen(function* () {
       const s = yield* Scope.Scope

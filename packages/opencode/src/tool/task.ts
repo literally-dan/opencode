@@ -3,6 +3,7 @@ import DESCRIPTION from "./task.txt"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { BackgroundJob } from "@/background/job"
 import { Session } from "@/session/session"
+import { SessionTaskState } from "@/session/task-state"
 import { SessionID, MessageID } from "../session/schema"
 import { MessageV2 } from "../session/message-v2"
 import { Agent } from "../agent/agent"
@@ -26,6 +27,7 @@ export interface TaskPromptOps {
     input: SessionPrompt.PromptInput,
     checkpoint: number,
     source?: SessionPrompt.NotificationSource,
+    onAdmitted?: Effect.Effect<void>,
   ): Effect.Effect<Option.Option<SessionPrompt.NotificationContinuation>>
   notify(input: SessionPrompt.PromptInput, checkpoint: number): Effect.Effect<SessionV1.WithParts | void>
 }
@@ -64,6 +66,10 @@ const BaseParameterFields = {
       "This should only be set if you mean to resume a previous task (you can pass a prior task_id and the task will continue the same subagent session as before instead of creating a fresh one)",
   }),
   command: Schema.optional(Schema.String).annotate({ description: "The command that triggered this task" }),
+  ancestor_access: Schema.optional(SessionTaskState.AncestorAccess).annotate({
+    description:
+      'Optional access to ancestor sessions: "history" (default), "none" (blind), "status" (read-only state), or "all" (history and state). Omitted resumes preserve the existing task policy.',
+  }),
 }
 
 export const Parameters = Schema.Struct(BaseParameterFields)
@@ -106,9 +112,11 @@ export const TaskTool = Tool.define(
     const background = yield* BackgroundJob.Service
     const config = yield* Config.Service
     const sessions = yield* Session.Service
+    const taskState = yield* SessionTaskState.Service
     const scope = yield* Scope.Scope
     const flags = yield* RuntimeFlags.Service
     const database = yield* Database.Service
+    const provider = yield* Provider.Service
 
     const run = Effect.fn("TaskTool.execute")(function* (
       params: Schema.Schema.Type<typeof Parameters>,
@@ -156,6 +164,9 @@ export const TaskTool = Tool.define(
           ),
         )
       }
+      // parseModel accepts any string. Check the model before a child Session is created or claimed.
+      const explicitModel = params.model ? Provider.parseModel(params.model) : undefined
+      if (explicitModel) yield* provider.getModel(explicitModel.providerID, explicitModel.modelID)
 
       const resume = Effect.fn("TaskTool.resume")(function* (taskID: string) {
         const decoded = Schema.decodeUnknownExit(SessionID)(taskID)
@@ -187,6 +198,11 @@ export const TaskTool = Tool.define(
         return session
       })
       const session = params.task_id ? yield* resume(params.task_id) : undefined
+      const requestedAccess =
+        params.ancestor_access ??
+        (session ? (yield* taskState.get(session.id))?.ancestor_access : undefined) ??
+        "history"
+      const ancestorAccess = yield* taskState.grant({ sessionID: parent.id, requested: requestedAccess })
 
       if (!ctx.extra?.bypassAgentCheck) {
         yield* ctx.ask({
@@ -256,7 +272,7 @@ export const TaskTool = Tool.define(
       if (msg.info.role !== "assistant") return yield* Effect.fail(new Error("Not an assistant message"))
       const variant = msg.info.variant
 
-      const model = (params.model ? Provider.parseModel(params.model) : undefined) ??
+      const model = explicitModel ??
         next.model ?? {
           modelID: msg.info.modelID,
           providerID: msg.info.providerID,
@@ -266,6 +282,7 @@ export const TaskTool = Tool.define(
         sessionId: nextSession.id,
         ancestorSessionIds: ancestors.map((item) => item.id),
         messageId: ctx.messageID,
+        ancestorAccess,
         model,
         background: true,
       }
@@ -282,10 +299,12 @@ export const TaskTool = Tool.define(
         checkpoint: number
         release: Effect.Effect<void>
       }> = []
+      const parentHolds: Array<Effect.Effect<void>> = []
       const releasedTargets = yield* Ref.make(false)
       const releaseTargets = Effect.gen(function* () {
         if (yield* Ref.getAndSet(releasedTargets, true)) return
         yield* Effect.forEach(notificationTargets, (target) => target.release, { discard: true }).pipe(Effect.ignore)
+        yield* Effect.forEach(parentHolds, (release) => release, { discard: true })
       }).pipe(Effect.uninterruptible)
       const routeSnapshot = [nextSession, ...ancestors]
       const validRoute = Effect.fn("TaskTool.validCompletionRoute")(function* () {
@@ -317,15 +336,16 @@ export const TaskTool = Tool.define(
         // compacted history from the spawning session. Gated with those tools:
         // without them the id is unusable, and naming the parent session at all
         // is a capability worth withholding when the feature is off.
-        const parts = flags.disableContextCompaction
-          ? basicParts
-          : [
-              ...basicParts,
-              {
-                type: "text" as const,
-                text: `\n<subagent-context parent-session-id="${ctx.sessionID}" />`,
-              },
-            ]
+        const parts =
+          flags.disableContextCompaction || (ancestorAccess !== "history" && ancestorAccess !== "all")
+            ? basicParts
+            : [
+                ...basicParts,
+                {
+                  type: "text" as const,
+                  text: `\n<subagent-context parent-session-id="${ctx.sessionID}" />`,
+                },
+              ]
         const result = yield* ops.prompt({
           messageID: MessageID.ascending(),
           sessionID: nextSession.id,
@@ -350,6 +370,17 @@ export const TaskTool = Tool.define(
         return text
       })
 
+      const labeledResult = (state: "completed" | "error", text: string) =>
+        renderOutput({
+          sessionID: nextSession.id,
+          state,
+          summary:
+            state === "completed"
+              ? `Background task completed: ${params.description}`
+              : `Background task failed: ${params.description}`,
+          text,
+        })
+
       const notificationInput = (
         target: (typeof notificationTargets)[number],
         state: "completed" | "error",
@@ -358,44 +389,82 @@ export const TaskTool = Tool.define(
         sessionID: target.session.id,
         agent: target.session.agent ?? (target.session.id === ctx.sessionID ? ctx.agent : undefined),
         variant,
-        parts: [
-          {
-            type: "text",
-            synthetic: true,
-            text: renderOutput({
-              sessionID: nextSession.id,
-              state,
-              summary:
-                state === "completed"
-                  ? `Background task completed: ${params.description}`
-                  : `Background task failed: ${params.description}`,
-              text,
-            }),
-          },
-        ],
+        parts: [{ type: "text", synthetic: true, text: labeledResult(state, text) }],
       })
 
+      // The forward run output becomes the target job output, which the target's parent receives as the target's reply.
       const forward = Effect.fn("TaskTool.forwardBackgroundResult")(function* (
         target: (typeof notificationTargets)[number],
         state: "completed" | "error",
         text: string,
         admitted: Deferred.Deferred<void>,
       ) {
-        if (!(yield* validRoute())) return text
-        const continuation = yield* ops.admitNotification(
-          notificationInput(target, state, text),
-          target.checkpoint,
-          source,
+        const previous = (yield* background.get(target.session.id))?.output
+        // The target never saw this result. Keep the target reply and pass the result through under its own task id.
+        const passThrough = () => [previous, labeledResult(state, text)].filter(Boolean).join("\n\n")
+        if (!(yield* validRoute())) return passThrough()
+        const continuation = yield* admitResult(target, state, text)
+        if (Option.isNone(continuation)) return passThrough()
+        // Resolving `admitted` lets this child job close and release its leases. The target keeps its own lease
+        // until the continuation settles; otherwise its checkpoint is gone when the continuation turn ends.
+        const result = yield* Effect.uninterruptibleMask((restore) =>
+          Effect.gen(function* () {
+            const release = yield* ops.retain(target.session.id, target.checkpoint)
+            yield* Deferred.succeed(admitted, undefined)
+            return yield* restore(continuation.value).pipe(
+              Effect.ensuring(Option.getOrElse(release, () => Effect.void)),
+            )
+          }),
         )
-        if (Option.isNone(continuation)) return text
-        yield* Deferred.succeed(admitted, undefined)
-        const result = yield* continuation.value
-        if (!result || result.info.role !== "assistant") return text
-        const part = result.parts.findLast((item) => item.type === "text")
-        return part?.type === "text" ? part.text : text
+        // No reply means no turn answered this result, for example a turn-only interrupt paused the target Session.
+        // Completing with the target's older output would look like a final answer.
+        if (result?.info.role !== "assistant")
+          return yield* Effect.fail(
+            new Error(
+              `Subagent failed (task_id: ${target.session.id}): Task interrupted before it answered the worker result (task_id: ${nextSession.id}).`,
+            ),
+          )
+        const reply = result.parts.findLast((item) => item.type === "text")?.text ?? ""
+        // A failed continuation turn fails the target job, as a failed first turn does in runTask.
+        if (result.info.error)
+          return yield* Effect.fail(
+            new Error(`Subagent failed (task_id: ${target.session.id}): ${childFailure(result.info.error, reply)}`),
+          )
+        const failed = result.parts.findLast((item) => item.type === "tool" && item.state.status === "error")
+        if (failed?.type === "tool" && failed.state.status === "error")
+          return yield* Effect.fail(new Error(`Subagent failed (task_id: ${target.session.id}): ${failed.state.error}`))
+        return reply || (previous ?? "")
       })
 
-      const route = Effect.fn("TaskTool.routeBackgroundResult")(function* (state: "completed" | "error", text: string) {
+      const admitResult = Effect.fn("TaskTool.admitBackgroundResult")(function* (
+        target: (typeof notificationTargets)[number],
+        state: "completed" | "error",
+        text: string,
+      ) {
+        return yield* taskState.withLock(nextSession.id)(
+          Effect.gen(function* () {
+            const generation = lifecycle.generation
+            if (!generation) return Option.none()
+            const current = yield* taskState.get(nextSession.id)
+            if (!current || current.generation !== generation || current.status === "running") return Option.none()
+            // A result held during a revert can be dropped later, so record the delivery when the message is saved.
+            return yield* ops.admitNotification(
+              notificationInput(target, state, text),
+              target.checkpoint,
+              source,
+              taskState
+                .deliver({ sessionID: nextSession.id, generation, targetID: target.session.id })
+                .pipe(Effect.asVoid),
+            )
+          }),
+        )
+      })
+
+      const route = Effect.fn("TaskTool.routeBackgroundResult")(function* (
+        state: "completed" | "error",
+        text: string,
+        cancelled: boolean,
+      ) {
         if (!(yield* validRoute())) {
           yield* releaseTargets
           return
@@ -411,10 +480,14 @@ export const TaskTool = Tool.define(
               id: target.session.id,
               expectedType: id,
               onFinalize: Deferred.succeed(admitted, undefined).pipe(Effect.andThen(releaseTargets)),
-              run: forward(target, state, text, admitted),
+              // Interrupting the forward run only stops waiting for the continuation. Cancel the turn itself too.
+              run: forward(target, state, text, admitted).pipe(Effect.onInterrupt(() => ops.cancel(target.session.id))),
             })
           )
             return yield* Deferred.await(admitted)
+          // A cancelled intermediate Task reports the cancellation of its whole subtree, so skip a second notice.
+          if (cancelled && (yield* taskState.get(target.session.id))?.status === "cancelled")
+            return yield* releaseTargets
         }
         const root = notificationTargets.at(-1)
         if (!root) {
@@ -422,7 +495,7 @@ export const TaskTool = Tool.define(
           return
         }
         if (!(yield* validRoute())) return yield* releaseTargets
-        const continuation = yield* ops.admitNotification(notificationInput(root, state, text), root.checkpoint, source)
+        const continuation = yield* admitResult(root, state, text)
         // The root keeps a lease until its continuation settles, so it stays busy and its checkpoint stays current.
         if (Option.isSome(continuation))
           yield* ops.retain(root.session.id, root.checkpoint).pipe(
@@ -438,12 +511,61 @@ export const TaskTool = Tool.define(
         yield* releaseTargets
       })
 
-      const complete = (info: BackgroundJob.Info) => {
-        if (info.status === "completed") return route("completed", info.output ?? "")
-        if (info.status === "error") return route("error", info.error ?? "")
-        if (info.status === "cancelled") return route("error", "Task cancelled")
-        return releaseTargets
-      }
+      // A revert claims the completion of the Tasks it cancels, so BackgroundJob skips `complete` and no notification is
+      // sent. The job still closes, so settle the durable Task row here. After `complete` this finds nothing to settle.
+      const settleUnfinished = Effect.suspend(() =>
+        lifecycle.generation === undefined
+          ? Effect.void
+          : taskState
+              .settle({
+                sessionID: nextSession.id,
+                generation: lifecycle.generation,
+                status: "cancelled",
+                error: "Task cancelled",
+              })
+              .pipe(Effect.asVoid),
+      )
+
+      const complete = Effect.fnUntraced(function* (info: BackgroundJob.Info) {
+        const result = yield* taskState.withLock(nextSession.id)(
+          Effect.gen(function* () {
+            const generation = lifecycle.generation
+            if (!generation) return undefined
+            if (info.status === "completed") {
+              const settled = yield* taskState.settle({
+                sessionID: nextSession.id,
+                generation,
+                status: "completed",
+              })
+              return settled ? ({ state: "completed", text: info.output ?? "" } as const) : undefined
+            }
+            if (info.status === "error") {
+              const settled = yield* taskState.settle({
+                sessionID: nextSession.id,
+                generation,
+                status: "error",
+                error: info.error,
+              })
+              return settled ? ({ state: "error", text: info.error ?? "" } as const) : undefined
+            }
+            if (info.status === "cancelled") {
+              const settled = yield* taskState.settle({
+                sessionID: nextSession.id,
+                generation,
+                status: "cancelled",
+                error: "Task cancelled",
+              })
+              return settled ? ({ state: "error", text: "Task cancelled" } as const) : undefined
+            }
+            return undefined
+          }),
+        )
+        if (!result) return yield* releaseTargets
+        // BackgroundJob closes the job scope only after delivery, and delivery can wait for an ancestor turn.
+        // Stop the cancelled child Session now so it does not keep working until then.
+        if (info.status === "cancelled") yield* ops.cancel(nextSession.id)
+        return yield* route(result.state, result.text, info.status === "cancelled")
+      })
 
       function backgroundResult(summary: string, text: string) {
         return {
@@ -469,7 +591,8 @@ export const TaskTool = Tool.define(
       )
       // Defer interruption until every acquired lease is released or owned by BackgroundJob.
       const handoff = { value: false }
-      const admitted = yield* Effect.uninterruptibleMask(() =>
+      const lifecycle = { generation: undefined as number | undefined, fresh: false }
+      const admitted = yield* Effect.uninterruptibleMask((restore) =>
         Effect.gen(function* () {
           const retainedTargets = yield* Effect.forEach(
             ancestors,
@@ -484,38 +607,116 @@ export const TaskTool = Tool.define(
             }),
           )
           if (retainedTargets.some(Option.isNone)) return Option.none()
+          // A parent Task generation stays open until this result is delivered. Otherwise the parent settles when its
+          // turn ends, and the result skips the parent and reaches a higher ancestor as raw output.
+          const parentHold = yield* background.hold({ id: ctx.sessionID, expectedType: id })
+          if (Option.isSome(parentHold)) parentHolds.push(parentHold.value)
+          function handoffTask(): Effect.Effect<Option.Option<"started" | "extended">, Error> {
+            return Effect.suspend(() =>
+              taskState
+                .withLock(nextSession.id)(
+                  Effect.gen(function* () {
+                    const current = yield* background.get(nextSession.id)
+                    if (current?.status === "running" && current.type !== id) return Option.none()
+                    if (current?.status === "running") {
+                      const generation = yield* taskState.ensure({ sessionID: nextSession.id, ancestorAccess })
+                      if (!generation) return Option.none()
+                      lifecycle.generation = generation
+                      lifecycle.fresh = false
+                      const extended = yield* ops.admitChild(
+                        nextSession.id,
+                        background.extend({
+                          id: nextSession.id,
+                          expectedType: id,
+                          onFinalize: releaseTargets,
+                          run: taskRun,
+                        }),
+                      )
+                      if (Option.isNone(extended)) return Option.none()
+                      return extended.value ? Option.some("extended" as const) : ("retry" as const)
+                    }
 
-          const admitted = yield* ops.admitChild(
-            nextSession.id,
-            Effect.gen(function* () {
-              if (
-                yield* background.extend({
-                  id: nextSession.id,
-                  expectedType: id,
-                  onFinalize: releaseTargets,
-                  run: taskRun,
-                })
+                    const admission = yield* ops.admitChild(
+                      nextSession.id,
+                      Effect.gen(function* () {
+                        // Begin after admission so a rejected handoff keeps the previous lifecycle state.
+                        const generation = yield* taskState.begin({ sessionID: nextSession.id, ancestorAccess })
+                        if (!generation) return Option.none()
+                        lifecycle.generation = generation
+                        lifecycle.fresh = true
+                        const started = yield* background.start({
+                          id: nextSession.id,
+                          type: id,
+                          title: params.description,
+                          metadata,
+                          onComplete: complete,
+                          awaitOnComplete: true,
+                          onFinalize: releaseTargets.pipe(Effect.andThen(settleUnfinished)),
+                          notifyOnComplete: true,
+                          run: taskRun,
+                        })
+                        if (started.type !== id) return yield* Effect.interrupt
+                        return Option.some("started" as const)
+                      }),
+                    )
+                    return Option.flatten(admission)
+                  }),
+                )
+                .pipe(
+                  Effect.flatMap((result) => {
+                    if (result !== "retry") return Effect.succeed(result)
+                    lifecycle.generation = undefined
+                    lifecycle.fresh = false
+                    return retryHandoff()
+                  }),
+                ),
+            )
+          }
+
+          const retryHandoff = Effect.fnUntraced(function* () {
+            // The finalizing child waits for its result to reach the nearest running ancestor Task. When this caller
+            // is that Task, the result waits for this turn to end, so waiting here would never finish. This call holds
+            // the caller job only when that job can still take the result.
+            const child = yield* background.get(nextSession.id)
+            if (child?.status === "running" && parentHolds.length > 0) {
+              const settled = (yield* taskState.get(nextSession.id))?.status
+              const outcome =
+                settled === "cancelled"
+                  ? "was cancelled; its cancellation notice is queued"
+                  : settled === "error"
+                    ? "failed; its error is queued"
+                    : settled === "completed"
+                      ? "finished; its result is queued"
+                      : "is finishing; its result will be queued"
+              return yield* Effect.fail(
+                new Error(`Task ${nextSession.id} ${outcome} for this session. End this turn, then resume it.`),
               )
-                return "extended" as const
+            }
+            yield* restore(background.wait({ id: nextSession.id }))
+            return yield* handoffTask()
+          })
 
-              const started = yield* background.start({
-                id: nextSession.id,
-                type: id,
-                title: params.description,
-                metadata,
-                onComplete: complete,
-                awaitOnComplete: true,
-                onFinalize: releaseTargets,
-                notifyOnComplete: true,
-                run: taskRun,
-              })
-              if (started.type !== id) return yield* Effect.interrupt
-              return "started" as const
-            }),
-          )
+          const admitted = yield* handoffTask()
           if (Option.isSome(admitted)) handoff.value = true
           return admitted
-        }).pipe(Effect.ensuring(Effect.suspend(() => (handoff.value ? Effect.void : releaseTargets)))),
+        }).pipe(
+          Effect.ensuring(
+            Effect.suspend(() =>
+              handoff.value
+                ? Effect.void
+                : lifecycle.fresh && lifecycle.generation
+                  ? taskState
+                      .settle({
+                        sessionID: nextSession.id,
+                        generation: lifecycle.generation,
+                        status: "cancelled",
+                        error: "Task handoff interrupted",
+                      })
+                      .pipe(Effect.andThen(releaseTargets))
+                  : releaseTargets,
+            ),
+          ),
+        ),
       )
       if (Option.isNone(admitted)) return yield* Effect.interrupt
       if (admitted.value === "extended") return backgroundResult("Background task updated", BACKGROUND_UPDATED)
