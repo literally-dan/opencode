@@ -22,9 +22,11 @@ import { UI } from "../ui"
 import { effectCmd } from "../effect-cmd"
 import { EOL } from "os"
 import { Filesystem } from "@/util/filesystem"
-import { createOpencodeClient, type OpencodeClient, type ToolPart } from "@opencode-ai/sdk/v2"
+import { createOpencodeClient, type OpencodeClient, type PermissionRequest, type ToolPart } from "@opencode-ai/sdk/v2"
 import { FormatError, FormatUnknownError } from "../error"
 import { INTERACTIVE_INPUT_ERROR, resolveInteractiveStdin } from "./run/runtime.stdin"
+import { resolveSessionTreeOwnership } from "./run/tree"
+import { replyPermission } from "@/session/permission-reply"
 
 type ModelInput = Parameters<OpencodeClient["session"]["prompt"]>[0]["model"]
 
@@ -57,6 +59,7 @@ type FilePart = {
 }
 
 const ATTACH_FILE_MAX_BYTES = 10 * 1024 * 1024
+const RECONNECT_ATTEMPTS = 5
 
 type Inline = {
   icon: string
@@ -691,134 +694,254 @@ export const RunCommand = effectCmd({
         }
 
         // Consume one subscribed event stream for the active session and mirror it
-        // to stdout/UI. `client` is passed explicitly because attach mode may
-        // rebind the SDK to the session's directory after the subscription is
-        // created, and replies issued from inside the loop must use that client.
-        async function loop(client: OpencodeClient, events: Awaited<ReturnType<typeof sdk.event.subscribe>>) {
+        // to stdout/UI until the session is idle. `client` is passed explicitly
+        // because attach mode may rebind the SDK to the session's directory after
+        // the subscription is created, and replies issued from inside the loop
+        // must use that client.
+        async function loop(
+          client: OpencodeClient,
+          events: Awaited<ReturnType<typeof sdk.event.subscribe>>,
+          earlierPermissions: ReadonlySet<string> | undefined,
+        ) {
           const toggles = new Map<string, boolean>()
-          const sessions = new Set([sessionID])
           let error: string | undefined
+          let idle = false
+          let disposed = false
+          // Keep only the run root. Every descendant permission revalidates its
+          // current immutable Task edges against this root.
+          const ancestryAbort = new AbortController()
+          const tree = new Set<string>([sessionID])
+          const pendingPermissions = new Map<string, Promise<void>>()
+          const seenPermissions = new Set<string>()
 
-          for await (const event of events.stream) {
-            if (event.type === "session.created" && event.properties.info.parentID) {
-              if (sessions.has(event.properties.info.parentID)) sessions.add(event.properties.info.id)
-            }
+          function answerPermission(requestID: string, reply: "once" | "always" | "reject") {
+            return replyPermission(client, {
+              requestID,
+              reply,
+              signal: ancestryAbort.signal,
+              onRetry: (retry) => {
+                if (retry.attempt !== 1 && retry.attempt % 5 !== 0) return
+                UI.error(
+                  `permission reply failed; retrying ${requestID} in ${retry.retryIn}ms (${String(retry.error)})`,
+                )
+              },
+            })
+          }
 
-            if (
-              event.type === "message.updated" &&
-              event.properties.sessionID === sessionID &&
-              event.properties.info.role === "assistant" &&
-              args.format !== "json" &&
-              toggles.get("start") !== true
-            ) {
-              UI.empty()
-              UI.println(`> ${event.properties.info.agent} · ${event.properties.info.modelID}`)
-              UI.empty()
-              toggles.set("start", true)
-            }
+          function routePermission(permission: PermissionRequest) {
+            if (seenPermissions.has(permission.id)) return pendingPermissions.get(permission.id)
+            seenPermissions.add(permission.id)
+            const task = (async () => {
+              const ownership = await resolveSessionTreeOwnership(client, tree, permission.sessionID, {
+                signal: ancestryAbort.signal,
+                onUnknown: (retry) => {
+                  if (retry.attempt !== 1 && retry.attempt % 5 !== 0) return
+                  UI.error(
+                    `permission ownership unresolved; retrying ${permission.id} in ${retry.retryIn}ms (${String(retry.error)})`,
+                  )
+                },
+              })
+              if (ownership.type === "foreign" || ownership.type === "cancelled") return
+              if (ownership.type === "exhausted") {
+                // A cycle or deleted parent never resolves, and the server
+                // waits on an untimed deferred, so reject rather than hang.
+                UI.error(
+                  `permission ancestry unresolvable for ${permission.id}; rejecting (${String(ownership.error)})`,
+                )
+                await answerPermission(permission.id, "reject")
+                return
+              }
 
-            if (event.type === "message.part.updated") {
-              const part = event.properties.part
-              if (part.sessionID !== sessionID) continue
+              // Auto-accept/reject behaviour applies to every descendant
+              // because they are all part of this run.
+              if (auto) {
+                await answerPermission(permission.id, "once")
+                return
+              }
 
-              if (part.type === "tool" && (part.state.status === "completed" || part.state.status === "error")) {
-                if (emit("tool_use", { part })) continue
-                if (part.state.status === "completed") {
-                  await tool(part)
-                  continue
-                }
-                await toolError(part)
-                UI.error(part.state.error)
+              UI.println(
+                UI.Style.TEXT_WARNING_BOLD + "!",
+                UI.Style.TEXT_NORMAL +
+                  `permission requested: ${permission.permission} (${permission.patterns.join(", ")}); auto-rejecting`,
+              )
+              await answerPermission(permission.id, "reject")
+            })().catch((failure) => {
+              seenPermissions.delete(permission.id)
+              if (ancestryAbort.signal.aborted) return
+              const message = `failed to route permission ${permission.id}: ${String(failure)}`
+              error = error ? error + EOL + message : message
+              UI.error(message)
+            })
+            const pending = task.finally(() => {
+              if (pendingPermissions.get(permission.id) === pending) pendingPermissions.delete(permission.id)
+            })
+            pendingPermissions.set(permission.id, pending)
+            return pending
+          }
+
+          // Tell the user once why the run waits for a request that recovery leaves for a human.
+          const noticed = new Set<string>()
+          async function noticeEarlierPermission(permission: PermissionRequest) {
+            if (noticed.has(permission.id)) return
+            noticed.add(permission.id)
+            const ownership = await resolveSessionTreeOwnership(client, tree, permission.sessionID, {
+              signal: ancestryAbort.signal,
+            })
+            if (ownership.type !== "owned") return
+            UI.println(
+              UI.Style.TEXT_WARNING_BOLD + "!",
+              UI.Style.TEXT_NORMAL +
+                `waiting for a human to answer permission ${permission.permission} (${permission.patterns.join(", ")}), which was pending before this run started`,
+            )
+          }
+
+          // The event stream has no replay. Once it is connected, recover requests
+          // raised before that and deduplicate them against events arriving while
+          // the list call is in flight. Requests that were already pending when
+          // this run started wait for a human, so recovery leaves them alone. If
+          // that list is unknown, recovery answers nothing.
+          const recoverPermissions = async () => {
+            if (!earlierPermissions) return
+            const response = await client.permission.list(undefined, {
+              signal: ancestryAbort.signal,
+              throwOnError: true,
+            })
+            const pending = response.data ?? []
+            await Promise.all([
+              ...pending.filter((permission) => !earlierPermissions.has(permission.id)).map(routePermission),
+              ...pending.filter((permission) => earlierPermissions.has(permission.id)).map(noticeEarlierPermission),
+            ])
+          }
+          let recoveredPermissions = Promise.resolve()
+
+          try {
+            for await (const event of events.stream) {
+              if (event.type === "server.connected" && args.attach) {
+                recoveredPermissions = recoverPermissions().catch((failure) => {
+                  if (!ancestryAbort.signal.aborted)
+                    UI.error(`failed to recover pending permissions (${String(failure)})`)
+                })
               }
 
               if (
-                part.type === "tool" &&
-                part.tool === "task" &&
-                part.state.status === "running" &&
-                args.format !== "json"
+                event.type === "message.updated" &&
+                event.properties.sessionID === sessionID &&
+                event.properties.info.role === "assistant" &&
+                args.format !== "json" &&
+                toggles.get("start") !== true
               ) {
-                if (toggles.get(part.id) === true) continue
-                await tool(part)
-                toggles.set(part.id, true)
-              }
-
-              if (part.type === "step-start") {
-                if (emit("step_start", { part })) continue
-              }
-
-              if (part.type === "step-finish") {
-                if (emit("step_finish", { part })) continue
-              }
-
-              if (part.type === "text" && part.time?.end) {
-                if (emit("text", { part })) continue
-                const text = part.text.trim()
-                if (!text) continue
-                if (!process.stdout.isTTY) {
-                  process.stdout.write(text + EOL)
-                  continue
-                }
                 UI.empty()
-                UI.println(text)
+                UI.println(`> ${event.properties.info.agent} · ${event.properties.info.modelID}`)
                 UI.empty()
+                toggles.set("start", true)
               }
 
-              if (part.type === "reasoning" && part.time?.end && thinking) {
-                if (emit("reasoning", { part })) continue
-                const text = part.text.trim()
-                if (!text) continue
-                const line = `Thinking: ${text}`
-                if (process.stdout.isTTY) {
-                  UI.empty()
-                  UI.println(`${UI.Style.TEXT_DIM}\u001b[3m${line}\u001b[0m${UI.Style.TEXT_NORMAL}`)
-                  UI.empty()
-                  continue
+              if (event.type === "message.part.updated") {
+                const part = event.properties.part
+                if (part.sessionID !== sessionID) continue
+
+                if (part.type === "tool" && (part.state.status === "completed" || part.state.status === "error")) {
+                  if (emit("tool_use", { part })) continue
+                  if (part.state.status === "completed") {
+                    await tool(part)
+                    continue
+                  }
+                  await toolError(part)
+                  UI.error(part.state.error)
                 }
-                process.stdout.write(line + EOL)
+
+                if (
+                  part.type === "tool" &&
+                  part.tool === "task" &&
+                  part.state.status === "running" &&
+                  args.format !== "json"
+                ) {
+                  if (toggles.get(part.id) === true) continue
+                  await tool(part)
+                  toggles.set(part.id, true)
+                }
+
+                if (part.type === "step-start") {
+                  if (emit("step_start", { part })) continue
+                }
+
+                if (part.type === "step-finish") {
+                  if (emit("step_finish", { part })) continue
+                }
+
+                if (part.type === "text" && part.time?.end) {
+                  if (emit("text", { part })) continue
+                  const text = part.text.trim()
+                  if (!text) continue
+                  if (!process.stdout.isTTY) {
+                    process.stdout.write(text + EOL)
+                    continue
+                  }
+                  UI.empty()
+                  UI.println(text)
+                  UI.empty()
+                }
+
+                if (part.type === "reasoning" && part.time?.end && thinking) {
+                  if (emit("reasoning", { part })) continue
+                  const text = part.text.trim()
+                  if (!text) continue
+                  const line = `Thinking: ${text}`
+                  if (process.stdout.isTTY) {
+                    UI.empty()
+                    UI.println(`${UI.Style.TEXT_DIM}\u001b[3m${line}\u001b[0m${UI.Style.TEXT_NORMAL}`)
+                    UI.empty()
+                    continue
+                  }
+                  process.stdout.write(line + EOL)
+                }
+              }
+
+              if (event.type === "session.error") {
+                const props = event.properties
+                if (props.sessionID !== sessionID || !props.error) continue
+                let err = String(props.error.name)
+                if ("data" in props.error && props.error.data && "message" in props.error.data) {
+                  err = String(props.error.data.message)
+                }
+                error = error ? error + EOL + err : err
+                if (emit("error", { error: props.error })) continue
+                UI.error(err)
+              }
+
+              if (
+                event.type === "session.status" &&
+                event.properties.sessionID === sessionID &&
+                event.properties.status.type === "idle"
+              ) {
+                idle = true
+                break
+              }
+
+              if (event.type === "permission.asked") {
+                // Tree membership covers any depth; prompts from parallel runs
+                // are ignored after the bounded ancestry check.
+                routePermission(event.properties)
+              }
+
+              // Disposal stops the session's work. A reconnect would only reach a new instance.
+              if (event.type === "server.instance.disposed" && args.attach) {
+                disposed = true
+                const message = "the server disposed the instance before the session became idle"
+                error = error ? error + EOL + message : message
+                UI.error(message)
+                break
               }
             }
-
-            if (event.type === "session.error") {
-              const props = event.properties
-              if (props.sessionID !== sessionID || !props.error) continue
-              let err = String(props.error.name)
-              if ("data" in props.error && props.error.data && "message" in props.error.data) {
-                err = String(props.error.data.message)
-              }
-              error = error ? error + EOL + err : err
-              if (emit("error", { error: props.error })) continue
-              UI.error(err)
+            if (!idle && !disposed && args.attach) {
+              const message = "lost the server event stream before the session became idle"
+              error = error ? error + EOL + message : message
+              UI.error(message)
             }
-
-            if (
-              event.type === "session.status" &&
-              event.properties.sessionID === sessionID &&
-              event.properties.status.type === "idle"
-            ) {
-              break
-            }
-
-            if (event.type === "permission.asked") {
-              const permission = event.properties
-              if (!sessions.has(permission.sessionID)) continue
-
-              if (auto) {
-                await client.permission.reply({
-                  requestID: permission.id,
-                  reply: "once",
-                })
-              } else {
-                UI.println(
-                  UI.Style.TEXT_WARNING_BOLD + "!",
-                  UI.Style.TEXT_NORMAL +
-                    `permission requested: ${permission.permission} (${permission.patterns.join(", ")}); auto-rejecting`,
-                )
-                await client.permission.reply({
-                  requestID: permission.id,
-                  reply: "reject",
-                })
-              }
-            }
+          } finally {
+            ancestryAbort.abort()
+            await recoveredPermissions
+            await Promise.allSettled(pendingPermissions.values())
           }
           return error
         }
@@ -831,13 +954,106 @@ export const RunCommand = effectCmd({
         await share(client, sessionID)
 
         if (!interactive) {
-          const events = await client.event.subscribe()
-          const completed = loop(client, events).catch((e) => {
-            console.error(e)
-            process.exitCode = 1
-          })
+          // Record requests pending before this run starts. Attach recovery answers only later requests.
+          const earlierPermissions = args.attach
+            ? await client.permission
+                .list(undefined, { throwOnError: true })
+                .then((response) => new Set((response.data ?? []).map((permission) => permission.id)))
+                .catch((failure) => {
+                  UI.error(`failed to list pending permissions; permission recovery is off (${String(failure)})`)
+                  return undefined
+                })
+            : new Set<string>()
+          // The run waits for idle, so a remote stream must not retry a server that is gone forever.
+          // Each stream ends on its first failure, or after a minute without the 10 second heartbeat.
+          let disconnect = new AbortController()
+          let silentIntervals = 0
+          const watchdog = args.attach
+            ? setInterval(() => {
+                silentIntervals += 1
+                if (silentIntervals >= 6) disconnect.abort()
+              }, 10_000)
+            : undefined
+          const subscribe = () => {
+            disconnect.abort()
+            disconnect = new AbortController()
+            silentIntervals = 0
+            return client.event.subscribe(
+              undefined,
+              args.attach
+                ? {
+                    signal: disconnect.signal,
+                    sseMaxRetryAttempts: 1,
+                    onSseEvent: () => {
+                      silentIntervals = 0
+                    },
+                  }
+                : undefined,
+            )
+          }
+          const first = await subscribe()
+          // An attached run opens a new stream a few times when one ends before the session is idle.
+          // The stream has no replay, so after each reconnect the run checks whether the session
+          // became idle while it was disconnected. Output and errors from that time are lost, so the
+          // run reports an error before the idle event and fails.
+          async function* events() {
+            yield* first.stream
+            let reconnects = 0
+            while (args.attach && reconnects < RECONNECT_ATTEMPTS) {
+              reconnects += 1
+              UI.println(
+                UI.Style.TEXT_WARNING_BOLD + "!",
+                UI.Style.TEXT_NORMAL + `event stream disconnected; reconnecting (${reconnects}/${RECONNECT_ATTEMPTS})`,
+              )
+              await Bun.sleep(Math.min(500 * 2 ** (reconnects - 1), 4_000))
+              for await (const event of (await subscribe()).stream) {
+                yield event
+                if (event.type !== "server.connected") continue
+                const signal = disconnect.signal
+                const status = await client.session
+                  .status(undefined, { signal, throwOnError: true })
+                  .catch((failure) => {
+                    if (!signal.aborted) UI.error(`failed to check the session status (${String(failure)})`)
+                    return undefined
+                  })
+                // Without a status, drop this stream so the next one checks again.
+                if (!status) {
+                  disconnect.abort()
+                  continue
+                }
+                // The new stream works, so a later drop starts a new reconnect budget.
+                reconnects = 0
+                if (status.data?.[sessionID]) continue
+                yield {
+                  id: "reconnected-error",
+                  type: "session.error" as const,
+                  properties: {
+                    sessionID,
+                    error: {
+                      name: "UnknownError" as const,
+                      data: {
+                        message:
+                          "session became idle while the event stream was disconnected; output from that time is missing",
+                      },
+                    },
+                  },
+                }
+                yield {
+                  id: "reconnected-idle",
+                  type: "session.status" as const,
+                  properties: { sessionID, status: { type: "idle" as const } },
+                }
+              }
+            }
+          }
+          const completed = loop(client, { stream: events() }, earlierPermissions)
+            .catch((e) => {
+              console.error(e)
+              process.exitCode = 1
+            })
+            .finally(() => clearInterval(watchdog))
+          // Background Task results arrive after the prompt returns. Wait until the session is idle.
           async function finish() {
-            if (args.attach) return
             const error = await completed
             if (error) process.exitCode = 1
           }
@@ -895,7 +1111,6 @@ export const RunCommand = effectCmd({
             initialInput,
             createSession: createFreshSession,
             thinking,
-            backgroundSubagents: flags.experimentalBackgroundSubagents,
             demo: args.demo,
           })
         } catch (error) {
@@ -932,7 +1147,6 @@ export const RunCommand = effectCmd({
             files,
             initialInput,
             thinking,
-            backgroundSubagents: flags.experimentalBackgroundSubagents,
             demo: args.demo,
           })
         } catch (error) {

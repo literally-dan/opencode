@@ -3,6 +3,7 @@ import { Permission } from "@/permission"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 
 import { Session } from "@/session/session"
+import { SessionAsk } from "@/session/ask"
 import { MessageV2 } from "@/session/message-v2"
 import { SessionPrompt } from "@/session/prompt"
 import { SessionRevert } from "@/session/revert"
@@ -20,7 +21,15 @@ import {
   WorkspaceRoutingQuery,
   WorkspaceRoutingQueryFields,
 } from "../middleware/workspace-routing"
-import { ApiNotFoundError, PermissionNotFoundError, SessionBusyError } from "../errors"
+import {
+  ApiNotFoundError,
+  ConflictError,
+  InvalidRequestError,
+  ModelNotFoundError,
+  PermissionNotFoundError,
+  SessionBusyError,
+  UpstreamError,
+} from "../errors"
 import { described } from "./metadata"
 import { QueryBoolean } from "./query"
 import { ProviderV2 } from "@opencode-ai/core/provider"
@@ -57,6 +66,15 @@ export const UpdatePayload = Schema.Struct({
   ),
 })
 export const ForkPayload = Schema.Struct(Struct.omit(Session.ForkInput.fields, ["sessionID"]))
+export const AbortQuery = Schema.Struct({
+  ...WorkspaceRoutingQueryFields,
+  scope: Schema.optional(
+    Schema.Literals(["turn", "all"]).annotate({
+      description:
+        "turn stops only the running turn, and background tasks keep running. all (the default) also cancels background tasks.",
+    }),
+  ),
+})
 export const InitPayload = Schema.Struct({
   modelID: ModelV2.ID,
   providerID: ProviderV2.ID,
@@ -67,6 +85,19 @@ export const SummarizePayload = Schema.Struct({
   modelID: ModelV2.ID,
   auto: Schema.optional(Schema.Boolean),
 })
+export const AskPayload = Schema.Struct(Struct.omit(SessionAsk.AskInput.fields, ["sessionID"]))
+const AskListLimit = Schema.NumberFromString.check(
+  Schema.isInt(),
+  Schema.isGreaterThanOrEqualTo(1),
+  Schema.isLessThanOrEqualTo(100),
+)
+const AskCursor = Schema.String.check(Schema.isMaxLength(512))
+export const AskThreadsQuery = Schema.Struct({
+  ...WorkspaceRoutingQueryFields,
+  limit: Schema.optional(AskListLimit),
+  before: Schema.optional(AskCursor),
+})
+export const AskThreadQuery = AskThreadsQuery
 export const PromptPayload = Schema.Struct(Struct.omit(SessionPrompt.PromptInput.fields, ["sessionID"]))
 export const CommandPayload = Schema.Struct(Struct.omit(SessionPrompt.CommandInput.fields, ["sessionID"]))
 export const ShellPayload = Schema.Struct(Struct.omit(SessionPrompt.ShellInput.fields, ["sessionID"]))
@@ -94,6 +125,10 @@ export const SessionPaths = {
   summarize: `${root}/:sessionID/summarize`,
   prompt: `${root}/:sessionID/message`,
   promptAsync: `${root}/:sessionID/prompt_async`,
+  ask: `${root}/:sessionID/ask`,
+  askThreads: `${root}/:sessionID/ask`,
+  askThread: `${root}/:sessionID/ask/:threadID`,
+  askCancel: `${root}/:sessionID/ask/:threadID/cancel`,
   command: `${root}/:sessionID/command`,
   shell: `${root}/:sessionID/shell`,
   revert: `${root}/:sessionID/revert`,
@@ -252,7 +287,7 @@ export const SessionApi = HttpApi.make("session")
         ),
         HttpApiEndpoint.post("abort", SessionPaths.abort, {
           params: { sessionID: SessionID },
-          query: WorkspaceRoutingQuery,
+          query: AbortQuery,
           success: described(Schema.Boolean, "Aborted session"),
           error: HttpApiError.BadRequest,
         }).annotateMerge(
@@ -340,6 +375,63 @@ export const SessionApi = HttpApi.make("session")
               "Create and send a new message to a session asynchronously, starting the session if needed and returning immediately.",
           }),
         ),
+        HttpApiEndpoint.post("ask", SessionPaths.ask, {
+          params: { sessionID: SessionID },
+          query: WorkspaceRoutingQuery,
+          payload: AskPayload,
+          success: described(SessionAsk.AskOutput, "Completed Ask turn"),
+          error: [
+            HttpApiError.BadRequest,
+            ApiNotFoundError,
+            InvalidRequestError,
+            ConflictError,
+            ModelNotFoundError,
+            UpstreamError,
+          ],
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "session.ask",
+            summary: "Ask without changing history",
+            description:
+              "Start or continue an isolated Ask thread using the current session context without changing session history.",
+          }),
+        ),
+        HttpApiEndpoint.get("askThreads", SessionPaths.askThreads, {
+          params: { sessionID: SessionID },
+          query: AskThreadsQuery,
+          success: described(SessionAsk.ThreadsOutput, "Ask threads"),
+          error: [HttpApiError.BadRequest, ApiNotFoundError],
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "session.askThreads",
+            summary: "List Ask threads",
+            description: "List isolated Ask threads for a session with cursor pagination.",
+          }),
+        ),
+        HttpApiEndpoint.get("askThread", SessionPaths.askThread, {
+          params: { sessionID: SessionID, threadID: SessionAsk.ID },
+          query: AskThreadQuery,
+          success: described(SessionAsk.TurnsOutput, "Ask turns"),
+          error: [HttpApiError.BadRequest, ApiNotFoundError],
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "session.askThread",
+            summary: "Get Ask thread",
+            description: "Get completed turns from an isolated Ask thread with cursor pagination.",
+          }),
+        ),
+        HttpApiEndpoint.post("askCancel", SessionPaths.askCancel, {
+          params: { sessionID: SessionID, threadID: SessionAsk.ID },
+          query: WorkspaceRoutingQuery,
+          success: described(Schema.Boolean, "Ask cancellation processed"),
+          error: [HttpApiError.BadRequest, ApiNotFoundError],
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "session.askCancel",
+            summary: "Cancel Ask turn",
+            description: "Cancel active work for one isolated Ask thread without cancelling session execution.",
+          }),
+        ),
         HttpApiEndpoint.post("command", SessionPaths.command, {
           params: { sessionID: SessionID },
           query: WorkspaceRoutingQuery,
@@ -377,7 +469,7 @@ export const SessionApi = HttpApi.make("session")
             identifier: "session.revert",
             summary: "Revert message",
             description:
-              "Revert a specific message in a session, undoing its effects and restoring the previous state.",
+              "Revert a specific message in a session, undoing its effects and restoring the previous state. Revert stops a running turn of the session itself, so clients do not need to abort first. Background tasks that the reverted messages started or resumed are cancelled, and other background tasks keep running. Returns 409 while another revert or unrevert of the session is in progress.",
           }),
         ),
         HttpApiEndpoint.post("unrevert", SessionPaths.unrevert, {
@@ -389,7 +481,8 @@ export const SessionApi = HttpApi.make("session")
           OpenApi.annotations({
             identifier: "session.unrevert",
             summary: "Restore reverted messages",
-            description: "Restore all previously reverted messages in a session.",
+            description:
+              "Restore all previously reverted messages in a session. Unrevert stops a running turn of the session itself, and background tasks keep running. Returns 409 while another revert or unrevert of the session is in progress.",
           }),
         ),
         HttpApiEndpoint.post("permissionRespond", SessionPaths.permissions, {

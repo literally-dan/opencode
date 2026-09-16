@@ -1,0 +1,16 @@
+Bulk-compact a large batch of fresh text and attachment-free tool parts by delegating the summarizing to a secondary model instead of writing each summary yourself. You give a `focus` and a list of `prt_…` ids; a secondary model (the same model running this session) reads them in transcript order — as ordered messages, with the request they served and their neighbouring turns for context — and writes one focus-guided summary per part. Each part is then replaced by its summary, still recoverable via `read_part`.
+
+Use this over `compact_results` when reclaiming a LOT at once (many parts, or large/old settled spans) and hand-summarizing each would burn tokens and attention. Use `compact_results` instead for a few surgical items, recent/load-bearing content, or when you already know the one-line conclusion.
+
+This tool is first-pass only. Already-compacted parts, file/media parts, and tool results with attachments are rejected because its text summarizer cannot safely inspect or refold them; inspect those parts and use `compact_results`.
+
+THE FOCUS IS EVERYTHING — it's the lens the secondary model summarizes through. Be specific about what you're doing AND what must survive: paths, identifiers, decisions, numbers, commands, errors, open questions. A vague focus ("my work") produces vague, lossy summaries; a sharp one produces summaries you can rely on later.
+
+PARAMETERS
+
+- `part_ids`: up to 128 `prt_…` ids to compact (from `list_context`). Order does not matter; they are always summarized in the order they occurred. Large batches are fine — they're split across several summarizer calls a turn at a time, one summary per part. Ineligible parts (the current message, the live request, pending or errored tools) are skipped and reported.
+- focus: what you're doing and the facts/values/threads that must be preserved.
+
+Every part is judged on its own, so one bad, oversized, truncated, or non-saving summary never costs you the rest of the batch. Each id comes back either compacted or skipped with the reason. A part reported as `deferred` hit this request's budget and was not touched — select it again in a follow-up call and it will compact normally. Persistence may still stop after an individual write failure; the result reports only writes that actually succeeded.
+
+Selecting a contiguous stretch beats scattered ids: neighbouring parts explain each other, and the summarizer sees that context. If the secondary model can't be resolved, it says so — fall back to `compact_results`. Never removes anything permanently; `read_part` recovers verbatim on demand.

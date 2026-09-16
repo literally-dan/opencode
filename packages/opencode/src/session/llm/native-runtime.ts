@@ -4,7 +4,7 @@ import { ProviderTransform } from "@/provider/transform"
 import { errorMessage } from "@/util/error"
 import { isRecord } from "@/util/record"
 import { asSchema, type ModelMessage, type Tool } from "ai"
-import { Cause, Effect, FiberSet, Queue } from "effect"
+import { Effect, Fiber, FiberSet } from "effect"
 import * as Stream from "effect/Stream"
 import { FetchHttpClient } from "effect/unstable/http"
 import {
@@ -32,6 +32,7 @@ type StreamInput = {
   readonly auth: Auth.Info | undefined
   readonly llmClient: LLMClientShape
   readonly messages: ModelMessage[]
+  readonly cachePrefixLimit?: number
   readonly tools: Record<string, Tool>
   readonly toolChoice?: "auto" | "required" | "none"
   readonly temperature?: number
@@ -87,11 +88,18 @@ export function stream(input: StreamInput): StreamResult {
   // — if a field ever needs to differ between the two surfaces, the
   // translation belongs here, not split across both packages.
   const tools = nativeTools(input.tools, input)
+  const messages = ProviderTransform.message(
+    input.messages,
+    input.model,
+    input.providerOptions ?? {},
+    input.cachePrefixLimit,
+  )
   const request = LLMNative.request({
     model: input.model,
     apiKey: current.apiKey,
     baseURL: current.baseURL,
-    messages: ProviderTransform.message(input.messages, input.model, input.providerOptions ?? {}),
+    messages,
+    cachePrefixLimit: ProviderTransform.cachePrefixLimit(messages),
     toolChoice: input.toolChoice,
     temperature: input.temperature,
     topP: input.topP,
@@ -103,38 +111,39 @@ export function stream(input: StreamInput): StreamResult {
   const stream = Stream.scoped(
     Stream.unwrap(
       Effect.gen(function* () {
-        const settlements = yield* FiberSet.make<void>()
-        const results = yield* Queue.unbounded<LLMEvent, Cause.Done>()
-        const provider = input.llmClient
+        const settlements = yield* FiberSet.make<ReadonlyArray<LLMEvent>>()
+        const pending: Fiber.Fiber<ReadonlyArray<LLMEvent>>[] = []
+        // Local tools run beside the provider stream. Emit their results before
+        // step-finish and finish: a consumer may stop at a step boundary, and a
+        // tool still running then would keep its side effects but lose its result.
+        const settled = Stream.suspend(() =>
+          Stream.fromIterableEffect(Fiber.joinAll(pending.splice(0)).pipe(Effect.map((events) => events.flat()))),
+        )
+        return input.llmClient
           .stream(
             LLMRequest.update(request, {
               tools: [...request.tools, ...toDefinitions(tools)],
             }),
           )
           .pipe(
-            Stream.flatMap((event) =>
-              event.type !== "tool-call" || event.providerExecuted
-                ? Stream.make(event)
-                : Stream.make(event).pipe(
-                    Stream.concat(
-                      Stream.fromEffectDrain(
-                        ToolRuntime.dispatch(tools, event).pipe(
-                          Effect.flatMap((dispatched) => Queue.offerAll(results, dispatched.events)),
-                          Effect.catchCause((cause) => Queue.failCause(results, cause)),
-                          Effect.asVoid,
-                          FiberSet.run(settlements, { startImmediately: true }),
-                        ),
-                      ),
+            Stream.flatMap((event) => {
+              if (event.type === "step-finish" || event.type === "finish")
+                return settled.pipe(Stream.concat(Stream.make(event)))
+              if (event.type !== "tool-call" || event.providerExecuted) return Stream.make(event)
+              return Stream.make(event).pipe(
+                Stream.concat(
+                  Stream.fromEffectDrain(
+                    ToolRuntime.dispatch(tools, event).pipe(
+                      Effect.map((dispatched) => dispatched.events),
+                      FiberSet.run(settlements, { startImmediately: true }),
+                      Effect.tap((fiber) => Effect.sync(() => pending.push(fiber))),
                     ),
                   ),
-            ),
-            Stream.concat(
-              Stream.fromEffectDrain(
-                FiberSet.awaitEmpty(settlements).pipe(Effect.andThen(Queue.end(results)), Effect.asVoid),
-              ),
-            ),
+                ),
+              )
+            }),
+            Stream.concat(settled),
           )
-        return provider.pipe(Stream.concat(Stream.fromQueue(results)))
       }),
     ),
   )

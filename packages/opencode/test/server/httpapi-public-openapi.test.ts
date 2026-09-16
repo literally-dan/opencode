@@ -6,10 +6,15 @@ type Method = "get" | "post" | "put" | "delete" | "patch"
 type OpenApiSchema = {
   readonly $ref?: string
   readonly anyOf?: ReadonlyArray<OpenApiSchema>
+  readonly oneOf?: ReadonlyArray<OpenApiSchema>
   readonly type?: string
   readonly enum?: readonly unknown[]
   readonly properties?: Record<string, OpenApiSchema>
   readonly required?: readonly string[]
+  readonly minLength?: number
+  readonly maxLength?: number
+  readonly minimum?: number
+  readonly maximum?: number
   readonly contentSchema?: OpenApiSchema
   readonly contentMediaType?: string
 }
@@ -18,14 +23,18 @@ type OpenApiResponse = {
   readonly content?: Record<string, { readonly schema?: OpenApiSchema }>
 }
 type OpenApiOperation = {
+  readonly operationId?: string
   readonly parameters?: ReadonlyArray<{
     readonly name: string
     readonly in: string
     readonly required?: boolean
-    readonly schema?: { readonly type?: string }
+    readonly schema?: OpenApiSchema
   }>
   readonly responses?: Record<string, OpenApiResponse>
-  readonly requestBody?: { readonly required?: boolean }
+  readonly requestBody?: {
+    readonly required?: boolean
+    readonly content?: Record<string, { readonly schema?: OpenApiSchema }>
+  }
   readonly security?: unknown
 }
 type OpenApiPathItem = Partial<Record<Method, OpenApiOperation>>
@@ -55,6 +64,11 @@ function responseRef(response: OpenApiResponse | undefined) {
 
 function componentName(ref: string) {
   return ref.replace("#/components/schemas/", "")
+}
+
+function resolveSchema(spec: OpenApiSpec, schema: OpenApiSchema | undefined) {
+  if (!schema?.$ref) return schema
+  return spec.components.schemas[componentName(schema.$ref)]
 }
 
 function componentNames(response: OpenApiResponse | undefined) {
@@ -106,6 +120,12 @@ describe("PublicApi OpenAPI v2 errors", () => {
 
     expect(spec.components.schemas.V2Event1).toBeUndefined()
     expect(spec.components.schemas.V2Event?.anyOf?.length).toBeGreaterThan(0)
+    expect(spec.components.schemas.V2Event?.anyOf?.map((schema) => schema.$ref)).not.toContain(
+      "#/components/schemas/EventSessionAskToolActivity",
+    )
+    expect(spec.components.schemas.Event?.anyOf?.map((schema) => schema.$ref)).toContain(
+      "#/components/schemas/EventSessionAskToolActivity",
+    )
     expect(spec.components.schemas.V2EventStream).toMatchObject({
       type: "string",
       contentMediaType: "application/json",
@@ -170,6 +190,20 @@ describe("PublicApi OpenAPI v2 errors", () => {
     ]) {
       expect(spec.paths[path]?.post?.requestBody?.required, path).toBe(true)
     }
+  })
+
+  test("normalizes legacy Ask validation errors to runtime BadRequest schemas", () => {
+    const spec = OpenApi.fromApi(PublicApi) as OpenApiSpec
+    const ask = spec.paths["/session/{sessionID}/ask"]?.post?.responses?.["400"]?.content?.["application/json"]?.schema
+    const askRefs = (ask?.anyOf ?? ask?.oneOf ?? []).map((schema) => schema.$ref)
+    const cancel =
+      spec.paths["/session/{sessionID}/ask/{threadID}/cancel"]?.post?.responses?.["400"]?.content?.["application/json"]
+        ?.schema
+
+    expect(askRefs).toEqual(["#/components/schemas/BadRequestError", "#/components/schemas/InvalidRequestError"])
+    expect(askRefs).not.toContain("#/components/schemas/EffectHttpApiErrorBadRequest")
+    expect(askRefs).not.toContain("#/components/schemas/effect_HttpApiError_BadRequest")
+    expect(cancel?.$ref).toBe("#/components/schemas/BadRequestError")
   })
 
   test("does not rewrite /api endpoint errors to legacy error components", () => {
@@ -272,6 +306,50 @@ describe("PublicApi OpenAPI v2 errors", () => {
       expect(componentName(responseRef(spec.paths[route[1]]?.[route[0]]?.responses?.["409"]) ?? "")).toBe(
         "SessionBusyError",
       )
+    }
+  })
+
+  test("documents Ask request IDs in input, output, and tool activity events", () => {
+    const spec = OpenApi.fromApi(PublicApi) as OpenApiSpec
+    const operation = spec.paths["/session/{sessionID}/ask"]?.post
+    const input = resolveSchema(spec, operation?.requestBody?.content?.["application/json"]?.schema)
+    const output = resolveSchema(spec, operation?.responses?.["200"]?.content?.["application/json"]?.schema)
+    const event = spec.components.schemas.EventSessionAskToolActivity?.properties?.properties
+
+    expect(resolveSchema(spec, input?.properties?.requestID)).toMatchObject({
+      type: "string",
+      minLength: 1,
+      maxLength: 128,
+    })
+    expect(input?.required).not.toContain("requestID")
+    expect(resolveSchema(spec, output?.properties?.requestID)).toMatchObject({
+      type: "string",
+      minLength: 1,
+      maxLength: 128,
+    })
+    expect(output?.required).toContain("requestID")
+    expect(resolveSchema(spec, event?.properties?.requestID)).toMatchObject({
+      type: "string",
+      minLength: 1,
+      maxLength: 128,
+    })
+    expect(event?.required).toContain("requestID")
+  })
+
+  test("documents bounded numeric Ask pagination parameters", () => {
+    const spec = OpenApi.fromApi(PublicApi) as OpenApiSpec
+
+    for (const path of ["/session/{sessionID}/ask", "/session/{sessionID}/ask/{threadID}"]) {
+      const parameters = spec.paths[path]?.get?.parameters
+      expect(parameters?.find((parameter) => parameter.name === "limit")?.schema, path).toEqual({
+        type: "integer",
+        minimum: 1,
+        maximum: 100,
+      })
+      expect(parameters?.find((parameter) => parameter.name === "before")?.schema, path).toEqual({
+        type: "string",
+        maxLength: 512,
+      })
     }
   })
 

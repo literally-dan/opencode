@@ -1,12 +1,15 @@
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test"
 import { OpencodeClient, type GlobalEvent } from "@opencode-ai/sdk/v2"
-import { createSessionTransport } from "@/cli/cmd/run/stream.transport"
+import { NamedError } from "@opencode-ai/core/util/error"
+import { createSessionTransport, formatUnknownError, ShownTurnError } from "@/cli/cmd/run/stream.transport"
+import { canInterruptRun } from "@/cli/cmd/run/footer"
 import type { FooterApi, FooterEvent, LocalReplayRow, RunFilePart, StreamCommit } from "@/cli/cmd/run/types"
 
 type EventStream = Awaited<ReturnType<OpencodeClient["event"]["subscribe"]>>["stream"]
 type GlobalEventStream = Awaited<ReturnType<OpencodeClient["global"]["event"]>>["stream"]
 type SdkEvent = EventStream extends AsyncGenerator<infer T, unknown, unknown> ? T : never
 type SessionMessage = NonNullable<Awaited<ReturnType<OpencodeClient["session"]["messages"]>>["data"]>[number]
+type AssistantSessionMessage = NonNullable<Awaited<ReturnType<OpencodeClient["session"]["prompt"]>>["data"]>
 type SessionChild = NonNullable<Awaited<ReturnType<OpencodeClient["session"]["children"]>>["data"]>[number]
 type SessionToolPart = Extract<SessionMessage["parts"][number], { type: "tool" }>
 type SessionStatusMap = NonNullable<Awaited<ReturnType<OpencodeClient["session"]["status"]>>["data"]>
@@ -40,6 +43,15 @@ async function waitFor<T>(check: () => T | undefined, timeout = 1_000): Promise<
   }
 
   throw new Error("timed out waiting for value")
+}
+
+// The footer phase set by the latest transport event that changes it.
+function footerPhase(events: FooterEvent[]) {
+  const item = events.findLast(
+    (event) => event.type === "turn.wait" || (event.type === "stream.patch" && event.patch.phase !== undefined),
+  )
+  if (item?.type === "stream.patch") return item.patch.phase
+  return item ? "running" : undefined
 }
 
 function busy(sessionID = "session-1") {
@@ -161,6 +173,18 @@ function ok<T>(data: T) {
   })
 }
 
+// A prompt request returns when its turn finishes. Tests that need an active turn hold the request until it is aborted.
+function untilAborted(signal: AbortSignal | null | undefined) {
+  return new Promise<void>((resolve) => {
+    if (signal?.aborted) {
+      resolve()
+      return
+    }
+
+    signal?.addEventListener("abort", () => resolve(), { once: true })
+  })
+}
+
 function sse(stream: EventStream) {
   return Promise.resolve({ stream })
 }
@@ -186,7 +210,11 @@ function statusMap(busy: boolean): SessionStatusMap {
   return {}
 }
 
-function assistantMessage(input: { sessionID: string; id: string; parts: SessionMessage["parts"] }): SessionMessage {
+function assistantMessage(input: {
+  sessionID: string
+  id: string
+  parts: SessionMessage["parts"]
+}): AssistantSessionMessage {
   return {
     info: {
       id: input.id,
@@ -348,7 +376,7 @@ function textDelta(messageID: string, partID: string, delta: string, sessionID =
   }
 }
 
-function child(id: string): SessionChild {
+function session(id: string): SessionChild {
   return {
     id,
     slug: id,
@@ -360,6 +388,15 @@ function child(id: string): SessionChild {
       created: 1,
       updated: 1,
     },
+  }
+}
+
+function child(id: string, parentID = "session-1", input: Partial<SessionChild> = {}): SessionChild {
+  return {
+    ...session(id),
+    parentID,
+    taskParentID: parentID,
+    ...input,
   }
 }
 
@@ -419,8 +456,9 @@ function sdk(
     globalStream?: GlobalEventStream
     subscribe?: OpencodeClient["event"]["subscribe"]
     globalEvent?: OpencodeClient["global"]["event"]
-    promptAsync?: OpencodeClient["session"]["promptAsync"]
+    prompt?: OpencodeClient["session"]["prompt"]
     status?: OpencodeClient["session"]["status"]
+    get?: OpencodeClient["session"]["get"]
     messages?: OpencodeClient["session"]["messages"]
     children?: OpencodeClient["session"]["children"]
     permissions?: OpencodeClient["permission"]["list"]
@@ -432,8 +470,10 @@ function sdk(
   const subscribe: OpencodeClient["event"]["subscribe"] = input.subscribe ?? (() => sse(input.stream ?? emptyStream()))
   const globalEvent: OpencodeClient["global"]["event"] =
     input.globalEvent ?? (() => globalSse(input.globalStream ?? wrapGlobalStream(input.stream ?? emptyStream())))
-  const promptAsync: OpencodeClient["session"]["promptAsync"] = input.promptAsync ?? (() => ok(undefined))
+  const prompt: OpencodeClient["session"]["prompt"] =
+    input.prompt ?? (() => ok(assistantMessage({ sessionID: "session-1", id: "msg-1", parts: [] })))
   const status: OpencodeClient["session"]["status"] = input.status ?? (() => ok({}))
+  const get: OpencodeClient["session"]["get"] = input.get ?? (({ sessionID }) => ok(session(sessionID)))
   const messages: OpencodeClient["session"]["messages"] = input.messages ?? (() => ok([]))
   const children: OpencodeClient["session"]["children"] = input.children ?? (() => ok([]))
   const permissions: OpencodeClient["permission"]["list"] = input.permissions ?? (() => ok([]))
@@ -441,8 +481,9 @@ function sdk(
 
   spyOn(client.event, "subscribe").mockImplementation(subscribe)
   spyOn(client.global, "event").mockImplementation(globalEvent)
-  spyOn(client.session, "promptAsync").mockImplementation(promptAsync)
+  spyOn(client.session, "prompt").mockImplementation(prompt)
   spyOn(client.session, "status").mockImplementation(status)
+  spyOn(client.session, "get").mockImplementation(get)
   spyOn(client.session, "messages").mockImplementation(messages)
   spyOn(client.session, "children").mockImplementation(children)
   spyOn(client.permission, "list").mockImplementation(permissions)
@@ -450,6 +491,24 @@ function sdk(
 
   return client
 }
+
+describe("formatUnknownError", () => {
+  test("shows the message and reference of a server error", () => {
+    const body = new NamedError.Unknown({
+      message: "Unexpected server error. Check server logs for details.",
+      ref: "err_1234abcd",
+    }).toObject()
+    const shown = "Unexpected server error. Check server logs for details. (ref: err_1234abcd)"
+
+    expect(formatUnknownError(body)).toBe(shown)
+    expect(formatUnknownError(new NamedError.Unknown(body.data))).toBe(shown)
+    // With throwOnError, the SDK throws an Error that keeps the response body in `cause`.
+    expect(formatUnknownError(new Error(body.data.message, { cause: { body, status: 500 } }))).toBe(shown)
+    expect(formatUnknownError({ name: "UnknownError", data: { message: "boom" } })).toBe("boom")
+    expect(formatUnknownError(new Error("plain failure"))).toBe("plain failure")
+    expect(formatUnknownError({ name: "BadRequest" })).toBe("BadRequest")
+  })
+})
 
 describe("run stream transport", () => {
   test("does not replay persisted main-session history during bootstrap by default", async () => {
@@ -851,84 +910,6 @@ describe("run stream transport", () => {
     }
   })
 
-  test("keeps coalescing resize requests while buffered events drain", async () => {
-    const src = eventFeed()
-    const ui = footer()
-    const firstReset = defer()
-    const statusGate = defer()
-    const statusStarted = defer()
-    let blockStatus = false
-    const trace = mock((_type: string, _data?: unknown) => {})
-    const resetA = mock(() => firstReset.promise)
-    const resetB = mock(() => Promise.resolve())
-    const resetC = mock(() => Promise.resolve())
-    const transport = await createSessionTransport({
-      sdk: sdk({
-        stream: src.stream,
-        status: async () => {
-          if (blockStatus) {
-            statusStarted.resolve()
-            await statusGate.promise
-          }
-          return ok(statusMap(true))
-        },
-      }),
-      sessionID: "session-1",
-      thinking: true,
-      replay: true,
-      limits: () => ({}),
-      footer: ui.api,
-      trace: { write: trace },
-    })
-    const turn = transport.runPromptTurn({
-      agent: undefined,
-      model: undefined,
-      variant: undefined,
-      prompt: { text: "active", parts: [] },
-      files: [],
-      includeFiles: false,
-    })
-
-    try {
-      await waitFor(() => ui.events.find((event) => event.type === "turn.wait"))
-      const active = transport.replayOnResize({ localRows: () => [], reset: resetA })
-      await waitFor(() => (resetA.mock.calls.length === 1 ? true : undefined))
-      blockStatus = true
-      src.push(busy())
-      src.push(idle())
-      await waitFor(() => (trace.mock.calls.filter((call) => call[0] === "recv.event").length >= 2 ? true : undefined))
-
-      expect(await transport.replayOnResize({ localRows: () => [], reset: resetB })).toBe(false)
-      firstReset.resolve()
-      await Promise.race([
-        statusStarted.promise,
-        Bun.sleep(1_000).then(() => {
-          throw new Error("timed out waiting for buffered status drain")
-        }),
-      ])
-
-      expect(await transport.replayOnResize({ localRows: () => [], reset: resetC })).toBe(false)
-      expect(resetC).not.toHaveBeenCalled()
-      blockStatus = false
-      statusGate.resolve()
-
-      expect(
-        await Promise.race([
-          active,
-          Bun.sleep(1_000).then(() => {
-            throw new Error("timed out waiting for trailing resize replay")
-          }),
-        ]),
-      ).toBe(true)
-      expect(resetB).not.toHaveBeenCalled()
-      expect(resetC).toHaveBeenCalledTimes(1)
-    } finally {
-      src.close()
-      await transport.close()
-      await turn
-    }
-  })
-
   test("preserves assistant deltas not yet persisted when replaying during a live stream", async () => {
     const src = eventFeed()
     const ui = footer()
@@ -1183,7 +1164,7 @@ describe("run stream transport", () => {
     }
   })
 
-  test("keeps completed historical subagent tabs during bootstrap", async () => {
+  test("uses bootstrap status to distinguish completed history from a running async Task", async () => {
     const src = eventFeed()
     const ui = footer()
     const transport = await createSessionTransport({
@@ -1213,11 +1194,26 @@ describe("run stream transport", () => {
                     sessionId: "child-1",
                   },
                 }),
+                completedTool({
+                  sessionID: "session-1",
+                  messageID: "msg-1",
+                  id: "task-2",
+                  callID: "call-2",
+                  tool: "task",
+                  body: {
+                    description: "Inspect async task",
+                    subagent_type: "general",
+                  },
+                  metadata: {
+                    sessionId: "child-2",
+                  },
+                }),
               ],
             }),
           ])
         },
-        children: async () => ok([child("child-1")]),
+        children: async () => ok([child("child-1"), child("child-2")]),
+        status: async () => ok({ "child-2": { type: "busy" } }),
       }),
       sessionID: "session-1",
       thinking: true,
@@ -1231,8 +1227,351 @@ describe("run stream transport", () => {
         return item?.type === "stream.subagent" ? item.state : undefined
       })
 
-      expect(state.tabs).toEqual([expect.objectContaining({ sessionID: "child-1", status: "completed" })])
+      expect(state.tabs).toEqual([
+        expect.objectContaining({ sessionID: "child-2", status: "running" }),
+        expect.objectContaining({ sessionID: "child-1", status: "completed" }),
+      ])
       expect(state.details).toEqual({})
+    } finally {
+      src.close()
+      await transport.close()
+    }
+  })
+
+  test("bootstraps a busy grandchild from descendant history without blockers", async () => {
+    const src = eventFeed()
+    const ui = footer()
+    const transport = await createSessionTransport({
+      sdk: sdk({
+        stream: src.stream,
+        messages: async ({ sessionID }) => {
+          if (sessionID === "session-1") {
+            return ok([
+              assistantMessage({
+                sessionID,
+                id: "msg-root",
+                parts: [
+                  completedTool({
+                    sessionID,
+                    messageID: "msg-root",
+                    id: "task-child",
+                    callID: "call-child",
+                    tool: "task",
+                    body: { description: "Inspect child", subagent_type: "general" },
+                    metadata: { sessionId: "child-1" },
+                  }),
+                ],
+              }),
+            ])
+          }
+          if (sessionID === "child-1") {
+            return ok([
+              assistantMessage({
+                sessionID,
+                id: "msg-child",
+                parts: [
+                  completedTool({
+                    sessionID,
+                    messageID: "msg-child",
+                    id: "task-grandchild",
+                    callID: "call-grandchild",
+                    tool: "task",
+                    body: { description: "Inspect grandchild", subagent_type: "explore" },
+                    metadata: { sessionId: "grandchild-1" },
+                  }),
+                ],
+              }),
+            ])
+          }
+          return ok([])
+        },
+        children: async ({ sessionID }) => {
+          if (sessionID === "session-1") return ok([child("child-1")])
+          if (sessionID === "child-1") return ok([child("grandchild-1", "child-1")])
+          return ok([])
+        },
+        status: async () => ok({ "grandchild-1": { type: "busy" } }),
+      }),
+      sessionID: "session-1",
+      thinking: true,
+      limits: () => ({}),
+      footer: ui.api,
+    })
+
+    try {
+      const state = await waitFor(() => {
+        const item = ui.events.findLast((event) => event.type === "stream.subagent")
+        const state = item?.type === "stream.subagent" ? item.state : undefined
+        return state?.tabs.some((tab) => tab.sessionID === "grandchild-1") ? state : undefined
+      })
+
+      expect(state.tabs).toEqual([
+        expect.objectContaining({ sessionID: "grandchild-1", status: "running" }),
+        expect.objectContaining({ sessionID: "child-1", status: "completed" }),
+      ])
+      expect(state.permissions).toEqual([])
+      expect(state.questions).toEqual([])
+      expect(
+        canInterruptRun(
+          {
+            phase: "idle",
+            status: "idle",
+            queue: 0,
+            model: "test-model",
+            duration: "0s",
+            usage: "",
+            first: false,
+            interrupt: 0,
+            exit: 0,
+          },
+          state,
+        ),
+      ).toBe(true)
+    } finally {
+      src.close()
+      await transport.close()
+    }
+  })
+
+  test("drains a grandchild idle event buffered during delayed history bootstrap", async () => {
+    const src = eventFeed()
+    const ui = footer()
+    const trace = mock((_type: string, _data?: unknown) => {})
+    const historyStarted = Promise.withResolvers<void>()
+    const historyRelease = Promise.withResolvers<void>()
+    const transport = await createSessionTransport({
+      sdk: sdk({
+        stream: src.stream,
+        messages: async ({ sessionID }) => {
+          if (sessionID === "session-1") {
+            return ok([
+              assistantMessage({
+                sessionID,
+                id: "msg-root",
+                parts: [
+                  completedTool({
+                    sessionID,
+                    messageID: "msg-root",
+                    id: "task-child",
+                    callID: "call-child",
+                    tool: "task",
+                    body: { description: "Inspect child", subagent_type: "general" },
+                    metadata: { sessionId: "child-1" },
+                  }),
+                ],
+              }),
+            ])
+          }
+          if (sessionID === "child-1") {
+            historyStarted.resolve()
+            await historyRelease.promise
+            return ok([
+              assistantMessage({
+                sessionID,
+                id: "msg-child",
+                parts: [
+                  completedTool({
+                    sessionID,
+                    messageID: "msg-child",
+                    id: "task-grandchild",
+                    callID: "call-grandchild",
+                    tool: "task",
+                    body: { description: "Inspect grandchild", subagent_type: "explore" },
+                    metadata: { sessionId: "grandchild-1" },
+                  }),
+                ],
+              }),
+            ])
+          }
+          return ok([])
+        },
+        children: async ({ sessionID }) => {
+          if (sessionID === "session-1") return ok([child("child-1")])
+          if (sessionID === "child-1") return ok([child("grandchild-1", "child-1")])
+          return ok([])
+        },
+        status: async () => ok({ "grandchild-1": { type: "busy" } }),
+      }),
+      sessionID: "session-1",
+      thinking: true,
+      limits: () => ({}),
+      footer: ui.api,
+      trace: { write: trace },
+    })
+
+    try {
+      await historyStarted.promise
+      src.push(idle("grandchild-1"))
+      await waitFor(() =>
+        trace.mock.calls.some(
+          (call) => call[0] === "recv.event" && (call[1] as SdkEvent | undefined)?.id === "evt-grandchild-1-idle",
+        )
+          ? true
+          : undefined,
+      )
+      historyRelease.resolve()
+
+      const state = await waitFor(() => {
+        const item = ui.events.findLast((event) => event.type === "stream.subagent")
+        const state = item?.type === "stream.subagent" ? item.state : undefined
+        return state?.tabs.some((tab) => tab.sessionID === "grandchild-1" && tab.status === "completed")
+          ? state
+          : undefined
+      })
+
+      expect(state.tabs).toEqual([
+        expect.objectContaining({ sessionID: "grandchild-1", status: "completed" }),
+        expect.objectContaining({ sessionID: "child-1", status: "completed" }),
+      ])
+      expect(state.permissions).toEqual([])
+      expect(state.questions).toEqual([])
+    } finally {
+      historyRelease.resolve()
+      src.close()
+      await transport.close()
+    }
+  })
+
+  test("continues bootstrap with partial descendants when one branch fails", async () => {
+    const src = eventFeed()
+    const ui = footer()
+    const trace = mock((_type: string, _data?: unknown) => {})
+    const transport = await createSessionTransport({
+      sdk: sdk({
+        stream: src.stream,
+        children: async ({ sessionID }) => {
+          if (sessionID === "session-1") return ok([child("child-1")])
+          throw new Error("child lookup unavailable")
+        },
+        permissions: async () =>
+          ok([
+            {
+              id: "perm-partial",
+              sessionID: "child-1",
+              permission: "edit",
+              patterns: ["src/partial.ts"],
+              metadata: {},
+              always: [],
+            },
+          ]),
+      }),
+      sessionID: "session-1",
+      thinking: true,
+      limits: () => ({}),
+      footer: ui.api,
+      trace: { write: trace },
+    })
+
+    try {
+      const state = await waitFor(() => {
+        const item = ui.events.findLast((event) => event.type === "stream.subagent")
+        const state = item?.type === "stream.subagent" ? item.state : undefined
+        return state?.permissions.some((permission) => permission.id === "perm-partial") ? state : undefined
+      })
+      expect(state.tabs).toEqual([expect.objectContaining({ sessionID: "child-1" })])
+      expect(trace).toHaveBeenCalledWith("bootstrap.descendants.partial", {
+        failures: ["child-1"],
+        descendants: ["child-1"],
+      })
+    } finally {
+      src.close()
+      await transport.close()
+    }
+  })
+
+  test("does not bootstrap blockers from a parent-only child", async () => {
+    const src = eventFeed()
+    const ui = footer()
+    const transport = await createSessionTransport({
+      sdk: sdk({
+        stream: src.stream,
+        children: async () => ok([child("history-1", "session-1", { taskParentID: undefined })]),
+        permissions: async () =>
+          ok([
+            {
+              id: "perm-history",
+              sessionID: "history-1",
+              permission: "edit",
+              patterns: ["src/history.ts"],
+              metadata: {},
+              always: [],
+            },
+          ]),
+      }),
+      sessionID: "session-1",
+      thinking: true,
+      limits: () => ({}),
+      footer: ui.api,
+    })
+
+    try {
+      const item = ui.events.findLast((event) => event.type === "stream.subagent")
+      const state = item?.type === "stream.subagent" ? item.state : undefined
+      expect(state?.tabs).toEqual([])
+      expect(state?.permissions).toEqual([])
+    } finally {
+      src.close()
+      await transport.close()
+    }
+  })
+
+  test("bootstraps blockers from a grandchild session", async () => {
+    const src = eventFeed()
+    const ui = footer()
+    const transport = await createSessionTransport({
+      sdk: sdk({
+        stream: src.stream,
+        children: async ({ sessionID }) => {
+          if (sessionID === "session-1") return ok([child("child-1")])
+          if (sessionID === "child-1") return ok([child("grandchild-1", "child-1")])
+          return ok([])
+        },
+        permissions: async () =>
+          ok([
+            {
+              id: "perm-grandchild",
+              sessionID: "grandchild-1",
+              permission: "edit",
+              patterns: ["src/nested.ts"],
+              metadata: {},
+              always: [],
+            },
+          ]),
+        questions: async () =>
+          ok([
+            {
+              id: "question-grandchild",
+              sessionID: "grandchild-1",
+              questions: [
+                {
+                  question: "Which file?",
+                  header: "File",
+                  options: [{ label: "nested.ts", description: "Use the nested file." }],
+                  multiple: false,
+                },
+              ],
+            },
+          ]),
+      }),
+      sessionID: "session-1",
+      thinking: true,
+      limits: () => ({}),
+      footer: ui.api,
+    })
+
+    try {
+      const state = await waitFor(() => {
+        const item = ui.events.findLast((event) => event.type === "stream.subagent")
+        const state = item?.type === "stream.subagent" ? item.state : undefined
+        return state?.permissions.some((permission) => permission.id === "perm-grandchild") &&
+          state.questions.some((question) => question.id === "question-grandchild")
+          ? state
+          : undefined
+      })
+
+      expect(state.tabs).toEqual([expect.objectContaining({ sessionID: "grandchild-1" })])
+      expect(state.permissions[0]?.sessionID).toBe("grandchild-1")
+      expect(state.questions[0]?.sessionID).toBe("grandchild-1")
     } finally {
       src.close()
       await transport.close()
@@ -1786,26 +2125,25 @@ describe("run stream transport", () => {
           questionCalls += 1
           return ok(questionCalls > 1 ? [request] : [])
         },
-        promptAsync: async () => {
-          queueMicrotask(() => {
-            src.push(busy())
-            src.push(assistant("msg-1"))
-            src.push(
-              toolUpdated(
-                runningTool({
-                  sessionID: "session-1",
-                  messageID: "msg-1",
-                  id: "question-tool-1",
-                  callID: "call-question-1",
-                  tool: "question",
-                  body: {
-                    questions: request.questions,
-                  },
-                }),
-              ),
-            )
-          })
-          return ok(undefined)
+        prompt: async (_input, opt) => {
+          src.push(busy())
+          src.push(assistant("msg-1"))
+          src.push(
+            toolUpdated(
+              runningTool({
+                sessionID: "session-1",
+                messageID: "msg-1",
+                id: "question-tool-1",
+                callID: "call-question-1",
+                tool: "question",
+                body: {
+                  questions: request.questions,
+                },
+              }),
+            ),
+          )
+          await untilAborted(opt?.signal)
+          return ok(assistantMessage({ sessionID: "session-1", id: "msg-1", parts: [] }))
         },
       }),
       sessionID: "session-1",
@@ -1920,26 +2258,25 @@ describe("run stream transport", () => {
 
           return ok([])
         },
-        promptAsync: async () => {
-          queueMicrotask(() => {
-            src.push(busy())
-            src.push(assistant("msg-1"))
-            src.push(
-              toolUpdated(
-                runningTool({
-                  sessionID: "session-1",
-                  messageID: "msg-1",
-                  id: "question-race-tool-1",
-                  callID: "call-question-race-1",
-                  tool: "question",
-                  body: {
-                    questions: request.questions,
-                  },
-                }),
-              ),
-            )
-          })
-          return ok(undefined)
+        prompt: async (_input, opt) => {
+          src.push(busy())
+          src.push(assistant("msg-1"))
+          src.push(
+            toolUpdated(
+              runningTool({
+                sessionID: "session-1",
+                messageID: "msg-1",
+                id: "question-race-tool-1",
+                callID: "call-question-race-1",
+                tool: "question",
+                body: {
+                  questions: request.questions,
+                },
+              }),
+            ),
+          )
+          await untilAborted(opt?.signal)
+          return ok(assistantMessage({ sessionID: "session-1", id: "msg-1", parts: [] }))
         },
       }),
       sessionID: "session-1",
@@ -2019,13 +2356,9 @@ describe("run stream transport", () => {
     const transport = await createSessionTransport({
       sdk: sdk({
         stream: src.stream,
-        promptAsync: async (input) => {
+        prompt: async (input) => {
           seen.push(input)
-          queueMicrotask(() => {
-            src.push(busy())
-            src.push(idle())
-          })
-          return ok(undefined)
+          return ok(assistantMessage({ sessionID: "session-1", id: "msg-1", parts: [] }))
         },
       }),
       sessionID: "session-1",
@@ -2067,21 +2400,119 @@ describe("run stream transport", () => {
     }
   })
 
-  test("falls back to session status polling when idle events are missing", async () => {
+  test("shows a background result turn as running from root session status while no local turn runs", async () => {
     const src = eventFeed()
     const ui = footer()
-    let busy = true
+    const transport = await createSessionTransport({
+      sdk: sdk({ stream: src.stream }),
+      sessionID: "session-1",
+      thinking: true,
+      limits: () => ({}),
+      footer: ui.api,
+    })
+    const phase = () => footerPhase(ui.events)
+    const interruptible = () =>
+      canInterruptRun(
+        {
+          phase: phase() ?? "idle",
+          status: "",
+          queue: 0,
+          model: "test-model",
+          duration: "",
+          usage: "",
+          first: false,
+          interrupt: 0,
+          exit: 0,
+        },
+        { tabs: [], details: {}, permissions: [], questions: [] },
+      )
+
+    try {
+      // A delivered background Task result starts a root turn without a local prompt.
+      src.push(busy())
+      await waitFor(() => (phase() === "running" ? true : undefined))
+      expect(interruptible()).toBe(true)
+
+      src.push(idle())
+      await waitFor(() => (phase() === "idle" ? true : undefined))
+      expect(interruptible()).toBe(false)
+
+      src.push(retry("session-1", 1, "rate limited"))
+      await waitFor(() => (phase() === "running" ? true : undefined))
+      expect(interruptible()).toBe(true)
+    } finally {
+      src.close()
+      await transport.close()
+    }
+  })
+
+  test("leaves the footer phase to an active local turn when root session status changes", async () => {
+    const src = eventFeed()
+    const ui = footer()
+    const release = defer()
+    const trace = mock((_type: string, _data?: unknown) => {})
     const transport = await createSessionTransport({
       sdk: sdk({
         stream: src.stream,
-        promptAsync: async () => {
-          queueMicrotask(() => {
-            src.push(assistant("msg-1"))
-            busy = false
-          })
-          return ok(undefined)
+        prompt: async () => {
+          src.push(busy())
+          src.push(idle())
+          await release.promise
+          return ok(assistantMessage({ sessionID: "session-1", id: "msg-1", parts: [] }))
         },
-        status: async () => ok(statusMap(busy)),
+      }),
+      sessionID: "session-1",
+      thinking: true,
+      limits: () => ({}),
+      footer: ui.api,
+      trace: { write: trace },
+    })
+
+    try {
+      let finished = false
+      const turn = transport
+        .runPromptTurn({
+          agent: undefined,
+          model: undefined,
+          variant: undefined,
+          prompt: { text: "hello", parts: [] },
+          files: [],
+          includeFiles: false,
+        })
+        .then(() => {
+          finished = true
+        })
+      await waitFor(() => (trace.mock.calls.filter((call) => call[0] === "recv.event").length >= 2 ? true : undefined))
+      await Bun.sleep(20)
+
+      expect(finished).toBe(false)
+      expect(ui.events.some((event) => event.type === "stream.patch" && event.patch.phase !== undefined)).toBe(false)
+
+      release.resolve()
+      await turn
+      expect(finished).toBe(true)
+    } finally {
+      release.resolve()
+      src.close()
+      await transport.close()
+    }
+  })
+
+  test("finishes a normal turn when the prompt call returns while background tasks keep the session busy", async () => {
+    const src = eventFeed()
+    const ui = footer()
+    const seen: unknown[] = []
+    const transport = await createSessionTransport({
+      sdk: sdk({
+        stream: src.stream,
+        prompt: async (input) => {
+          seen.push(input)
+          src.push(busy())
+          src.push(assistant("msg-1"))
+          return ok(assistantMessage({ sessionID: "session-1", id: "msg-1", parts: [] }))
+        },
+        // Undelivered background Task results keep the session busy, so no idle event arrives.
+        status: async () => ok(statusMap(true)),
       }),
       sessionID: "session-1",
       thinking: true,
@@ -2095,12 +2526,199 @@ describe("run stream transport", () => {
           agent: undefined,
           model: undefined,
           variant: undefined,
-          prompt: { text: "hello", parts: [] },
+          prompt: { text: "hello", parts: [], messageID: "msg-user-1" },
           files: [],
           includeFiles: false,
         }),
-        new Promise((_, reject) => setTimeout(() => reject(new Error("turn timed out")), 1_000)),
+        Bun.sleep(1_000).then(() => {
+          throw new Error("turn did not finish when the prompt call returned")
+        }),
       ])
+      expect(seen).toEqual([
+        expect.objectContaining({
+          sessionID: "session-1",
+          messageID: "msg-user-1",
+          parts: [{ type: "text", text: "hello" }],
+        }),
+      ])
+
+      // A delivered background result starts a later turn. It renders from events without an active turn.
+      src.push(assistant("msg-2"))
+      src.push(textUpdated(textPart("txt-2", "msg-2", "background result")))
+      await waitFor(() =>
+        ui.commits.find((commit) => commit.kind === "assistant" && commit.text === "background result"),
+      )
+    } finally {
+      src.close()
+      await transport.close()
+    }
+  })
+
+  test("rejects a normal turn when the prompt request fails", async () => {
+    const src = eventFeed()
+    const ui = footer()
+    const transport = await createSessionTransport({
+      sdk: sdk({
+        stream: src.stream,
+        prompt: async () => {
+          throw new Error("prompt request failed")
+        },
+        status: async () => ok(statusMap(true)),
+      }),
+      sessionID: "session-1",
+      thinking: true,
+      limits: () => ({}),
+      footer: ui.api,
+    })
+
+    try {
+      await expect(
+        Promise.race([
+          transport.runPromptTurn({
+            agent: undefined,
+            model: undefined,
+            variant: undefined,
+            prompt: { text: "hello", parts: [] },
+            files: [],
+            includeFiles: false,
+          }),
+          Bun.sleep(1_000).then(() => {
+            throw new Error("turn timed out")
+          }),
+        ]),
+      ).rejects.toThrow("prompt request failed")
+    } finally {
+      src.close()
+      await transport.close()
+    }
+  })
+
+  test("rejects a command turn when the command request fails", async () => {
+    const src = eventFeed()
+    const ui = footer()
+    const client = sdk({ stream: src.stream })
+    const throwOnError: unknown[] = []
+    spyOn(client.session, "command").mockImplementation(async (_input, opt) => {
+      throwOnError.push(opt?.throwOnError)
+      throw new Error("command request failed")
+    })
+    const transport = await createSessionTransport({
+      sdk: client,
+      sessionID: "session-1",
+      thinking: true,
+      limits: () => ({}),
+      footer: ui.api,
+    })
+
+    try {
+      await expect(
+        Promise.race([
+          transport.runPromptTurn({
+            agent: undefined,
+            model: undefined,
+            variant: undefined,
+            prompt: { text: "/review", parts: [], command: { name: "review", arguments: "" } },
+            files: [],
+            includeFiles: false,
+          }),
+          Bun.sleep(1_000).then(() => {
+            throw new Error("turn timed out")
+          }),
+        ]),
+      ).rejects.toThrow("command request failed")
+      // Without throwOnError the SDK resolves HTTP and network failures, so the turn would end silently.
+      expect(throwOnError).toEqual([true])
+    } finally {
+      src.close()
+      await transport.close()
+    }
+  })
+
+  test("fails a command turn without a second error row when the server also reports it as a session error", async () => {
+    const src = eventFeed()
+    const ui = footer()
+    const client = sdk({ stream: src.stream })
+    const failure = (message: string) =>
+      ({
+        id: `evt-error-${message}`,
+        type: "session.error",
+        properties: { sessionID: "session-1", error: { name: "UnknownError", data: { message } } },
+      }) satisfies SdkEvent
+    let calls = 0
+    spyOn(client.session, "command").mockImplementation(async () => {
+      calls += 1
+      // The server publishes session.error before it fails the request. The event can arrive before or after the response.
+      if (calls === 1) {
+        src.push(failure("Command not found: first"))
+        await Bun.sleep(20)
+        throw new Error("Unexpected server error. Check server logs for details.")
+      }
+      setTimeout(() => src.push(failure("Command not found: second")), 20)
+      throw new Error("Unexpected server error. Check server logs for details.")
+    })
+    const transport = await createSessionTransport({
+      sdk: client,
+      sessionID: "session-1",
+      thinking: true,
+      limits: () => ({}),
+      footer: ui.api,
+    })
+    const turn = () =>
+      transport.runPromptTurn({
+        agent: undefined,
+        model: undefined,
+        variant: undefined,
+        prompt: { text: "/missing", parts: [], command: { name: "missing", arguments: "" } },
+        files: [],
+        includeFiles: false,
+      })
+
+    try {
+      // The turn still fails, so the runtime keeps its files and local rows. The marker tells it the error is shown.
+      await expect(turn()).rejects.toBeInstanceOf(ShownTurnError)
+      await expect(turn()).rejects.toBeInstanceOf(ShownTurnError)
+      expect(ui.commits.filter((commit) => commit.kind === "error").map((commit) => commit.text)).toEqual([
+        "Command not found: first",
+        "Command not found: second",
+      ])
+    } finally {
+      src.close()
+      await transport.close()
+    }
+  })
+
+  test("rejects a shell turn when the shell request fails", async () => {
+    const src = eventFeed()
+    const ui = footer()
+    const client = sdk({ stream: src.stream })
+    // A turn that delivers a background result keeps the runner busy, so the server rejects the shell request.
+    spyOn(client.session, "shell").mockImplementation(async () => {
+      throw new Error("session is busy")
+    })
+    const transport = await createSessionTransport({
+      sdk: client,
+      sessionID: "session-1",
+      thinking: true,
+      limits: () => ({}),
+      footer: ui.api,
+    })
+
+    try {
+      await expect(
+        Promise.race([
+          transport.runPromptTurn({
+            agent: "build",
+            model: undefined,
+            variant: undefined,
+            prompt: { text: "pwd", parts: [], mode: "shell" },
+            files: [],
+            includeFiles: false,
+          }),
+          Bun.sleep(1_000).then(() => {
+            throw new Error("turn timed out")
+          }),
+        ]),
+      ).rejects.toThrow("session is busy")
     } finally {
       src.close()
       await transport.close()
@@ -2118,14 +2736,13 @@ describe("run stream transport", () => {
     const transport = await createSessionTransport({
       sdk: sdk({
         stream: src.stream,
-        promptAsync: async () => {
-          queueMicrotask(() => {
-            src.push(busy())
-            src.push(assistant("msg-1"))
-            src.push(textUpdated(textPart("txt-1", "msg-1", "")))
-            src.push(textDelta("msg-1", "txt-1", "unfinished"))
-          })
-          return ok(undefined)
+        prompt: async (_input, opt) => {
+          src.push(busy())
+          src.push(assistant("msg-1"))
+          src.push(textUpdated(textPart("txt-1", "msg-1", "")))
+          src.push(textDelta("msg-1", "txt-1", "unfinished"))
+          await untilAborted(opt?.signal)
+          return ok(assistantMessage({ sessionID: "session-1", id: "msg-1", parts: [] }))
         },
       }),
       sessionID: "session-1",
@@ -2185,18 +2802,11 @@ describe("run stream transport", () => {
     const transport = await createSessionTransport({
       sdk: sdk({
         stream: src.stream,
-        promptAsync: async (_input, opt) => {
+        prompt: async (_input, opt) => {
           ready.resolve()
-          await new Promise<void>((resolve) => {
-            const onAbort = () => {
-              aborted = true
-              opt?.signal?.removeEventListener("abort", onAbort)
-              resolve()
-            }
-
-            opt?.signal?.addEventListener("abort", onAbort, { once: true })
-          })
-          return ok(undefined)
+          await untilAborted(opt?.signal)
+          aborted = true
+          return ok(assistantMessage({ sessionID: "session-1", id: "msg-1", parts: [] }))
         },
       }),
       sessionID: "session-1",
@@ -2240,9 +2850,10 @@ describe("run stream transport", () => {
               throw new Error("boom")
             })(),
           ),
-        promptAsync: async () => {
+        prompt: async (_input, opt) => {
           ready.resolve()
-          return ok(undefined)
+          await untilAborted(opt?.signal)
+          return ok(assistantMessage({ sessionID: "session-1", id: "msg-1", parts: [] }))
         },
         status: async () => ok({ "session-1": { type: "busy" } }),
       }),
@@ -2287,9 +2898,10 @@ describe("run stream transport", () => {
               })
             })(),
           ),
-        promptAsync: async () => {
+        prompt: async (_input, opt) => {
           ready.resolve()
-          return ok(undefined)
+          await untilAborted(opt?.signal)
+          return ok(assistantMessage({ sessionID: "session-1", id: "msg-1", parts: [] }))
         },
         status: async () => ok({}),
       }),
@@ -2322,6 +2934,10 @@ describe("run stream transport", () => {
     const transport = await createSessionTransport({
       sdk: sdk({
         stream: src.stream,
+        prompt: async (_input, opt) => {
+          await untilAborted(opt?.signal)
+          return ok(assistantMessage({ sessionID: "session-1", id: "msg-1", parts: [] }))
+        },
       }),
       sessionID: "session-1",
       thinking: true,

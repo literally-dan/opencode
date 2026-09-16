@@ -72,7 +72,7 @@ const tmpWithFiles = (files: Record<string, string>) =>
     return dir
   })
 
-function loaded(filepath: string): SessionV1.WithParts[] {
+function loaded(filepath: string, compaction?: Record<string, unknown>): SessionV1.WithParts[] {
   const sessionID = SessionID.make("session-loaded-1")
   const messageID = MessageID.make("msg_message-loaded-1")
 
@@ -104,6 +104,7 @@ function loaded(filepath: string): SessionV1.WithParts[] {
             title: "Read",
             metadata: { loaded: [filepath] },
             time: { start: 0, end: 1 },
+            ...compaction,
           },
         },
       ],
@@ -192,6 +193,83 @@ describe("Instruction.resolve", () => {
     ),
   )
 
+  it.live("refreshes cached instruction hits and misses between provider turns", () =>
+    withFiles({ "subdir/nested/file.ts": "const x = 1" }, (dir) =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem
+        const svc = yield* Instruction.Service
+        const filepath = path.join(dir, "subdir", "nested", "file.ts")
+        const agents = path.join(dir, "subdir", "AGENTS.md")
+        const id = MessageID.make("msg_message-cache-lifetime")
+
+        expect(yield* svc.resolve([], filepath, id)).toEqual([])
+        yield* write(agents, "# Added Instructions")
+        yield* svc.clear(id)
+
+        const added = yield* svc.resolve([], filepath, id)
+        expect(added).toHaveLength(1)
+        expect(added[0].filepath).toBe(agents)
+
+        yield* fs.remove(agents)
+        yield* svc.clear(id)
+        expect(yield* svc.resolve([], filepath, id)).toEqual([])
+      }),
+    ),
+  )
+
+  it.live("caches the worktree-wide instruction scan for the life of one turn", () =>
+    withFiles({ "AGENTS.md": "# Root Instructions", "subdir/nested/file.ts": "const x = 1" }, (dir) =>
+      Effect.gen(function* () {
+        // resolve() consults systemPaths() on every read tool call, and that scan
+        // walks findUp across every ancestor plus a glob per configured entry.
+        // Within one turn the answer cannot change usefully, so it is cached; a
+        // root AGENTS.md appearing mid-turn must not be picked up until clear().
+        const svc = yield* Instruction.Service
+        const filepath = path.join(dir, "subdir", "nested", "file.ts")
+        const nested = path.join(dir, "subdir", "AGENTS.md")
+        const id = MessageID.make("msg_system-paths-cache")
+
+        // Seeds the cache, and the root AGENTS.md is a system path so it is not
+        // attached as a nearby instruction file.
+        expect(yield* svc.resolve([], filepath, id)).toEqual([])
+
+        yield* write(nested, "# Nested Instructions")
+        yield* svc.clear(id)
+        expect((yield* svc.resolve([], filepath, id)).map((item) => item.filepath)).toEqual([nested])
+      }),
+    ),
+  )
+
+  it.live("keeps instruction discovery caches isolated across concurrent turns", () =>
+    withFiles({ "subdir/nested/file.ts": "const x = 1" }, (dir) =>
+      Effect.gen(function* () {
+        const svc = yield* Instruction.Service
+        const filepath = path.join(dir, "subdir", "nested", "file.ts")
+        const agents = path.join(dir, "subdir", "AGENTS.md")
+        const firstID = MessageID.make("msg_message-cache-concurrent-1")
+        const secondID = MessageID.make("msg_message-cache-concurrent-2")
+
+        expect(
+          yield* Effect.all([svc.resolve([], filepath, firstID), svc.resolve([], filepath, secondID)], {
+            concurrency: "unbounded",
+          }),
+        ).toEqual([[], []])
+        yield* write(agents, "# Added Instructions")
+        yield* svc.clear(firstID)
+
+        const [first, second] = yield* Effect.all(
+          [svc.resolve([], filepath, firstID), svc.resolve([], filepath, secondID)],
+          { concurrency: "unbounded" },
+        )
+        expect(first.map((item) => item.filepath)).toEqual([agents])
+        expect(second).toEqual([])
+
+        yield* svc.clear(secondID)
+        expect((yield* svc.resolve([], filepath, secondID)).map((item) => item.filepath)).toEqual([agents])
+      }),
+    ),
+  )
+
   it.live("skips instructions already reported by prior read metadata", () =>
     withFiles({ "subdir/AGENTS.md": "# Subdir Instructions", "subdir/nested/file.ts": "const x = 1" }, (dir) =>
       Effect.gen(function* () {
@@ -202,6 +280,34 @@ describe("Instruction.resolve", () => {
 
         const results = yield* svc.resolve(loaded(agents), filepath, id)
         expect(results).toEqual([])
+      }),
+    ),
+  )
+
+  it.live("re-delivers instructions whose carrying read has been compacted", () =>
+    withFiles({ "subdir/AGENTS.md": "# Subdir Instructions", "subdir/nested/file.ts": "const x = 1" }, (dir) =>
+      Effect.gen(function* () {
+        const svc = yield* Instruction.Service
+        const agents = path.join(dir, "subdir", "AGENTS.md")
+        const filepath = path.join(dir, "subdir", "nested", "file.ts")
+
+        // A compacted read no longer renders its payload, so it can no longer
+        // count as having delivered anything. Both native pruning and model
+        // compaction have to retract the claim, and they record it differently.
+        // A distinct message id per case: resolve records what it has already
+        // attached for a message, so reusing one would return [] the second time
+        // whatever the compaction state.
+        for (const [index, compaction] of [
+          { time: { start: 0, end: 1, compacted: 5 } },
+          { compactionGroup: "g1", compactionSummary: "folded", compactionGeneration: 1 },
+        ].entries()) {
+          const results = yield* svc.resolve(
+            loaded(agents, compaction),
+            filepath,
+            MessageID.make(`msg_message-claim-4${index}`),
+          )
+          expect(results.map((result) => result.filepath)).toEqual([agents])
+        }
       }),
     ),
   )

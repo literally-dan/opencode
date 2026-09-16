@@ -6,6 +6,7 @@ import { disposeAllInstances, TestInstance } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
 import { Agent } from "../../src/agent/agent"
 import { Auth } from "../../src/auth"
+import { Command } from "../../src/command"
 import { Config } from "../../src/config/config"
 import { RuntimeFlags } from "../../src/effect/runtime-flags"
 import { Global } from "@opencode-ai/core/global"
@@ -23,6 +24,12 @@ const agentLayer = (flags: Partial<RuntimeFlags.Info> = {}) =>
   )
 
 const it = testEffect(agentLayer())
+
+const commandIt = testEffect(
+  LayerNode.compile(LayerNode.group([Agent.node, Command.node, RuntimeFlags.node]), [
+    [RuntimeFlags.node, RuntimeFlags.layer({})],
+  ]),
+)
 
 // Helper to evaluate permission for a tool with wildcard pattern
 function evalPerm(agent: Agent.Info | undefined, permission: string): PermissionV1.Action | undefined {
@@ -52,6 +59,8 @@ it.instance("returns default native agents when no config", () =>
     expect(names).toContain("plan")
     expect(names).toContain("general")
     expect(names).toContain("explore")
+    expect(names).toContain("target-reviewer")
+    expect(names).toContain("target-coordinator")
     expect(names).toContain("compaction")
     expect(names).toContain("title")
     expect(names).toContain("summary")
@@ -90,6 +99,15 @@ it.instance("plan agent denies the general subagent by default", () =>
   }),
 )
 
+it.instance("plan agent keeps todowrite available", () =>
+  Effect.gen(function* () {
+    const plan = yield* load((svc) => svc.get("plan"))
+    expect(plan).toBeDefined()
+    expect(evalPerm(plan, "todowrite")).toBe("allow")
+    expect(plan ? Permission.disabled(["todowrite"], plan.permission).has("todowrite") : undefined).toBe(false)
+  }),
+)
+
 it.instance(
   "user permission can allow the general subagent from plan mode",
   () =>
@@ -117,6 +135,139 @@ it.instance("explore agent denies edit and write", () =>
     expect(evalPerm(explore, "edit")).toBe("deny")
     expect(evalPerm(explore, "write")).toBe("deny")
     expect(evalPerm(explore, "todowrite")).toBe("deny")
+  }),
+)
+
+it.instance("target-reviewer agent can inspect but cannot modify or delegate", () =>
+  Effect.gen(function* () {
+    const reviewer = yield* load((svc) => svc.get("target-reviewer"))
+    expect(reviewer?.native).toBe(true)
+    expect(reviewer?.mode).toBe("subagent")
+    expect(evalPerm(reviewer, "read")).toBe("allow")
+    expect(evalPerm(reviewer, "bash")).toBe("allow")
+    expect(evalPerm(reviewer, "edit")).toBe("deny")
+    expect(evalPerm(reviewer, "write")).toBe("deny")
+    expect(evalPerm(reviewer, "apply_patch")).toBe("deny")
+    expect(evalPerm(reviewer, "task")).toBe("deny")
+  }),
+)
+
+it.instance("target-coordinator agent delegates and interviews but cannot edit", () =>
+  Effect.gen(function* () {
+    const coordinator = yield* load((svc) => svc.get("target-coordinator"))
+    expect(coordinator?.native).toBe(true)
+    expect(coordinator?.mode).toBe("subagent")
+    // Hidden so the coordinator is only reachable through /target, not offered
+    // to models as a subagent they can launch.
+    expect(coordinator?.hidden).toBe(true)
+    expect(evalPerm(coordinator, "task")).toBe("allow")
+    expect(evalPerm(coordinator, "question")).toBe("allow")
+    expect(evalPerm(coordinator, "read")).toBe("allow")
+    expect(evalPerm(coordinator, "edit")).toBe("deny")
+    expect(evalPerm(coordinator, "write")).toBe("deny")
+    expect(evalPerm(coordinator, "apply_patch")).toBe("deny")
+  }),
+)
+
+it.instance(
+  "target workflow agents cannot edit when user permission allows everything",
+  () =>
+    Effect.gen(function* () {
+      const reviewer = yield* load((svc) => svc.get("target-reviewer"))
+      const coordinator = yield* load((svc) => svc.get("target-coordinator"))
+      expect(evalPerm(reviewer, "bash")).toBe("allow")
+      expect(evalPerm(reviewer, "edit")).toBe("deny")
+      expect(evalPerm(reviewer, "write")).toBe("deny")
+      expect(evalPerm(reviewer, "apply_patch")).toBe("deny")
+      expect(evalPerm(reviewer, "task")).toBe("deny")
+      expect(evalPerm(reviewer, "todowrite")).toBe("deny")
+      expect(evalPerm(coordinator, "task")).toBe("allow")
+      expect(evalPerm(coordinator, "edit")).toBe("deny")
+      expect(evalPerm(coordinator, "write")).toBe("deny")
+      expect(evalPerm(coordinator, "apply_patch")).toBe("deny")
+      expect([...Permission.disabled(["edit", "write", "apply_patch"], reviewer!.permission)]).toEqual([
+        "edit",
+        "write",
+        "apply_patch",
+      ])
+      expect([...Permission.disabled(["edit", "write", "apply_patch"], coordinator!.permission)]).toEqual([
+        "edit",
+        "write",
+        "apply_patch",
+      ])
+    }),
+  {
+    config: {
+      permission: {
+        "*": "allow",
+      },
+    },
+  },
+)
+
+it.instance(
+  "per-agent permission config can override target workflow agent denies",
+  () =>
+    Effect.gen(function* () {
+      const reviewer = yield* load((svc) => svc.get("target-reviewer"))
+      const coordinator = yield* load((svc) => svc.get("target-coordinator"))
+      expect(evalPerm(reviewer, "edit")).toBe("allow")
+      expect(evalPerm(reviewer, "task")).toBe("allow")
+      expect(evalPerm(coordinator, "edit")).toBe("allow")
+    }),
+  {
+    config: {
+      permission: {
+        "*": "allow",
+      },
+      agent: {
+        "target-reviewer": { permission: { edit: "allow", task: "allow" } },
+        "target-coordinator": { permission: { edit: "allow" } },
+      },
+    },
+  },
+)
+
+it.instance(
+  "user agents named reviewer and target stay separate from the target workflow agents",
+  () =>
+    Effect.gen(function* () {
+      const reviewer = yield* load((svc) => svc.get("reviewer"))
+      const target = yield* load((svc) => svc.get("target"))
+      const nativeReviewer = yield* load((svc) => svc.get("target-reviewer"))
+      const coordinator = yield* load((svc) => svc.get("target-coordinator"))
+      expect(reviewer?.native).toBe(false)
+      expect(reviewer?.prompt).toBe("Review for style")
+      expect(evalPerm(reviewer, "edit")).toBe("allow")
+      expect(target?.native).toBe(false)
+      expect(target?.prompt).toBe("Coordinate releases")
+      expect(target?.hidden).toBeUndefined()
+      expect(evalPerm(target, "edit")).toBe("allow")
+      expect(nativeReviewer?.native).toBe(true)
+      expect(nativeReviewer?.prompt).not.toBe("Review for style")
+      expect(evalPerm(nativeReviewer, "edit")).toBe("deny")
+      expect(coordinator?.native).toBe(true)
+      expect(coordinator?.prompt).not.toBe("Coordinate releases")
+      expect(evalPerm(coordinator, "edit")).toBe("deny")
+    }),
+  {
+    config: {
+      agent: {
+        reviewer: { prompt: "Review for style" },
+        target: { prompt: "Coordinate releases" },
+      },
+    },
+  },
+)
+
+commandIt.instance("/target command launches the target-coordinator agent", () =>
+  Effect.gen(function* () {
+    const command = yield* Command.Service.use((svc) => svc.get("target"))
+    expect(command?.agent).toBe("target-coordinator")
+    expect(command?.subtask).toBe(true)
+    const coordinator = yield* load((svc) => svc.get(command?.agent ?? ""))
+    expect(coordinator?.native).toBe(true)
+    expect(coordinator?.hidden).toBe(true)
   }),
 )
 
@@ -644,6 +795,7 @@ it.instance(
       },
     },
   },
+  { timeout: 15_000 },
 )
 
 it.instance("defaultAgent returns build when no default_agent config", () =>

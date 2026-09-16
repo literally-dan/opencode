@@ -206,6 +206,53 @@ describe("step-finish token propagation via event", () => {
 })
 
 describe("Session", () => {
+  it.instance("serializes Task claims with updates and emits immutable ownership", () =>
+    Effect.gen(function* () {
+      const session = yield* SessionNs.Service
+      const events = yield* EventV2Bridge.Service
+      const root = yield* Effect.acquireRelease(session.create({ title: "root" }), (info) =>
+        session.remove(info.id).pipe(Effect.ignore),
+      )
+      const other = yield* Effect.acquireRelease(session.create({ title: "other" }), (info) =>
+        session.remove(info.id).pipe(Effect.ignore),
+      )
+      const child = yield* session.create({ parentID: root.id, title: "history child" })
+      const updates: SessionNs.Info[] = []
+      const unsubscribe = yield* events.listen((event) => {
+        if (event.type !== SessionNs.Event.Updated.type) return Effect.void
+        const data = event.data as typeof SessionNs.Event.Updated.data.Type
+        if (data.sessionID === child.id) updates.push(data.info as SessionNs.Info)
+        return Effect.void
+      })
+      yield* Effect.addFinalizer(() => unsubscribe)
+
+      yield* Effect.all(
+        [
+          session.setTitle({ sessionID: child.id, title: "updated history child" }),
+          session.claimTask({ sessionID: child.id, parentID: root.id }),
+        ],
+        { concurrency: "unbounded", discard: true },
+      )
+
+      expect(yield* session.get(child.id)).toMatchObject({
+        parentID: root.id,
+        taskParentID: root.id,
+        title: "updated history child",
+      })
+      const claimedAt = updates.findIndex((info) => info.taskParentID === root.id)
+      expect(claimedAt).toBeGreaterThanOrEqual(0)
+      expect(updates.slice(claimedAt).every((info) => info.taskParentID === root.id)).toBe(true)
+
+      const count = updates.length
+      yield* session.claimTask({ sessionID: child.id, parentID: root.id })
+      expect(updates).toHaveLength(count)
+      expect(Exit.isFailure(yield* session.claimTask({ sessionID: child.id, parentID: other.id }).pipe(Effect.exit))).toBe(
+        true,
+      )
+      expect((yield* session.get(child.id)).taskParentID).toBe(root.id)
+    }),
+  )
+
   it.live("remove works without an instance", () =>
     Effect.gen(function* () {
       const session = yield* SessionNs.Service
@@ -267,6 +314,62 @@ describe("Session", () => {
 
       expect((yield* session.messages({ sessionID: beforeWrap.id })).map((msg) => msg.info.time.created)).toEqual([1])
       expect((yield* session.messages({ sessionID: afterWrap.id })).map((msg) => msg.info.time.created)).toEqual([1, 2])
+    }),
+  )
+
+  it.instance("preserves legacy tool compaction timestamps while normalizing grouped records", () =>
+    Effect.gen(function* () {
+      const session = yield* SessionNs.Service
+      const created = yield* Effect.acquireRelease(session.create({}), (info) =>
+        session.remove(info.id).pipe(Effect.ignore),
+      )
+      const messageID = MessageID.ascending()
+      yield* session.updateMessage({
+        id: messageID,
+        sessionID: created.id,
+        role: "assistant",
+        time: { created: Date.now() },
+        parentID: MessageID.ascending(),
+        modelID: "test",
+        providerID: "test",
+        mode: "",
+        agent: "agent",
+        path: { cwd: created.directory, root: created.directory },
+        cost: 0,
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+      } as SessionV1.Assistant)
+
+      const makeTool = (group?: string): SessionV1.ToolPart => ({
+        id: PartID.ascending(),
+        messageID,
+        sessionID: created.id,
+        type: "tool",
+        callID: group ? "grouped" : "legacy",
+        tool: "read",
+        state: {
+          status: "completed",
+          input: {},
+          output: "large historical output",
+          title: "",
+          metadata: {},
+          time: { start: 1, end: 2, compacted: 3 },
+          compactionSummary: "historical summary",
+          ...(group ? { compactionGroup: group, compactionGeneration: 1 } : {}),
+        },
+      })
+
+      const legacy = yield* session.updatePart(makeTool())
+      const grouped = yield* session.updatePart(makeTool("new-group"))
+      expect(legacy.type === "tool" && legacy.state.status === "completed" && legacy.state.time.compacted).toBe(3)
+      expect(
+        grouped.type === "tool" && grouped.state.status === "completed" && grouped.state.time.compacted,
+      ).toBeUndefined()
+
+      const stored = yield* session.messages({ sessionID: created.id })
+      const storedLegacy = stored.flatMap((message) => message.parts).find((part) => part.id === legacy.id)
+      expect(
+        storedLegacy?.type === "tool" && storedLegacy.state.status === "completed" && storedLegacy.state.time.compacted,
+      ).toBe(3)
     }),
   )
 

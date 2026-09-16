@@ -33,18 +33,11 @@
             }
           },
           "400": {
-            "description": "BadRequest | InvalidRequestError",
+            "description": "Bad request",
             "content": {
               "application/json": {
                 "schema": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
-                    },
-                    {
-                      "$ref": "#/components/schemas/InvalidRequestError"
-                    }
-                  ]
+                  "$ref": "#/components/schemas/BadRequestError"
                 }
               }
             }
@@ -94,18 +87,11 @@
             }
           },
           "400": {
-            "description": "BadRequest | InvalidRequestError",
+            "description": "Bad request",
             "content": {
               "application/json": {
                 "schema": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
-                    },
-                    {
-                      "$ref": "#/components/schemas/InvalidRequestError"
-                    }
-                  ]
+                  "$ref": "#/components/schemas/BadRequestError"
                 }
               }
             }
@@ -156,18 +142,11 @@
             }
           },
           "400": {
-            "description": "BadRequest | InvalidRequestError",
+            "description": "Bad request",
             "content": {
               "application/json": {
                 "schema": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
-                    },
-                    {
-                      "$ref": "#/components/schemas/InvalidRequestError"
-                    }
-                  ]
+                  "$ref": "#/components/schemas/BadRequestError"
                 }
               }
             }
@@ -229,9 +208,6 @@
                   "anyOf": [
                     {
                       "$ref": "#/components/schemas/MoveSessionError"
-                    },
-                    {
-                      "$ref": "#/components/schemas/InvalidRequestError"
                     }
                   ]
                 }
@@ -301,11 +277,11 @@
             }
           },
           "400": {
-            "description": "Bad request",
+            "description": "InvalidRequestError",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BadRequestError"
+                  "$ref": "#/components/schemas/InvalidRequestError"
                 }
               }
             }
@@ -338,11 +314,11 @@
             }
           },
           "400": {
-            "description": "Bad request",
+            "description": "InvalidRequestError",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BadRequestError"
+                  "$ref": "#/components/schemas/InvalidRequestError"
                 }
               }
             }
@@ -375,11 +351,11 @@
             }
           },
           "400": {
-            "description": "Bad request",
+            "description": "InvalidRequestError",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BadRequestError"
+                  "$ref": "#/components/schemas/InvalidRequestError"
                 }
               }
             }
@@ -410,18 +386,11 @@
             }
           },
           "400": {
-            "description": "BadRequest | InvalidRequestError",
+            "description": "Bad request",
             "content": {
               "application/json": {
                 "schema": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
-                    },
-                    {
-                      "$ref": "#/components/schemas/InvalidRequestError"
-                    }
-                  ]
+                  "$ref": "#/components/schemas/BadRequestError"
                 }
               }
             }
@@ -464,11 +433,11 @@
             }
           },
           "400": {
-            "description": "Bad request",
+            "description": "InvalidRequestError",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BadRequestError"
+                  "$ref": "#/components/schemas/InvalidRequestError"
                 }
               }
             }
@@ -531,18 +500,11 @@
             }
           },
           "400": {
-            "description": "BadRequest | InvalidRequestError",
+            "description": "Bad request",
             "content": {
               "application/json": {
                 "schema": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
-                    },
-                    {
-                      "$ref": "#/components/schemas/InvalidRequestError"
-                    }
-                  ]
+                  "$ref": "#/components/schemas/BadRequestError"
                 }
               }
             }
@@ -652,11 +614,11 @@
             }
           },
           "400": {
-            "description": "Bad request",
+            "description": "InvalidRequestError",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BadRequestError"
+                  "$ref": "#/components/schemas/InvalidRequestError"
                 }
               }
             }
@@ -704,18 +666,11 @@
             }
           },
           "400": {
-            "description": "BadRequest | InvalidRequestError",
+            "description": "Bad request",
             "content": {
               "application/json": {
                 "schema": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
-                    },
-                    {
-                      "$ref": "#/components/schemas/InvalidRequestError"
-                    }
-                  ]
+                  "$ref": "#/components/schemas/BadRequestError"
                 }
               }
             }
@@ -791,11 +746,11 @@
             }
           },
           "400": {
-            "description": "Bad request",
+            "description": "InvalidRequestError",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BadRequestError"
+                  "$ref": "#/components/schemas/InvalidRequestError"
                 }
               }
             }
@@ -845,11 +800,11 @@
             }
           },
           "400": {
-            "description": "Bad request",
+            "description": "InvalidRequestError",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BadRequestError"
+                  "$ref": "#/components/schemas/InvalidRequestError"
                 }
               }
             }
@@ -899,11 +854,11 @@
             }
           },
           "400": {
-            "description": "Bad request",
+            "description": "InvalidRequestError",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BadRequestError"
+                  "$ref": "#/components/schemas/InvalidRequestError"
                 }
               }
             }
@@ -996,11 +951,11 @@
             }
           },
           "400": {
-            "description": "Bad request",
+            "description": "InvalidRequestError",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BadRequestError"
+                  "$ref": "#/components/schemas/InvalidRequestError"
                 }
               }
             }
@@ -1140,18 +1095,11 @@
             }
           },
           "400": {
-            "description": "BadRequest | InvalidRequestError",
+            "description": "Bad request",
             "content": {
               "application/json": {
                 "schema": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
-                    },
-                    {
-                      "$ref": "#/components/schemas/InvalidRequestError"
-                    }
-                  ]
+                  "$ref": "#/components/schemas/BadRequestError"
                 }
               }
             }
@@ -1201,18 +1149,11 @@
             }
           },
           "400": {
-            "description": "BadRequest | InvalidRequestError",
+            "description": "Bad request",
             "content": {
               "application/json": {
                 "schema": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
-                    },
-                    {
-                      "$ref": "#/components/schemas/InvalidRequestError"
-                    }
-                  ]
+                  "$ref": "#/components/schemas/BadRequestError"
                 }
               }
             }
@@ -1273,9 +1214,6 @@
                   "anyOf": [
                     {
                       "$ref": "#/components/schemas/WorktreeError"
-                    },
-                    {
-                      "$ref": "#/components/schemas/InvalidRequestError"
                     }
                   ]
                 }
@@ -1332,9 +1270,6 @@
                   "anyOf": [
                     {
                       "$ref": "#/components/schemas/WorktreeError"
-                    },
-                    {
-                      "$ref": "#/components/schemas/InvalidRequestError"
                     }
                   ]
                 }
@@ -1401,9 +1336,6 @@
                   "anyOf": [
                     {
                       "$ref": "#/components/schemas/WorktreeError"
-                    },
-                    {
-                      "$ref": "#/components/schemas/InvalidRequestError"
                     }
                   ]
                 }
@@ -1472,9 +1404,6 @@
                   "anyOf": [
                     {
                       "$ref": "#/components/schemas/WorktreeError"
-                    },
-                    {
-                      "$ref": "#/components/schemas/InvalidRequestError"
                     }
                   ]
                 }
@@ -1603,11 +1532,11 @@
             }
           },
           "400": {
-            "description": "Bad request",
+            "description": "InvalidRequestError",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BadRequestError"
+                  "$ref": "#/components/schemas/InvalidRequestError"
                 }
               }
             }
@@ -1619,77 +1548,6 @@
           {
             "lang": "js",
             "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.experimental.session.list({\n  ...\n})"
-          }
-        ]
-      }
-    },
-    "/experimental/session/{sessionID}/background": {
-      "post": {
-        "tags": ["experimental"],
-        "operationId": "experimental.session.background",
-        "parameters": [
-          {
-            "name": "sessionID",
-            "in": "path",
-            "schema": {
-              "type": "string",
-              "pattern": "^ses"
-            },
-            "required": true
-          },
-          {
-            "name": "directory",
-            "in": "query",
-            "schema": {
-              "type": "string"
-            },
-            "required": false
-          },
-          {
-            "name": "workspace",
-            "in": "query",
-            "schema": {
-              "type": "string"
-            },
-            "required": false
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Backgrounded subagents",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "boolean",
-                  "description": "Backgrounded subagents"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "BadRequest | InvalidRequestError",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
-                    },
-                    {
-                      "$ref": "#/components/schemas/InvalidRequestError"
-                    }
-                  ]
-                }
-              }
-            }
-          }
-        },
-        "description": "Detach any synchronous subagents currently blocking the session and continue them in the background.",
-        "summary": "Background subagents",
-        "x-codeSamples": [
-          {
-            "lang": "js",
-            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.experimental.session.background({\n  ...\n})"
           }
         ]
       }
@@ -1732,11 +1590,11 @@
             }
           },
           "400": {
-            "description": "Bad request",
+            "description": "InvalidRequestError",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BadRequestError"
+                  "$ref": "#/components/schemas/InvalidRequestError"
                 }
               }
             }
@@ -1858,11 +1716,11 @@
             }
           },
           "400": {
-            "description": "Bad request",
+            "description": "InvalidRequestError",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BadRequestError"
+                  "$ref": "#/components/schemas/InvalidRequestError"
                 }
               }
             }
@@ -1952,11 +1810,11 @@
             }
           },
           "400": {
-            "description": "Bad request",
+            "description": "InvalidRequestError",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BadRequestError"
+                  "$ref": "#/components/schemas/InvalidRequestError"
                 }
               }
             }
@@ -2018,11 +1876,11 @@
             }
           },
           "400": {
-            "description": "Bad request",
+            "description": "InvalidRequestError",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BadRequestError"
+                  "$ref": "#/components/schemas/InvalidRequestError"
                 }
               }
             }
@@ -2084,11 +1942,11 @@
             }
           },
           "400": {
-            "description": "Bad request",
+            "description": "InvalidRequestError",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BadRequestError"
+                  "$ref": "#/components/schemas/InvalidRequestError"
                 }
               }
             }
@@ -2146,11 +2004,11 @@
             }
           },
           "400": {
-            "description": "Bad request",
+            "description": "InvalidRequestError",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BadRequestError"
+                  "$ref": "#/components/schemas/InvalidRequestError"
                 }
               }
             }
@@ -2204,11 +2062,11 @@
             }
           },
           "400": {
-            "description": "Bad request",
+            "description": "InvalidRequestError",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BadRequestError"
+                  "$ref": "#/components/schemas/InvalidRequestError"
                 }
               }
             }
@@ -2259,11 +2117,11 @@
             }
           },
           "400": {
-            "description": "Bad request",
+            "description": "InvalidRequestError",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BadRequestError"
+                  "$ref": "#/components/schemas/InvalidRequestError"
                 }
               }
             }
@@ -2313,11 +2171,11 @@
             }
           },
           "400": {
-            "description": "Bad request",
+            "description": "InvalidRequestError",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BadRequestError"
+                  "$ref": "#/components/schemas/InvalidRequestError"
                 }
               }
             }
@@ -2367,11 +2225,11 @@
             }
           },
           "400": {
-            "description": "Bad request",
+            "description": "InvalidRequestError",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BadRequestError"
+                  "$ref": "#/components/schemas/InvalidRequestError"
                 }
               }
             }
@@ -2425,11 +2283,11 @@
             }
           },
           "400": {
-            "description": "Bad request",
+            "description": "InvalidRequestError",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BadRequestError"
+                  "$ref": "#/components/schemas/InvalidRequestError"
                 }
               }
             }
@@ -2501,11 +2359,11 @@
             }
           },
           "400": {
-            "description": "Bad request",
+            "description": "InvalidRequestError",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BadRequestError"
+                  "$ref": "#/components/schemas/InvalidRequestError"
                 }
               }
             }
@@ -2555,11 +2413,11 @@
             }
           },
           "400": {
-            "description": "Bad request",
+            "description": "InvalidRequestError",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BadRequestError"
+                  "$ref": "#/components/schemas/InvalidRequestError"
                 }
               }
             }
@@ -2624,9 +2482,6 @@
                   "anyOf": [
                     {
                       "$ref": "#/components/schemas/VcsApplyError"
-                    },
-                    {
-                      "$ref": "#/components/schemas/InvalidRequestError"
                     }
                   ]
                 }
@@ -2698,11 +2553,11 @@
             }
           },
           "400": {
-            "description": "Bad request",
+            "description": "InvalidRequestError",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BadRequestError"
+                  "$ref": "#/components/schemas/InvalidRequestError"
                 }
               }
             }
@@ -2756,11 +2611,11 @@
             }
           },
           "400": {
-            "description": "Bad request",
+            "description": "InvalidRequestError",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BadRequestError"
+                  "$ref": "#/components/schemas/InvalidRequestError"
                 }
               }
             }
@@ -2830,11 +2685,11 @@
             }
           },
           "400": {
-            "description": "Bad request",
+            "description": "InvalidRequestError",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BadRequestError"
+                  "$ref": "#/components/schemas/InvalidRequestError"
                 }
               }
             }
@@ -2888,11 +2743,11 @@
             }
           },
           "400": {
-            "description": "Bad request",
+            "description": "InvalidRequestError",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BadRequestError"
+                  "$ref": "#/components/schemas/InvalidRequestError"
                 }
               }
             }
@@ -2946,11 +2801,11 @@
             }
           },
           "400": {
-            "description": "Bad request",
+            "description": "InvalidRequestError",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BadRequestError"
+                  "$ref": "#/components/schemas/InvalidRequestError"
                 }
               }
             }
@@ -3004,11 +2859,11 @@
             }
           },
           "400": {
-            "description": "Bad request",
+            "description": "InvalidRequestError",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BadRequestError"
+                  "$ref": "#/components/schemas/InvalidRequestError"
                 }
               }
             }
@@ -3060,18 +2915,11 @@
             }
           },
           "400": {
-            "description": "BadRequest | InvalidRequestError",
+            "description": "Bad request",
             "content": {
               "application/json": {
                 "schema": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
-                    },
-                    {
-                      "$ref": "#/components/schemas/InvalidRequestError"
-                    }
-                  ]
+                  "$ref": "#/components/schemas/BadRequestError"
                 }
               }
             }
@@ -3173,9 +3021,6 @@
                   "anyOf": [
                     {
                       "$ref": "#/components/schemas/McpUnsupportedOAuthError"
-                    },
-                    {
-                      "$ref": "#/components/schemas/InvalidRequestError"
                     }
                   ]
                 }
@@ -3252,11 +3097,11 @@
             }
           },
           "400": {
-            "description": "Bad request",
+            "description": "InvalidRequestError",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BadRequestError"
+                  "$ref": "#/components/schemas/InvalidRequestError"
                 }
               }
             }
@@ -3324,18 +3169,11 @@
             }
           },
           "400": {
-            "description": "BadRequest | InvalidRequestError",
+            "description": "Bad request",
             "content": {
               "application/json": {
                 "schema": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
-                    },
-                    {
-                      "$ref": "#/components/schemas/InvalidRequestError"
-                    }
-                  ]
+                  "$ref": "#/components/schemas/BadRequestError"
                 }
               }
             }
@@ -3426,9 +3264,6 @@
                   "anyOf": [
                     {
                       "$ref": "#/components/schemas/McpUnsupportedOAuthError"
-                    },
-                    {
-                      "$ref": "#/components/schemas/InvalidRequestError"
                     }
                   ]
                 }
@@ -3499,11 +3334,11 @@
             }
           },
           "400": {
-            "description": "Bad request",
+            "description": "InvalidRequestError",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BadRequestError"
+                  "$ref": "#/components/schemas/InvalidRequestError"
                 }
               }
             }
@@ -3571,11 +3406,11 @@
             }
           },
           "400": {
-            "description": "Bad request",
+            "description": "InvalidRequestError",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BadRequestError"
+                  "$ref": "#/components/schemas/InvalidRequestError"
                 }
               }
             }
@@ -3638,11 +3473,11 @@
             }
           },
           "400": {
-            "description": "Bad request",
+            "description": "InvalidRequestError",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BadRequestError"
+                  "$ref": "#/components/schemas/InvalidRequestError"
                 }
               }
             }
@@ -3692,11 +3527,11 @@
             }
           },
           "400": {
-            "description": "Bad request",
+            "description": "InvalidRequestError",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BadRequestError"
+                  "$ref": "#/components/schemas/InvalidRequestError"
                 }
               }
             }
@@ -3746,11 +3581,11 @@
             }
           },
           "400": {
-            "description": "Bad request",
+            "description": "InvalidRequestError",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BadRequestError"
+                  "$ref": "#/components/schemas/InvalidRequestError"
                 }
               }
             }
@@ -3808,18 +3643,11 @@
             }
           },
           "400": {
-            "description": "BadRequest | InvalidRequestError",
+            "description": "Bad request",
             "content": {
               "application/json": {
                 "schema": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
-                    },
-                    {
-                      "$ref": "#/components/schemas/InvalidRequestError"
-                    }
-                  ]
+                  "$ref": "#/components/schemas/BadRequestError"
                 }
               }
             }
@@ -3908,11 +3736,11 @@
             }
           },
           "400": {
-            "description": "Bad request",
+            "description": "InvalidRequestError",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BadRequestError"
+                  "$ref": "#/components/schemas/InvalidRequestError"
                 }
               }
             }
@@ -3977,11 +3805,11 @@
             }
           },
           "400": {
-            "description": "Bad request",
+            "description": "InvalidRequestError",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BadRequestError"
+                  "$ref": "#/components/schemas/InvalidRequestError"
                 }
               }
             }
@@ -4063,11 +3891,11 @@
             }
           },
           "400": {
-            "description": "Bad request",
+            "description": "InvalidRequestError",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BadRequestError"
+                  "$ref": "#/components/schemas/InvalidRequestError"
                 }
               }
             }
@@ -4121,11 +3949,11 @@
             }
           },
           "400": {
-            "description": "Bad request",
+            "description": "InvalidRequestError",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BadRequestError"
+                  "$ref": "#/components/schemas/InvalidRequestError"
                 }
               }
             }
@@ -4173,18 +4001,11 @@
             }
           },
           "400": {
-            "description": "BadRequest | InvalidRequestError",
+            "description": "Bad request",
             "content": {
               "application/json": {
                 "schema": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
-                    },
-                    {
-                      "$ref": "#/components/schemas/InvalidRequestError"
-                    }
-                  ]
+                  "$ref": "#/components/schemas/BadRequestError"
                 }
               }
             }
@@ -4276,11 +4097,11 @@
             }
           },
           "400": {
-            "description": "Bad request",
+            "description": "InvalidRequestError",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BadRequestError"
+                  "$ref": "#/components/schemas/InvalidRequestError"
                 }
               }
             }
@@ -4347,18 +4168,11 @@
             }
           },
           "400": {
-            "description": "BadRequest | InvalidRequestError",
+            "description": "Bad request",
             "content": {
               "application/json": {
                 "schema": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
-                    },
-                    {
-                      "$ref": "#/components/schemas/InvalidRequestError"
-                    }
-                  ]
+                  "$ref": "#/components/schemas/BadRequestError"
                 }
               }
             }
@@ -4456,11 +4270,11 @@
             }
           },
           "400": {
-            "description": "Bad request",
+            "description": "InvalidRequestError",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BadRequestError"
+                  "$ref": "#/components/schemas/InvalidRequestError"
                 }
               }
             }
@@ -4529,11 +4343,11 @@
             }
           },
           "400": {
-            "description": "Bad request",
+            "description": "InvalidRequestError",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BadRequestError"
+                  "$ref": "#/components/schemas/InvalidRequestError"
                 }
               }
             }
@@ -4607,11 +4421,11 @@
             }
           },
           "400": {
-            "description": "Bad request",
+            "description": "InvalidRequestError",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BadRequestError"
+                  "$ref": "#/components/schemas/InvalidRequestError"
                 }
               }
             }
@@ -4671,18 +4485,11 @@
             }
           },
           "400": {
-            "description": "BadRequest | InvalidRequestError",
+            "description": "Bad request",
             "content": {
               "application/json": {
                 "schema": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
-                    },
-                    {
-                      "$ref": "#/components/schemas/InvalidRequestError"
-                    }
-                  ]
+                  "$ref": "#/components/schemas/BadRequestError"
                 }
               }
             }
@@ -4772,18 +4579,11 @@
             }
           },
           "400": {
-            "description": "BadRequest | InvalidRequestError",
+            "description": "Bad request",
             "content": {
               "application/json": {
                 "schema": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
-                    },
-                    {
-                      "$ref": "#/components/schemas/InvalidRequestError"
-                    }
-                  ]
+                  "$ref": "#/components/schemas/BadRequestError"
                 }
               }
             }
@@ -4847,11 +4647,11 @@
             }
           },
           "400": {
-            "description": "Bad request",
+            "description": "InvalidRequestError",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BadRequestError"
+                  "$ref": "#/components/schemas/InvalidRequestError"
                 }
               }
             }
@@ -4911,18 +4711,11 @@
             }
           },
           "400": {
-            "description": "BadRequest | InvalidRequestError",
+            "description": "Bad request",
             "content": {
               "application/json": {
                 "schema": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
-                    },
-                    {
-                      "$ref": "#/components/schemas/InvalidRequestError"
-                    }
-                  ]
+                  "$ref": "#/components/schemas/BadRequestError"
                 }
               }
             }
@@ -5025,11 +4818,11 @@
             }
           },
           "400": {
-            "description": "Bad request",
+            "description": "InvalidRequestError",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BadRequestError"
+                  "$ref": "#/components/schemas/InvalidRequestError"
                 }
               }
             }
@@ -5086,11 +4879,11 @@
             }
           },
           "400": {
-            "description": "Bad request",
+            "description": "InvalidRequestError",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BadRequestError"
+                  "$ref": "#/components/schemas/InvalidRequestError"
                 }
               }
             }
@@ -5155,9 +4948,6 @@
                   "anyOf": [
                     {
                       "$ref": "#/components/schemas/ProviderAuthError1"
-                    },
-                    {
-                      "$ref": "#/components/schemas/InvalidRequestError"
                     }
                   ]
                 }
@@ -5248,9 +5038,6 @@
                   "anyOf": [
                     {
                       "$ref": "#/components/schemas/ProviderAuthError1"
-                    },
-                    {
-                      "$ref": "#/components/schemas/InvalidRequestError"
                     }
                   ]
                 }
@@ -5383,11 +5170,11 @@
             }
           },
           "400": {
-            "description": "Bad request",
+            "description": "InvalidRequestError",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BadRequestError"
+                  "$ref": "#/components/schemas/InvalidRequestError"
                 }
               }
             }
@@ -5435,18 +5222,11 @@
             }
           },
           "400": {
-            "description": "BadRequest | InvalidRequestError",
+            "description": "Bad request",
             "content": {
               "application/json": {
                 "schema": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
-                    },
-                    {
-                      "$ref": "#/components/schemas/InvalidRequestError"
-                    }
-                  ]
+                  "$ref": "#/components/schemas/BadRequestError"
                 }
               }
             }
@@ -5548,18 +5328,11 @@
             }
           },
           "400": {
-            "description": "BadRequest | InvalidRequestError",
+            "description": "Bad request",
             "content": {
               "application/json": {
                 "schema": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
-                    },
-                    {
-                      "$ref": "#/components/schemas/InvalidRequestError"
-                    }
-                  ]
+                  "$ref": "#/components/schemas/BadRequestError"
                 }
               }
             }
@@ -5618,18 +5391,11 @@
             }
           },
           "400": {
-            "description": "BadRequest | InvalidRequestError",
+            "description": "Bad request",
             "content": {
               "application/json": {
                 "schema": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
-                    },
-                    {
-                      "$ref": "#/components/schemas/InvalidRequestError"
-                    }
-                  ]
+                  "$ref": "#/components/schemas/BadRequestError"
                 }
               }
             }
@@ -5697,18 +5463,11 @@
             }
           },
           "400": {
-            "description": "BadRequest | InvalidRequestError",
+            "description": "Bad request",
             "content": {
               "application/json": {
                 "schema": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
-                    },
-                    {
-                      "$ref": "#/components/schemas/InvalidRequestError"
-                    }
-                  ]
+                  "$ref": "#/components/schemas/BadRequestError"
                 }
               }
             }
@@ -5775,18 +5534,11 @@
             }
           },
           "400": {
-            "description": "BadRequest | InvalidRequestError",
+            "description": "Bad request",
             "content": {
               "application/json": {
                 "schema": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
-                    },
-                    {
-                      "$ref": "#/components/schemas/InvalidRequestError"
-                    }
-                  ]
+                  "$ref": "#/components/schemas/BadRequestError"
                 }
               }
             }
@@ -5889,18 +5641,11 @@
             }
           },
           "400": {
-            "description": "BadRequest | InvalidRequestError",
+            "description": "Bad request",
             "content": {
               "application/json": {
                 "schema": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
-                    },
-                    {
-                      "$ref": "#/components/schemas/InvalidRequestError"
-                    }
-                  ]
+                  "$ref": "#/components/schemas/BadRequestError"
                 }
               }
             }
@@ -5973,18 +5718,11 @@
             }
           },
           "400": {
-            "description": "BadRequest | InvalidRequestError",
+            "description": "Bad request",
             "content": {
               "application/json": {
                 "schema": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
-                    },
-                    {
-                      "$ref": "#/components/schemas/InvalidRequestError"
-                    }
-                  ]
+                  "$ref": "#/components/schemas/BadRequestError"
                 }
               }
             }
@@ -6066,11 +5804,11 @@
             }
           },
           "400": {
-            "description": "Bad request",
+            "description": "InvalidRequestError",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BadRequestError"
+                  "$ref": "#/components/schemas/InvalidRequestError"
                 }
               }
             }
@@ -6164,18 +5902,11 @@
             }
           },
           "400": {
-            "description": "BadRequest | InvalidRequestError",
+            "description": "Bad request",
             "content": {
               "application/json": {
                 "schema": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
-                    },
-                    {
-                      "$ref": "#/components/schemas/InvalidRequestError"
-                    }
-                  ]
+                  "$ref": "#/components/schemas/BadRequestError"
                 }
               }
             }
@@ -6254,18 +5985,11 @@
             }
           },
           "400": {
-            "description": "BadRequest | InvalidRequestError",
+            "description": "Bad request",
             "content": {
               "application/json": {
                 "schema": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
-                    },
-                    {
-                      "$ref": "#/components/schemas/InvalidRequestError"
-                    }
-                  ]
+                  "$ref": "#/components/schemas/BadRequestError"
                 }
               }
             }
@@ -6427,18 +6151,11 @@
             }
           },
           "400": {
-            "description": "BadRequest | InvalidRequestError",
+            "description": "Bad request",
             "content": {
               "application/json": {
                 "schema": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
-                    },
-                    {
-                      "$ref": "#/components/schemas/InvalidRequestError"
-                    }
-                  ]
+                  "$ref": "#/components/schemas/BadRequestError"
                 }
               }
             }
@@ -6515,18 +6232,11 @@
             }
           },
           "400": {
-            "description": "BadRequest | InvalidRequestError",
+            "description": "Bad request",
             "content": {
               "application/json": {
                 "schema": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
-                    },
-                    {
-                      "$ref": "#/components/schemas/InvalidRequestError"
-                    }
-                  ]
+                  "$ref": "#/components/schemas/BadRequestError"
                 }
               }
             }
@@ -6605,18 +6315,11 @@
             }
           },
           "400": {
-            "description": "BadRequest | InvalidRequestError",
+            "description": "Bad request",
             "content": {
               "application/json": {
                 "schema": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
-                    },
-                    {
-                      "$ref": "#/components/schemas/InvalidRequestError"
-                    }
-                  ]
+                  "$ref": "#/components/schemas/BadRequestError"
                 }
               }
             }
@@ -6687,6 +6390,16 @@
               "type": "string"
             },
             "required": false
+          },
+          {
+            "name": "scope",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": ["turn", "all"],
+              "description": "turn stops only the running turn, and background tasks keep running. all (the default) also cancels background tasks."
+            },
+            "required": false
           }
         ],
         "responses": {
@@ -6702,18 +6415,11 @@
             }
           },
           "400": {
-            "description": "BadRequest | InvalidRequestError",
+            "description": "Bad request",
             "content": {
               "application/json": {
                 "schema": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
-                    },
-                    {
-                      "$ref": "#/components/schemas/InvalidRequestError"
-                    }
-                  ]
+                  "$ref": "#/components/schemas/BadRequestError"
                 }
               }
             }
@@ -6773,18 +6479,11 @@
             }
           },
           "400": {
-            "description": "BadRequest | InvalidRequestError",
+            "description": "Bad request",
             "content": {
               "application/json": {
                 "schema": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
-                    },
-                    {
-                      "$ref": "#/components/schemas/InvalidRequestError"
-                    }
-                  ]
+                  "$ref": "#/components/schemas/BadRequestError"
                 }
               }
             }
@@ -6876,11 +6575,11 @@
             }
           },
           "400": {
-            "description": "Bad request",
+            "description": "InvalidRequestError",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BadRequestError"
+                  "$ref": "#/components/schemas/InvalidRequestError"
                 }
               }
             }
@@ -6957,11 +6656,11 @@
             }
           },
           "400": {
-            "description": "Bad request",
+            "description": "InvalidRequestError",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BadRequestError"
+                  "$ref": "#/components/schemas/InvalidRequestError"
                 }
               }
             }
@@ -7041,18 +6740,11 @@
             }
           },
           "400": {
-            "description": "BadRequest | InvalidRequestError",
+            "description": "Bad request",
             "content": {
               "application/json": {
                 "schema": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
-                    },
-                    {
-                      "$ref": "#/components/schemas/InvalidRequestError"
-                    }
-                  ]
+                  "$ref": "#/components/schemas/BadRequestError"
                 }
               }
             }
@@ -7136,18 +6828,11 @@
             "description": "Prompt accepted"
           },
           "400": {
-            "description": "BadRequest | InvalidRequestError",
+            "description": "Bad request",
             "content": {
               "application/json": {
                 "schema": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
-                    },
-                    {
-                      "$ref": "#/components/schemas/InvalidRequestError"
-                    }
-                  ]
+                  "$ref": "#/components/schemas/BadRequestError"
                 }
               }
             }
@@ -7243,6 +6928,693 @@
         ]
       }
     },
+    "/session/{sessionID}/ask": {
+      "post": {
+        "tags": ["session"],
+        "operationId": "session.ask",
+        "parameters": [
+          {
+            "name": "sessionID",
+            "in": "path",
+            "schema": {
+              "type": "string",
+              "pattern": "^ses"
+            },
+            "required": true
+          },
+          {
+            "name": "directory",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          },
+          {
+            "name": "workspace",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Completed Ask turn",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "pattern": "^atn_"
+                    },
+                    "threadID": {
+                      "type": "string",
+                      "pattern": "^ask_"
+                    },
+                    "question": {
+                      "type": "string"
+                    },
+                    "answer": {
+                      "type": "string"
+                    },
+                    "toolActivity": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "callID": {
+                            "type": "string"
+                          },
+                          "tool": {
+                            "type": "string"
+                          },
+                          "status": {
+                            "type": "string",
+                            "enum": ["completed", "error"]
+                          },
+                          "input": {
+                            "type": "string"
+                          },
+                          "output": {
+                            "type": "string"
+                          },
+                          "error": {
+                            "type": "string"
+                          }
+                        },
+                        "required": ["callID", "tool", "status", "input"],
+                        "additionalProperties": false
+                      }
+                    },
+                    "time": {
+                      "type": "object",
+                      "properties": {
+                        "created": {
+                          "anyOf": [
+                            {
+                              "type": "number"
+                            },
+                            {
+                              "type": "string",
+                              "enum": ["NaN"]
+                            },
+                            {
+                              "type": "string",
+                              "enum": ["Infinity"]
+                            },
+                            {
+                              "type": "string",
+                              "enum": ["-Infinity"]
+                            },
+                            {
+                              "type": "string",
+                              "enum": ["Infinity", "-Infinity", "NaN"]
+                            }
+                          ]
+                        }
+                      },
+                      "required": ["created"],
+                      "additionalProperties": false
+                    },
+                    "requestID": {
+                      "$ref": "#/components/schemas/SessionAskRequestID"
+                    },
+                    "text": {
+                      "type": "string"
+                    }
+                  },
+                  "required": ["id", "threadID", "question", "answer", "toolActivity", "time", "requestID", "text"],
+                  "additionalProperties": false,
+                  "description": "Completed Ask turn"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "BadRequest | InvalidRequestError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/BadRequestError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "NotFoundError | ModelNotFoundError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/NotFoundError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ModelNotFoundError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "ConflictError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConflictError"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "UpstreamError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UpstreamError"
+                }
+              }
+            }
+          }
+        },
+        "description": "Start or continue an isolated Ask thread using the current session context without changing session history.",
+        "summary": "Ask without changing history",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "requestID": {
+                    "$ref": "#/components/schemas/SessionAskRequestID"
+                  },
+                  "threadID": {
+                    "type": "string",
+                    "pattern": "^ask_"
+                  },
+                  "question": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "model": {
+                    "type": "object",
+                    "properties": {
+                      "providerID": {
+                        "type": "string"
+                      },
+                      "modelID": {
+                        "type": "string"
+                      }
+                    },
+                    "required": ["providerID", "modelID"],
+                    "additionalProperties": false
+                  },
+                  "agent": {
+                    "type": "string"
+                  },
+                  "variant": {
+                    "type": "string"
+                  }
+                },
+                "required": ["question"],
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.session.ask({\n  ...\n})"
+          }
+        ]
+      },
+      "get": {
+        "tags": ["session"],
+        "operationId": "session.askThreads",
+        "parameters": [
+          {
+            "name": "sessionID",
+            "in": "path",
+            "schema": {
+              "type": "string",
+              "pattern": "^ses"
+            },
+            "required": true
+          },
+          {
+            "name": "directory",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          },
+          {
+            "name": "workspace",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100
+            },
+            "required": false
+          },
+          {
+            "name": "before",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "maxLength": 512
+            },
+            "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Ask threads",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "items": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": {
+                            "type": "string",
+                            "pattern": "^ask_"
+                          },
+                          "sessionID": {
+                            "type": "string",
+                            "pattern": "^ses"
+                          },
+                          "title": {
+                            "type": "string"
+                          },
+                          "time": {
+                            "type": "object",
+                            "properties": {
+                              "created": {
+                                "anyOf": [
+                                  {
+                                    "type": "number"
+                                  },
+                                  {
+                                    "type": "string",
+                                    "enum": ["NaN"]
+                                  },
+                                  {
+                                    "type": "string",
+                                    "enum": ["Infinity"]
+                                  },
+                                  {
+                                    "type": "string",
+                                    "enum": ["-Infinity"]
+                                  },
+                                  {
+                                    "type": "string",
+                                    "enum": ["Infinity", "-Infinity", "NaN"]
+                                  }
+                                ]
+                              },
+                              "updated": {
+                                "anyOf": [
+                                  {
+                                    "type": "number"
+                                  },
+                                  {
+                                    "type": "string",
+                                    "enum": ["NaN"]
+                                  },
+                                  {
+                                    "type": "string",
+                                    "enum": ["Infinity"]
+                                  },
+                                  {
+                                    "type": "string",
+                                    "enum": ["-Infinity"]
+                                  },
+                                  {
+                                    "type": "string",
+                                    "enum": ["Infinity", "-Infinity", "NaN"]
+                                  }
+                                ]
+                              }
+                            },
+                            "required": ["created", "updated"],
+                            "additionalProperties": false
+                          }
+                        },
+                        "required": ["id", "sessionID", "title", "time"],
+                        "additionalProperties": false
+                      }
+                    },
+                    "more": {
+                      "type": "boolean"
+                    },
+                    "cursor": {
+                      "type": "string"
+                    }
+                  },
+                  "required": ["items", "more"],
+                  "additionalProperties": false,
+                  "description": "Ask threads"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BadRequestError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "NotFoundError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundError"
+                }
+              }
+            }
+          }
+        },
+        "description": "List isolated Ask threads for a session with cursor pagination.",
+        "summary": "List Ask threads",
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.session.askThreads({\n  ...\n})"
+          }
+        ]
+      }
+    },
+    "/session/{sessionID}/ask/{threadID}": {
+      "get": {
+        "tags": ["session"],
+        "operationId": "session.askThread",
+        "parameters": [
+          {
+            "name": "sessionID",
+            "in": "path",
+            "schema": {
+              "type": "string",
+              "pattern": "^ses"
+            },
+            "required": true
+          },
+          {
+            "name": "threadID",
+            "in": "path",
+            "schema": {
+              "type": "string",
+              "pattern": "^ask_"
+            },
+            "required": true
+          },
+          {
+            "name": "directory",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          },
+          {
+            "name": "workspace",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100
+            },
+            "required": false
+          },
+          {
+            "name": "before",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "maxLength": 512
+            },
+            "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Ask turns",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "items": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": {
+                            "type": "string",
+                            "pattern": "^atn_"
+                          },
+                          "threadID": {
+                            "type": "string",
+                            "pattern": "^ask_"
+                          },
+                          "question": {
+                            "type": "string"
+                          },
+                          "answer": {
+                            "type": "string"
+                          },
+                          "toolActivity": {
+                            "type": "array",
+                            "items": {
+                              "type": "object",
+                              "properties": {
+                                "callID": {
+                                  "type": "string"
+                                },
+                                "tool": {
+                                  "type": "string"
+                                },
+                                "status": {
+                                  "type": "string",
+                                  "enum": ["completed", "error"]
+                                },
+                                "input": {
+                                  "type": "string"
+                                },
+                                "output": {
+                                  "type": "string"
+                                },
+                                "error": {
+                                  "type": "string"
+                                }
+                              },
+                              "required": ["callID", "tool", "status", "input"],
+                              "additionalProperties": false
+                            }
+                          },
+                          "time": {
+                            "type": "object",
+                            "properties": {
+                              "created": {
+                                "anyOf": [
+                                  {
+                                    "type": "number"
+                                  },
+                                  {
+                                    "type": "string",
+                                    "enum": ["NaN"]
+                                  },
+                                  {
+                                    "type": "string",
+                                    "enum": ["Infinity"]
+                                  },
+                                  {
+                                    "type": "string",
+                                    "enum": ["-Infinity"]
+                                  },
+                                  {
+                                    "type": "string",
+                                    "enum": ["Infinity", "-Infinity", "NaN"]
+                                  }
+                                ]
+                              }
+                            },
+                            "required": ["created"],
+                            "additionalProperties": false
+                          }
+                        },
+                        "required": ["id", "threadID", "question", "answer", "toolActivity", "time"],
+                        "additionalProperties": false
+                      }
+                    },
+                    "more": {
+                      "type": "boolean"
+                    },
+                    "cursor": {
+                      "type": "string"
+                    }
+                  },
+                  "required": ["items", "more"],
+                  "additionalProperties": false,
+                  "description": "Ask turns"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BadRequestError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "NotFoundError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundError"
+                }
+              }
+            }
+          }
+        },
+        "description": "Get completed turns from an isolated Ask thread with cursor pagination.",
+        "summary": "Get Ask thread",
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.session.askThread({\n  ...\n})"
+          }
+        ]
+      }
+    },
+    "/session/{sessionID}/ask/{threadID}/cancel": {
+      "post": {
+        "tags": ["session"],
+        "operationId": "session.askCancel",
+        "parameters": [
+          {
+            "name": "sessionID",
+            "in": "path",
+            "schema": {
+              "type": "string",
+              "pattern": "^ses"
+            },
+            "required": true
+          },
+          {
+            "name": "threadID",
+            "in": "path",
+            "schema": {
+              "type": "string",
+              "pattern": "^ask_"
+            },
+            "required": true
+          },
+          {
+            "name": "directory",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          },
+          {
+            "name": "workspace",
+            "in": "query",
+            "schema": {
+              "type": "string"
+            },
+            "required": false
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Ask cancellation processed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "boolean",
+                  "description": "Ask cancellation processed"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BadRequestError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "NotFoundError",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundError"
+                }
+              }
+            }
+          }
+        },
+        "description": "Cancel active work for one isolated Ask thread without cancelling session execution.",
+        "summary": "Cancel Ask turn",
+        "x-codeSamples": [
+          {
+            "lang": "js",
+            "source": "import { createOpencodeClient } from \"@opencode-ai/sdk\n\nconst client = createOpencodeClient()\nawait client.session.askCancel({\n  ...\n})"
+          }
+        ]
+      }
+    },
     "/session/{sessionID}/command": {
       "post": {
         "tags": ["session"],
@@ -7298,18 +7670,11 @@
             }
           },
           "400": {
-            "description": "BadRequest | InvalidRequestError",
+            "description": "Bad request",
             "content": {
               "application/json": {
                 "schema": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
-                    },
-                    {
-                      "$ref": "#/components/schemas/InvalidRequestError"
-                    }
-                  ]
+                  "$ref": "#/components/schemas/BadRequestError"
                 }
               }
             }
@@ -7454,18 +7819,11 @@
             }
           },
           "400": {
-            "description": "BadRequest | InvalidRequestError",
+            "description": "Bad request",
             "content": {
               "application/json": {
                 "schema": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
-                    },
-                    {
-                      "$ref": "#/components/schemas/InvalidRequestError"
-                    }
-                  ]
+                  "$ref": "#/components/schemas/BadRequestError"
                 }
               }
             }
@@ -7580,18 +7938,11 @@
             }
           },
           "400": {
-            "description": "BadRequest | InvalidRequestError",
+            "description": "Bad request",
             "content": {
               "application/json": {
                 "schema": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
-                    },
-                    {
-                      "$ref": "#/components/schemas/InvalidRequestError"
-                    }
-                  ]
+                  "$ref": "#/components/schemas/BadRequestError"
                 }
               }
             }
@@ -7617,7 +7968,7 @@
             }
           }
         },
-        "description": "Revert a specific message in a session, undoing its effects and restoring the previous state.",
+        "description": "Revert a specific message in a session, undoing its effects and restoring the previous state. Revert stops a running turn of the session itself, so clients do not need to abort first. Background tasks that the reverted messages started or resumed are cancelled, and other background tasks keep running. Returns 409 while another revert or unrevert of the session is in progress.",
         "summary": "Revert message",
         "requestBody": {
           "content": {
@@ -7691,18 +8042,11 @@
             }
           },
           "400": {
-            "description": "BadRequest | InvalidRequestError",
+            "description": "Bad request",
             "content": {
               "application/json": {
                 "schema": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
-                    },
-                    {
-                      "$ref": "#/components/schemas/InvalidRequestError"
-                    }
-                  ]
+                  "$ref": "#/components/schemas/BadRequestError"
                 }
               }
             }
@@ -7728,7 +8072,7 @@
             }
           }
         },
-        "description": "Restore all previously reverted messages in a session.",
+        "description": "Restore all previously reverted messages in a session. Unrevert stops a running turn of the session itself, and background tasks keep running. Returns 409 while another revert or unrevert of the session is in progress.",
         "summary": "Restore reverted messages",
         "x-codeSamples": [
           {
@@ -7791,18 +8135,11 @@
             }
           },
           "400": {
-            "description": "BadRequest | InvalidRequestError",
+            "description": "Bad request",
             "content": {
               "application/json": {
                 "schema": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
-                    },
-                    {
-                      "$ref": "#/components/schemas/InvalidRequestError"
-                    }
-                  ]
+                  "$ref": "#/components/schemas/BadRequestError"
                 }
               }
             }
@@ -7915,18 +8252,11 @@
             }
           },
           "400": {
-            "description": "BadRequest | InvalidRequestError",
+            "description": "Bad request",
             "content": {
               "application/json": {
                 "schema": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
-                    },
-                    {
-                      "$ref": "#/components/schemas/InvalidRequestError"
-                    }
-                  ]
+                  "$ref": "#/components/schemas/BadRequestError"
                 }
               }
             }
@@ -8010,18 +8340,11 @@
             }
           },
           "400": {
-            "description": "BadRequest | InvalidRequestError",
+            "description": "Bad request",
             "content": {
               "application/json": {
                 "schema": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
-                    },
-                    {
-                      "$ref": "#/components/schemas/InvalidRequestError"
-                    }
-                  ]
+                  "$ref": "#/components/schemas/BadRequestError"
                 }
               }
             }
@@ -8090,11 +8413,11 @@
             }
           },
           "400": {
-            "description": "Bad request",
+            "description": "InvalidRequestError",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BadRequestError"
+                  "$ref": "#/components/schemas/InvalidRequestError"
                 }
               }
             }
@@ -8152,18 +8475,11 @@
             }
           },
           "400": {
-            "description": "BadRequest | InvalidRequestError",
+            "description": "Bad request",
             "content": {
               "application/json": {
                 "schema": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
-                    },
-                    {
-                      "$ref": "#/components/schemas/InvalidRequestError"
-                    }
-                  ]
+                  "$ref": "#/components/schemas/BadRequestError"
                 }
               }
             }
@@ -8266,18 +8582,11 @@
             }
           },
           "400": {
-            "description": "BadRequest | InvalidRequestError",
+            "description": "Bad request",
             "content": {
               "application/json": {
                 "schema": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
-                    },
-                    {
-                      "$ref": "#/components/schemas/InvalidRequestError"
-                    }
-                  ]
+                  "$ref": "#/components/schemas/BadRequestError"
                 }
               }
             }
@@ -8369,18 +8678,11 @@
             }
           },
           "400": {
-            "description": "BadRequest | InvalidRequestError",
+            "description": "Bad request",
             "content": {
               "application/json": {
                 "schema": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
-                    },
-                    {
-                      "$ref": "#/components/schemas/InvalidRequestError"
-                    }
-                  ]
+                  "$ref": "#/components/schemas/BadRequestError"
                 }
               }
             }
@@ -8444,18 +8746,11 @@
             }
           },
           "400": {
-            "description": "BadRequest | InvalidRequestError",
+            "description": "Bad request",
             "content": {
               "application/json": {
                 "schema": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
-                    },
-                    {
-                      "$ref": "#/components/schemas/InvalidRequestError"
-                    }
-                  ]
+                  "$ref": "#/components/schemas/BadRequestError"
                 }
               }
             }
@@ -8522,11 +8817,11 @@
             }
           },
           "400": {
-            "description": "Bad request",
+            "description": "InvalidRequestError",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BadRequestError"
+                  "$ref": "#/components/schemas/InvalidRequestError"
                 }
               }
             }
@@ -8577,11 +8872,11 @@
             }
           },
           "400": {
-            "description": "Bad request",
+            "description": "InvalidRequestError",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BadRequestError"
+                  "$ref": "#/components/schemas/InvalidRequestError"
                 }
               }
             }
@@ -8632,11 +8927,11 @@
             }
           },
           "400": {
-            "description": "Bad request",
+            "description": "InvalidRequestError",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BadRequestError"
+                  "$ref": "#/components/schemas/InvalidRequestError"
                 }
               }
             }
@@ -8687,11 +8982,11 @@
             }
           },
           "400": {
-            "description": "Bad request",
+            "description": "InvalidRequestError",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BadRequestError"
+                  "$ref": "#/components/schemas/InvalidRequestError"
                 }
               }
             }
@@ -8742,11 +9037,11 @@
             }
           },
           "400": {
-            "description": "Bad request",
+            "description": "InvalidRequestError",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BadRequestError"
+                  "$ref": "#/components/schemas/InvalidRequestError"
                 }
               }
             }
@@ -8797,11 +9092,11 @@
             }
           },
           "400": {
-            "description": "Bad request",
+            "description": "InvalidRequestError",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BadRequestError"
+                  "$ref": "#/components/schemas/InvalidRequestError"
                 }
               }
             }
@@ -8852,18 +9147,11 @@
             }
           },
           "400": {
-            "description": "BadRequest | InvalidRequestError",
+            "description": "Bad request",
             "content": {
               "application/json": {
                 "schema": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
-                    },
-                    {
-                      "$ref": "#/components/schemas/InvalidRequestError"
-                    }
-                  ]
+                  "$ref": "#/components/schemas/BadRequestError"
                 }
               }
             }
@@ -8930,11 +9218,11 @@
             }
           },
           "400": {
-            "description": "Bad request",
+            "description": "InvalidRequestError",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BadRequestError"
+                  "$ref": "#/components/schemas/InvalidRequestError"
                 }
               }
             }
@@ -9012,18 +9300,11 @@
             }
           },
           "400": {
-            "description": "BadRequest | InvalidRequestError",
+            "description": "Bad request",
             "content": {
               "application/json": {
                 "schema": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
-                    },
-                    {
-                      "$ref": "#/components/schemas/InvalidRequestError"
-                    }
-                  ]
+                  "$ref": "#/components/schemas/BadRequestError"
                 }
               }
             }
@@ -9096,18 +9377,11 @@
             }
           },
           "400": {
-            "description": "BadRequest | InvalidRequestError",
+            "description": "Bad request",
             "content": {
               "application/json": {
                 "schema": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
-                    },
-                    {
-                      "$ref": "#/components/schemas/InvalidRequestError"
-                    }
-                  ]
+                  "$ref": "#/components/schemas/BadRequestError"
                 }
               }
             }
@@ -9194,11 +9468,11 @@
             }
           },
           "400": {
-            "description": "Bad request",
+            "description": "InvalidRequestError",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BadRequestError"
+                  "$ref": "#/components/schemas/InvalidRequestError"
                 }
               }
             }
@@ -9249,11 +9523,11 @@
             }
           },
           "400": {
-            "description": "Bad request",
+            "description": "InvalidRequestError",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BadRequestError"
+                  "$ref": "#/components/schemas/InvalidRequestError"
                 }
               }
             }
@@ -9327,11 +9601,11 @@
             }
           },
           "400": {
-            "description": "Bad request",
+            "description": "InvalidRequestError",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BadRequestError"
+                  "$ref": "#/components/schemas/InvalidRequestError"
                 }
               }
             }
@@ -9385,11 +9659,11 @@
             }
           },
           "400": {
-            "description": "Bad request",
+            "description": "InvalidRequestError",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BadRequestError"
+                  "$ref": "#/components/schemas/InvalidRequestError"
                 }
               }
             }
@@ -9431,7 +9705,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Workspace"
+                  "$ref": "#/components/schemas/Workspace1"
                 }
               }
             }
@@ -9446,10 +9720,7 @@
                       "$ref": "#/components/schemas/WorkspaceCreateError"
                     },
                     {
-                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
-                    },
-                    {
-                      "$ref": "#/components/schemas/InvalidRequestError"
+                      "$ref": "#/components/schemas/BadRequestError"
                     }
                   ]
                 }
@@ -9532,11 +9803,11 @@
             "description": "Workspace list synced"
           },
           "400": {
-            "description": "Bad request",
+            "description": "InvalidRequestError",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BadRequestError"
+                  "$ref": "#/components/schemas/InvalidRequestError"
                 }
               }
             }
@@ -9590,11 +9861,11 @@
             }
           },
           "400": {
-            "description": "Bad request",
+            "description": "InvalidRequestError",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/BadRequestError"
+                  "$ref": "#/components/schemas/InvalidRequestError"
                 }
               }
             }
@@ -9653,18 +9924,11 @@
             }
           },
           "400": {
-            "description": "BadRequest | InvalidRequestError",
+            "description": "Bad request",
             "content": {
               "application/json": {
                 "schema": {
-                  "anyOf": [
-                    {
-                      "$ref": "#/components/schemas/effect_HttpApiError_BadRequest"
-                    },
-                    {
-                      "$ref": "#/components/schemas/InvalidRequestError"
-                    }
-                  ]
+                  "$ref": "#/components/schemas/BadRequestError"
                 }
               }
             }
@@ -9717,9 +9981,6 @@
                     },
                     {
                       "$ref": "#/components/schemas/VcsApplyError"
-                    },
-                    {
-                      "$ref": "#/components/schemas/InvalidRequestError"
                     }
                   ]
                 }
@@ -14986,9 +15247,6 @@
                   "anyOf": [
                     {
                       "$ref": "#/components/schemas/ProjectCopyError"
-                    },
-                    {
-                      "$ref": "#/components/schemas/InvalidRequestError"
                     }
                   ]
                 }
@@ -15069,9 +15327,6 @@
                   "anyOf": [
                     {
                       "$ref": "#/components/schemas/ProjectCopyError"
-                    },
-                    {
-                      "$ref": "#/components/schemas/InvalidRequestError"
                     }
                   ]
                 }
@@ -15151,9 +15406,6 @@
                   "anyOf": [
                     {
                       "$ref": "#/components/schemas/ProjectCopyError"
-                    },
-                    {
-                      "$ref": "#/components/schemas/InvalidRequestError"
                     }
                   ]
                 }
@@ -15399,6 +15651,9 @@
             "$ref": "#/components/schemas/EventSessionError"
           },
           {
+            "$ref": "#/components/schemas/EventSessionAskToolActivity"
+          },
+          {
             "$ref": "#/components/schemas/EventInstallationUpdated"
           },
           {
@@ -15642,17 +15897,6 @@
           }
         ]
       },
-      "effect_HttpApiError_BadRequest": {
-        "type": "object",
-        "properties": {
-          "_tag": {
-            "type": "string",
-            "enum": ["BadRequest"]
-          }
-        },
-        "required": ["_tag"],
-        "additionalProperties": false
-      },
       "InvalidRequestError": {
         "type": "object",
         "properties": {
@@ -15767,6 +16011,10 @@
             "type": "string"
           },
           "parentID": {
+            "type": "string",
+            "pattern": "^ses"
+          },
+          "taskParentID": {
             "type": "string",
             "pattern": "^ses"
           },
@@ -16435,6 +16683,20 @@
           },
           "metadata": {
             "type": "object"
+          },
+          "compacted": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "compactionGroup": {
+            "type": "string"
+          },
+          "compactionSummary": {
+            "type": "string"
+          },
+          "compactionGeneration": {
+            "type": "integer",
+            "minimum": 0
           }
         },
         "required": ["id", "sessionID", "messageID", "type", "text"],
@@ -16483,6 +16745,9 @@
           },
           "command": {
             "type": "string"
+          },
+          "background": {
+            "type": "boolean"
           }
         },
         "required": ["id", "sessionID", "messageID", "type", "prompt", "description", "agent"],
@@ -16527,6 +16792,20 @@
             },
             "required": ["start"],
             "additionalProperties": false
+          },
+          "compacted": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "compactionGroup": {
+            "type": "string"
+          },
+          "compactionSummary": {
+            "type": "string"
+          },
+          "compactionGeneration": {
+            "type": "integer",
+            "minimum": 0
           }
         },
         "required": ["id", "sessionID", "messageID", "type", "text", "time"],
@@ -16692,6 +16971,20 @@
           },
           "source": {
             "$ref": "#/components/schemas/FilePartSource"
+          },
+          "compacted": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "compactionGroup": {
+            "type": "string"
+          },
+          "compactionSummary": {
+            "type": "string"
+          },
+          "compactionGeneration": {
+            "type": "integer",
+            "minimum": 0
           }
         },
         "required": ["id", "sessionID", "messageID", "type", "mime", "url"],
@@ -16788,6 +17081,16 @@
             "items": {
               "$ref": "#/components/schemas/FilePart"
             }
+          },
+          "compactionGroup": {
+            "type": "string"
+          },
+          "compactionSummary": {
+            "type": "string"
+          },
+          "compactionGeneration": {
+            "type": "integer",
+            "minimum": 0
           }
         },
         "required": ["status", "input", "output", "title", "metadata", "time"],
@@ -17206,6 +17509,11 @@
         },
         "required": ["text"],
         "additionalProperties": false
+      },
+      "SessionAskRequestID": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128
       },
       "Pty": {
         "type": "object",
@@ -19137,6 +19445,62 @@
                         ]
                       }
                     },
+                    "additionalProperties": false
+                  }
+                },
+                "required": ["id", "type", "properties"],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "pattern": "^evt_"
+                  },
+                  "type": {
+                    "type": "string",
+                    "enum": ["session.ask.tool.activity"]
+                  },
+                  "properties": {
+                    "type": "object",
+                    "properties": {
+                      "sessionID": {
+                        "type": "string",
+                        "pattern": "^ses"
+                      },
+                      "requestID": {
+                        "$ref": "#/components/schemas/SessionAskRequestID"
+                      },
+                      "threadID": {
+                        "type": "string",
+                        "pattern": "^ask_"
+                      },
+                      "turnID": {
+                        "type": "string",
+                        "pattern": "^atn_"
+                      },
+                      "callID": {
+                        "type": "string"
+                      },
+                      "tool": {
+                        "type": "string"
+                      },
+                      "status": {
+                        "type": "string",
+                        "enum": ["running", "completed", "error"]
+                      },
+                      "input": {
+                        "type": "string"
+                      },
+                      "output": {
+                        "type": "string"
+                      },
+                      "error": {
+                        "type": "string"
+                      }
+                    },
+                    "required": ["sessionID", "requestID", "threadID", "turnID", "callID", "tool", "status", "input"],
                     "additionalProperties": false
                   }
                 },
@@ -22056,6 +22420,10 @@
             "type": "string",
             "pattern": "^ses"
           },
+          "taskParentID": {
+            "type": "string",
+            "pattern": "^ses"
+          },
           "summary": {
             "type": "object",
             "properties": {
@@ -22505,6 +22873,9 @@
             "type": "string"
           },
           "subtask": {
+            "type": "boolean"
+          },
+          "background": {
             "type": "boolean"
           },
           "hints": {
@@ -23232,9 +23603,95 @@
           },
           "command": {
             "type": "string"
+          },
+          "background": {
+            "type": "boolean"
           }
         },
         "required": ["type", "prompt", "description", "agent"],
+        "additionalProperties": false
+      },
+      "ModelNotFoundError": {
+        "type": "object",
+        "properties": {
+          "_tag": {
+            "type": "string",
+            "enum": ["ModelNotFoundError"]
+          },
+          "providerID": {
+            "type": "string"
+          },
+          "modelID": {
+            "type": "string"
+          },
+          "suggestions": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": ["_tag", "providerID", "modelID", "suggestions", "message"],
+        "additionalProperties": false
+      },
+      "ConflictError": {
+        "type": "object",
+        "properties": {
+          "_tag": {
+            "type": "string",
+            "enum": ["ConflictError"]
+          },
+          "message": {
+            "type": "string"
+          },
+          "resource": {
+            "type": "string"
+          }
+        },
+        "required": ["_tag", "message"],
+        "additionalProperties": false
+      },
+      "UpstreamError": {
+        "type": "object",
+        "properties": {
+          "_tag": {
+            "type": "string",
+            "enum": ["UpstreamError"]
+          },
+          "message": {
+            "type": "string"
+          },
+          "service": {
+            "type": "string"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "string",
+                "enum": ["NaN"]
+              },
+              {
+                "type": "string",
+                "enum": ["Infinity"]
+              },
+              {
+                "type": "string",
+                "enum": ["-Infinity"]
+              },
+              {
+                "type": "string",
+                "enum": ["Infinity", "-Infinity", "NaN"]
+              }
+            ]
+          }
+        },
+        "required": ["_tag", "message"],
         "additionalProperties": false
       },
       "SessionBusyError": {
@@ -23447,6 +23904,56 @@
         "required": ["id", "type", "name", "projectID", "timeUsed"],
         "additionalProperties": false
       },
+      "Workspace1": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^wrk"
+          },
+          "type": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "branch": {
+            "type": "string"
+          },
+          "directory": {
+            "type": "string"
+          },
+          "extra": {},
+          "projectID": {
+            "type": "string"
+          },
+          "timeUsed": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "string",
+                "enum": ["NaN"]
+              },
+              {
+                "type": "string",
+                "enum": ["Infinity"]
+              },
+              {
+                "type": "string",
+                "enum": ["-Infinity"]
+              },
+              {
+                "type": "string",
+                "enum": ["Infinity", "-Infinity", "NaN"]
+              }
+            ]
+          }
+        },
+        "required": ["id", "type", "name", "projectID", "timeUsed"],
+        "additionalProperties": false
+      },
       "WorkspaceCreateError": {
         "type": "object",
         "properties": {
@@ -23590,23 +24097,6 @@
           }
         },
         "required": ["text"],
-        "additionalProperties": false
-      },
-      "ConflictError": {
-        "type": "object",
-        "properties": {
-          "_tag": {
-            "type": "string",
-            "enum": ["ConflictError"]
-          },
-          "message": {
-            "type": "string"
-          },
-          "resource": {
-            "type": "string"
-          }
-        },
-        "required": ["_tag", "message"],
         "additionalProperties": false
       },
       "ServiceUnavailableError": {
@@ -23849,167 +24339,6 @@
           }
         ]
       },
-      "session.status": {
-        "type": "object",
-        "properties": {
-          "id": {
-            "type": "string",
-            "pattern": "^evt_"
-          },
-          "metadata": {
-            "type": "object"
-          },
-          "type": {
-            "type": "string",
-            "enum": ["session.status"]
-          },
-          "durable": {
-            "type": "object",
-            "properties": {
-              "aggregateID": {
-                "type": "string"
-              },
-              "seq": {
-                "type": "integer"
-              },
-              "version": {
-                "type": "integer"
-              }
-            },
-            "required": ["aggregateID", "seq", "version"],
-            "additionalProperties": false
-          },
-          "location": {
-            "$ref": "#/components/schemas/LocationRef"
-          },
-          "data": {
-            "type": "object",
-            "properties": {
-              "sessionID": {
-                "type": "string",
-                "pattern": "^ses"
-              },
-              "status": {
-                "$ref": "#/components/schemas/SessionStatus"
-              }
-            },
-            "required": ["sessionID", "status"],
-            "additionalProperties": false
-          }
-        },
-        "required": ["id", "type", "data"],
-        "additionalProperties": false
-      },
-      "question.replied": {
-        "type": "object",
-        "properties": {
-          "id": {
-            "type": "string",
-            "pattern": "^evt_"
-          },
-          "metadata": {
-            "type": "object"
-          },
-          "type": {
-            "type": "string",
-            "enum": ["question.replied"]
-          },
-          "durable": {
-            "type": "object",
-            "properties": {
-              "aggregateID": {
-                "type": "string"
-              },
-              "seq": {
-                "type": "integer"
-              },
-              "version": {
-                "type": "integer"
-              }
-            },
-            "required": ["aggregateID", "seq", "version"],
-            "additionalProperties": false
-          },
-          "location": {
-            "$ref": "#/components/schemas/LocationRef"
-          },
-          "data": {
-            "type": "object",
-            "properties": {
-              "sessionID": {
-                "type": "string",
-                "pattern": "^ses"
-              },
-              "requestID": {
-                "type": "string",
-                "pattern": "^que"
-              },
-              "answers": {
-                "type": "array",
-                "items": {
-                  "$ref": "#/components/schemas/QuestionAnswer"
-                }
-              }
-            },
-            "required": ["sessionID", "requestID", "answers"],
-            "additionalProperties": false
-          }
-        },
-        "required": ["id", "type", "data"],
-        "additionalProperties": false
-      },
-      "question.rejected": {
-        "type": "object",
-        "properties": {
-          "id": {
-            "type": "string",
-            "pattern": "^evt_"
-          },
-          "metadata": {
-            "type": "object"
-          },
-          "type": {
-            "type": "string",
-            "enum": ["question.rejected"]
-          },
-          "durable": {
-            "type": "object",
-            "properties": {
-              "aggregateID": {
-                "type": "string"
-              },
-              "seq": {
-                "type": "integer"
-              },
-              "version": {
-                "type": "integer"
-              }
-            },
-            "required": ["aggregateID", "seq", "version"],
-            "additionalProperties": false
-          },
-          "location": {
-            "$ref": "#/components/schemas/LocationRef"
-          },
-          "data": {
-            "type": "object",
-            "properties": {
-              "sessionID": {
-                "type": "string",
-                "pattern": "^ses"
-              },
-              "requestID": {
-                "type": "string",
-                "pattern": "^que"
-              }
-            },
-            "required": ["sessionID", "requestID"],
-            "additionalProperties": false
-          }
-        },
-        "required": ["id", "type", "data"],
-        "additionalProperties": false
-      },
       "V2Event": {
         "anyOf": [
           {
@@ -24142,21 +24471,6 @@
             "$ref": "#/components/schemas/SessionNextRevertCommitted"
           },
           {
-            "$ref": "#/components/schemas/MessagePartDelta"
-          },
-          {
-            "$ref": "#/components/schemas/SessionDiff"
-          },
-          {
-            "$ref": "#/components/schemas/SessionError"
-          },
-          {
-            "$ref": "#/components/schemas/InstallationUpdated"
-          },
-          {
-            "$ref": "#/components/schemas/InstallationUpdate-available"
-          },
-          {
             "$ref": "#/components/schemas/FileEdited"
           },
           {
@@ -24202,79 +24516,7 @@
             "$ref": "#/components/schemas/TodoUpdated"
           },
           {
-            "$ref": "#/components/schemas/LspUpdated"
-          },
-          {
-            "$ref": "#/components/schemas/PermissionAsked"
-          },
-          {
-            "$ref": "#/components/schemas/PermissionReplied"
-          },
-          {
-            "$ref": "#/components/schemas/TuiPromptAppend"
-          },
-          {
-            "$ref": "#/components/schemas/TuiCommandExecute"
-          },
-          {
-            "$ref": "#/components/schemas/TuiToastShow"
-          },
-          {
-            "$ref": "#/components/schemas/TuiSessionSelect"
-          },
-          {
-            "$ref": "#/components/schemas/McpToolsChanged"
-          },
-          {
-            "$ref": "#/components/schemas/McpBrowserOpenFailed"
-          },
-          {
-            "$ref": "#/components/schemas/CommandExecuted"
-          },
-          {
-            "$ref": "#/components/schemas/ProjectUpdated"
-          },
-          {
-            "$ref": "#/components/schemas/session.status"
-          },
-          {
-            "$ref": "#/components/schemas/SessionIdle"
-          },
-          {
-            "$ref": "#/components/schemas/QuestionAsked"
-          },
-          {
-            "$ref": "#/components/schemas/question.replied"
-          },
-          {
-            "$ref": "#/components/schemas/question.rejected"
-          },
-          {
-            "$ref": "#/components/schemas/SessionCompacted"
-          },
-          {
-            "$ref": "#/components/schemas/VcsBranchUpdated"
-          },
-          {
-            "$ref": "#/components/schemas/WorkspaceReady"
-          },
-          {
-            "$ref": "#/components/schemas/WorkspaceFailed"
-          },
-          {
-            "$ref": "#/components/schemas/WorkspaceStatus"
-          },
-          {
-            "$ref": "#/components/schemas/WorktreeReady"
-          },
-          {
-            "$ref": "#/components/schemas/WorktreeFailed"
-          },
-          {
-            "$ref": "#/components/schemas/ServerConnected"
-          },
-          {
-            "$ref": "#/components/schemas/GlobalDisposed"
+            "$ref": "#/components/schemas/V2EventServerConnected"
           }
         ]
       },
@@ -31483,291 +31725,6 @@
         "required": ["id", "type", "data"],
         "additionalProperties": false
       },
-      "MessagePartDelta": {
-        "type": "object",
-        "properties": {
-          "id": {
-            "type": "string",
-            "pattern": "^evt_"
-          },
-          "metadata": {
-            "type": "object"
-          },
-          "type": {
-            "type": "string",
-            "enum": ["message.part.delta"]
-          },
-          "durable": {
-            "type": "object",
-            "properties": {
-              "aggregateID": {
-                "type": "string"
-              },
-              "seq": {
-                "type": "integer"
-              },
-              "version": {
-                "type": "integer"
-              }
-            },
-            "required": ["aggregateID", "seq", "version"],
-            "additionalProperties": false
-          },
-          "location": {
-            "$ref": "#/components/schemas/LocationRef"
-          },
-          "data": {
-            "type": "object",
-            "properties": {
-              "sessionID": {
-                "type": "string",
-                "pattern": "^ses"
-              },
-              "messageID": {
-                "type": "string",
-                "pattern": "^msg"
-              },
-              "partID": {
-                "type": "string",
-                "pattern": "^prt"
-              },
-              "field": {
-                "type": "string"
-              },
-              "delta": {
-                "type": "string"
-              }
-            },
-            "required": ["sessionID", "messageID", "partID", "field", "delta"],
-            "additionalProperties": false
-          }
-        },
-        "required": ["id", "type", "data"],
-        "additionalProperties": false
-      },
-      "SessionDiff": {
-        "type": "object",
-        "properties": {
-          "id": {
-            "type": "string",
-            "pattern": "^evt_"
-          },
-          "metadata": {
-            "type": "object"
-          },
-          "type": {
-            "type": "string",
-            "enum": ["session.diff"]
-          },
-          "durable": {
-            "type": "object",
-            "properties": {
-              "aggregateID": {
-                "type": "string"
-              },
-              "seq": {
-                "type": "integer"
-              },
-              "version": {
-                "type": "integer"
-              }
-            },
-            "required": ["aggregateID", "seq", "version"],
-            "additionalProperties": false
-          },
-          "location": {
-            "$ref": "#/components/schemas/LocationRef"
-          },
-          "data": {
-            "type": "object",
-            "properties": {
-              "sessionID": {
-                "type": "string",
-                "pattern": "^ses"
-              },
-              "diff": {
-                "type": "array",
-                "items": {
-                  "$ref": "#/components/schemas/SnapshotFileDiff"
-                }
-              }
-            },
-            "required": ["sessionID", "diff"],
-            "additionalProperties": false
-          }
-        },
-        "required": ["id", "type", "data"],
-        "additionalProperties": false
-      },
-      "SessionError": {
-        "type": "object",
-        "properties": {
-          "id": {
-            "type": "string",
-            "pattern": "^evt_"
-          },
-          "metadata": {
-            "type": "object"
-          },
-          "type": {
-            "type": "string",
-            "enum": ["session.error"]
-          },
-          "durable": {
-            "type": "object",
-            "properties": {
-              "aggregateID": {
-                "type": "string"
-              },
-              "seq": {
-                "type": "integer"
-              },
-              "version": {
-                "type": "integer"
-              }
-            },
-            "required": ["aggregateID", "seq", "version"],
-            "additionalProperties": false
-          },
-          "location": {
-            "$ref": "#/components/schemas/LocationRef"
-          },
-          "data": {
-            "type": "object",
-            "properties": {
-              "sessionID": {
-                "type": "string",
-                "pattern": "^ses"
-              },
-              "error": {
-                "anyOf": [
-                  {
-                    "$ref": "#/components/schemas/ProviderAuthError"
-                  },
-                  {
-                    "$ref": "#/components/schemas/UnknownError"
-                  },
-                  {
-                    "$ref": "#/components/schemas/MessageOutputLengthError"
-                  },
-                  {
-                    "$ref": "#/components/schemas/MessageAbortedError"
-                  },
-                  {
-                    "$ref": "#/components/schemas/StructuredOutputError"
-                  },
-                  {
-                    "$ref": "#/components/schemas/ContextOverflowError"
-                  },
-                  {
-                    "$ref": "#/components/schemas/ContentFilterError"
-                  },
-                  {
-                    "$ref": "#/components/schemas/APIError"
-                  }
-                ]
-              }
-            },
-            "additionalProperties": false
-          }
-        },
-        "required": ["id", "type", "data"],
-        "additionalProperties": false
-      },
-      "InstallationUpdated": {
-        "type": "object",
-        "properties": {
-          "id": {
-            "type": "string",
-            "pattern": "^evt_"
-          },
-          "metadata": {
-            "type": "object"
-          },
-          "type": {
-            "type": "string",
-            "enum": ["installation.updated"]
-          },
-          "durable": {
-            "type": "object",
-            "properties": {
-              "aggregateID": {
-                "type": "string"
-              },
-              "seq": {
-                "type": "integer"
-              },
-              "version": {
-                "type": "integer"
-              }
-            },
-            "required": ["aggregateID", "seq", "version"],
-            "additionalProperties": false
-          },
-          "location": {
-            "$ref": "#/components/schemas/LocationRef"
-          },
-          "data": {
-            "type": "object",
-            "properties": {
-              "version": {
-                "type": "string"
-              }
-            },
-            "required": ["version"],
-            "additionalProperties": false
-          }
-        },
-        "required": ["id", "type", "data"],
-        "additionalProperties": false
-      },
-      "InstallationUpdate-available": {
-        "type": "object",
-        "properties": {
-          "id": {
-            "type": "string",
-            "pattern": "^evt_"
-          },
-          "metadata": {
-            "type": "object"
-          },
-          "type": {
-            "type": "string",
-            "enum": ["installation.update-available"]
-          },
-          "durable": {
-            "type": "object",
-            "properties": {
-              "aggregateID": {
-                "type": "string"
-              },
-              "seq": {
-                "type": "integer"
-              },
-              "version": {
-                "type": "integer"
-              }
-            },
-            "required": ["aggregateID", "seq", "version"],
-            "additionalProperties": false
-          },
-          "location": {
-            "$ref": "#/components/schemas/LocationRef"
-          },
-          "data": {
-            "type": "object",
-            "properties": {
-              "version": {
-                "type": "string"
-              }
-            },
-            "required": ["version"],
-            "additionalProperties": false
-          }
-        },
-        "required": ["id", "type", "data"],
-        "additionalProperties": false
-      },
       "FileEdited": {
         "type": "object",
         "properties": {
@@ -32549,7 +32506,7 @@
         "required": ["id", "type", "data"],
         "additionalProperties": false
       },
-      "LspUpdated": {
+      "V2EventServerConnected": {
         "type": "object",
         "properties": {
           "id": {
@@ -32558,10 +32515,6 @@
           },
           "metadata": {
             "type": "object"
-          },
-          "type": {
-            "type": "string",
-            "enum": ["lsp.updated"]
           },
           "durable": {
             "type": "object",
@@ -32581,1126 +32534,10 @@
           },
           "location": {
             "$ref": "#/components/schemas/LocationRef"
-          },
-          "data": {
-            "type": "object",
-            "properties": {}
-          }
-        },
-        "required": ["id", "type", "data"],
-        "additionalProperties": false
-      },
-      "PermissionAsked": {
-        "type": "object",
-        "properties": {
-          "id": {
-            "type": "string",
-            "pattern": "^evt_"
-          },
-          "metadata": {
-            "type": "object"
-          },
-          "type": {
-            "type": "string",
-            "enum": ["permission.asked"]
-          },
-          "durable": {
-            "type": "object",
-            "properties": {
-              "aggregateID": {
-                "type": "string"
-              },
-              "seq": {
-                "type": "integer"
-              },
-              "version": {
-                "type": "integer"
-              }
-            },
-            "required": ["aggregateID", "seq", "version"],
-            "additionalProperties": false
-          },
-          "location": {
-            "$ref": "#/components/schemas/LocationRef"
-          },
-          "data": {
-            "type": "object",
-            "properties": {
-              "id": {
-                "type": "string",
-                "pattern": "^per"
-              },
-              "sessionID": {
-                "type": "string",
-                "pattern": "^ses"
-              },
-              "permission": {
-                "type": "string"
-              },
-              "patterns": {
-                "type": "array",
-                "items": {
-                  "type": "string"
-                }
-              },
-              "metadata": {
-                "type": "object"
-              },
-              "always": {
-                "type": "array",
-                "items": {
-                  "type": "string"
-                }
-              },
-              "tool": {
-                "type": "object",
-                "properties": {
-                  "messageID": {
-                    "type": "string"
-                  },
-                  "callID": {
-                    "type": "string"
-                  }
-                },
-                "required": ["messageID", "callID"],
-                "additionalProperties": false
-              }
-            },
-            "required": ["id", "sessionID", "permission", "patterns", "metadata", "always"],
-            "additionalProperties": false
-          }
-        },
-        "required": ["id", "type", "data"],
-        "additionalProperties": false
-      },
-      "PermissionReplied": {
-        "type": "object",
-        "properties": {
-          "id": {
-            "type": "string",
-            "pattern": "^evt_"
-          },
-          "metadata": {
-            "type": "object"
-          },
-          "type": {
-            "type": "string",
-            "enum": ["permission.replied"]
-          },
-          "durable": {
-            "type": "object",
-            "properties": {
-              "aggregateID": {
-                "type": "string"
-              },
-              "seq": {
-                "type": "integer"
-              },
-              "version": {
-                "type": "integer"
-              }
-            },
-            "required": ["aggregateID", "seq", "version"],
-            "additionalProperties": false
-          },
-          "location": {
-            "$ref": "#/components/schemas/LocationRef"
-          },
-          "data": {
-            "type": "object",
-            "properties": {
-              "sessionID": {
-                "type": "string",
-                "pattern": "^ses"
-              },
-              "requestID": {
-                "type": "string",
-                "pattern": "^per"
-              },
-              "reply": {
-                "type": "string",
-                "enum": ["once", "always", "reject"]
-              }
-            },
-            "required": ["sessionID", "requestID", "reply"],
-            "additionalProperties": false
-          }
-        },
-        "required": ["id", "type", "data"],
-        "additionalProperties": false
-      },
-      "TuiPromptAppend": {
-        "type": "object",
-        "properties": {
-          "id": {
-            "type": "string",
-            "pattern": "^evt_"
-          },
-          "metadata": {
-            "type": "object"
-          },
-          "type": {
-            "type": "string",
-            "enum": ["tui.prompt.append"]
-          },
-          "durable": {
-            "type": "object",
-            "properties": {
-              "aggregateID": {
-                "type": "string"
-              },
-              "seq": {
-                "type": "integer"
-              },
-              "version": {
-                "type": "integer"
-              }
-            },
-            "required": ["aggregateID", "seq", "version"],
-            "additionalProperties": false
-          },
-          "location": {
-            "$ref": "#/components/schemas/LocationRef"
-          },
-          "data": {
-            "type": "object",
-            "properties": {
-              "text": {
-                "type": "string"
-              }
-            },
-            "required": ["text"],
-            "additionalProperties": false
-          }
-        },
-        "required": ["id", "type", "data"],
-        "additionalProperties": false
-      },
-      "TuiCommandExecute": {
-        "type": "object",
-        "properties": {
-          "id": {
-            "type": "string",
-            "pattern": "^evt_"
-          },
-          "metadata": {
-            "type": "object"
-          },
-          "type": {
-            "type": "string",
-            "enum": ["tui.command.execute"]
-          },
-          "durable": {
-            "type": "object",
-            "properties": {
-              "aggregateID": {
-                "type": "string"
-              },
-              "seq": {
-                "type": "integer"
-              },
-              "version": {
-                "type": "integer"
-              }
-            },
-            "required": ["aggregateID", "seq", "version"],
-            "additionalProperties": false
-          },
-          "location": {
-            "$ref": "#/components/schemas/LocationRef"
-          },
-          "data": {
-            "type": "object",
-            "properties": {
-              "command": {
-                "anyOf": [
-                  {
-                    "type": "string",
-                    "enum": [
-                      "session.list",
-                      "session.new",
-                      "session.share",
-                      "session.interrupt",
-                      "session.compact",
-                      "session.page.up",
-                      "session.page.down",
-                      "session.line.up",
-                      "session.line.down",
-                      "session.half.page.up",
-                      "session.half.page.down",
-                      "session.first",
-                      "session.last",
-                      "prompt.clear",
-                      "prompt.submit",
-                      "agent.cycle"
-                    ]
-                  },
-                  {
-                    "type": "string"
-                  }
-                ]
-              }
-            },
-            "required": ["command"],
-            "additionalProperties": false
-          }
-        },
-        "required": ["id", "type", "data"],
-        "additionalProperties": false
-      },
-      "TuiToastShow": {
-        "type": "object",
-        "properties": {
-          "id": {
-            "type": "string",
-            "pattern": "^evt_"
-          },
-          "metadata": {
-            "type": "object"
-          },
-          "type": {
-            "type": "string",
-            "enum": ["tui.toast.show"]
-          },
-          "durable": {
-            "type": "object",
-            "properties": {
-              "aggregateID": {
-                "type": "string"
-              },
-              "seq": {
-                "type": "integer"
-              },
-              "version": {
-                "type": "integer"
-              }
-            },
-            "required": ["aggregateID", "seq", "version"],
-            "additionalProperties": false
-          },
-          "location": {
-            "$ref": "#/components/schemas/LocationRef"
-          },
-          "data": {
-            "type": "object",
-            "properties": {
-              "title": {
-                "type": "string"
-              },
-              "message": {
-                "type": "string"
-              },
-              "variant": {
-                "type": "string",
-                "enum": ["info", "success", "warning", "error"]
-              },
-              "duration": {
-                "type": "integer",
-                "exclusiveMinimum": 0
-              }
-            },
-            "required": ["message", "variant"],
-            "additionalProperties": false
-          }
-        },
-        "required": ["id", "type", "data"],
-        "additionalProperties": false
-      },
-      "TuiSessionSelect": {
-        "type": "object",
-        "properties": {
-          "id": {
-            "type": "string",
-            "pattern": "^evt_"
-          },
-          "metadata": {
-            "type": "object"
-          },
-          "type": {
-            "type": "string",
-            "enum": ["tui.session.select"]
-          },
-          "durable": {
-            "type": "object",
-            "properties": {
-              "aggregateID": {
-                "type": "string"
-              },
-              "seq": {
-                "type": "integer"
-              },
-              "version": {
-                "type": "integer"
-              }
-            },
-            "required": ["aggregateID", "seq", "version"],
-            "additionalProperties": false
-          },
-          "location": {
-            "$ref": "#/components/schemas/LocationRef"
-          },
-          "data": {
-            "type": "object",
-            "properties": {
-              "sessionID": {
-                "type": "string",
-                "pattern": "^ses",
-                "description": "Session ID to navigate to"
-              }
-            },
-            "required": ["sessionID"],
-            "additionalProperties": false
-          }
-        },
-        "required": ["id", "type", "data"],
-        "additionalProperties": false
-      },
-      "McpToolsChanged": {
-        "type": "object",
-        "properties": {
-          "id": {
-            "type": "string",
-            "pattern": "^evt_"
-          },
-          "metadata": {
-            "type": "object"
-          },
-          "type": {
-            "type": "string",
-            "enum": ["mcp.tools.changed"]
-          },
-          "durable": {
-            "type": "object",
-            "properties": {
-              "aggregateID": {
-                "type": "string"
-              },
-              "seq": {
-                "type": "integer"
-              },
-              "version": {
-                "type": "integer"
-              }
-            },
-            "required": ["aggregateID", "seq", "version"],
-            "additionalProperties": false
-          },
-          "location": {
-            "$ref": "#/components/schemas/LocationRef"
-          },
-          "data": {
-            "type": "object",
-            "properties": {
-              "server": {
-                "type": "string"
-              }
-            },
-            "required": ["server"],
-            "additionalProperties": false
-          }
-        },
-        "required": ["id", "type", "data"],
-        "additionalProperties": false
-      },
-      "McpBrowserOpenFailed": {
-        "type": "object",
-        "properties": {
-          "id": {
-            "type": "string",
-            "pattern": "^evt_"
-          },
-          "metadata": {
-            "type": "object"
-          },
-          "type": {
-            "type": "string",
-            "enum": ["mcp.browser.open.failed"]
-          },
-          "durable": {
-            "type": "object",
-            "properties": {
-              "aggregateID": {
-                "type": "string"
-              },
-              "seq": {
-                "type": "integer"
-              },
-              "version": {
-                "type": "integer"
-              }
-            },
-            "required": ["aggregateID", "seq", "version"],
-            "additionalProperties": false
-          },
-          "location": {
-            "$ref": "#/components/schemas/LocationRef"
-          },
-          "data": {
-            "type": "object",
-            "properties": {
-              "mcpName": {
-                "type": "string"
-              },
-              "url": {
-                "type": "string"
-              }
-            },
-            "required": ["mcpName", "url"],
-            "additionalProperties": false
-          }
-        },
-        "required": ["id", "type", "data"],
-        "additionalProperties": false
-      },
-      "CommandExecuted": {
-        "type": "object",
-        "properties": {
-          "id": {
-            "type": "string",
-            "pattern": "^evt_"
-          },
-          "metadata": {
-            "type": "object"
-          },
-          "type": {
-            "type": "string",
-            "enum": ["command.executed"]
-          },
-          "durable": {
-            "type": "object",
-            "properties": {
-              "aggregateID": {
-                "type": "string"
-              },
-              "seq": {
-                "type": "integer"
-              },
-              "version": {
-                "type": "integer"
-              }
-            },
-            "required": ["aggregateID", "seq", "version"],
-            "additionalProperties": false
-          },
-          "location": {
-            "$ref": "#/components/schemas/LocationRef"
-          },
-          "data": {
-            "type": "object",
-            "properties": {
-              "name": {
-                "type": "string"
-              },
-              "sessionID": {
-                "type": "string",
-                "pattern": "^ses"
-              },
-              "arguments": {
-                "type": "string"
-              },
-              "messageID": {
-                "type": "string",
-                "pattern": "^msg"
-              }
-            },
-            "required": ["name", "sessionID", "arguments", "messageID"],
-            "additionalProperties": false
-          }
-        },
-        "required": ["id", "type", "data"],
-        "additionalProperties": false
-      },
-      "ProjectUpdated": {
-        "type": "object",
-        "properties": {
-          "id": {
-            "type": "string",
-            "pattern": "^evt_"
-          },
-          "metadata": {
-            "type": "object"
-          },
-          "type": {
-            "type": "string",
-            "enum": ["project.updated"]
-          },
-          "durable": {
-            "type": "object",
-            "properties": {
-              "aggregateID": {
-                "type": "string"
-              },
-              "seq": {
-                "type": "integer"
-              },
-              "version": {
-                "type": "integer"
-              }
-            },
-            "required": ["aggregateID", "seq", "version"],
-            "additionalProperties": false
-          },
-          "location": {
-            "$ref": "#/components/schemas/LocationRef"
-          },
-          "data": {
-            "type": "object",
-            "properties": {
-              "id": {
-                "type": "string"
-              },
-              "worktree": {
-                "type": "string"
-              },
-              "vcs": {
-                "$ref": "#/components/schemas/ProjectVcs"
-              },
-              "name": {
-                "type": "string"
-              },
-              "icon": {
-                "$ref": "#/components/schemas/ProjectIcon"
-              },
-              "commands": {
-                "$ref": "#/components/schemas/ProjectCommands"
-              },
-              "time": {
-                "$ref": "#/components/schemas/ProjectTime"
-              },
-              "sandboxes": {
-                "type": "array",
-                "items": {
-                  "type": "string"
-                }
-              }
-            },
-            "required": ["id", "worktree", "time", "sandboxes"],
-            "additionalProperties": false
-          }
-        },
-        "required": ["id", "type", "data"],
-        "additionalProperties": false
-      },
-      "SessionIdle": {
-        "type": "object",
-        "properties": {
-          "id": {
-            "type": "string",
-            "pattern": "^evt_"
-          },
-          "metadata": {
-            "type": "object"
-          },
-          "type": {
-            "type": "string",
-            "enum": ["session.idle"]
-          },
-          "durable": {
-            "type": "object",
-            "properties": {
-              "aggregateID": {
-                "type": "string"
-              },
-              "seq": {
-                "type": "integer"
-              },
-              "version": {
-                "type": "integer"
-              }
-            },
-            "required": ["aggregateID", "seq", "version"],
-            "additionalProperties": false
-          },
-          "location": {
-            "$ref": "#/components/schemas/LocationRef"
-          },
-          "data": {
-            "type": "object",
-            "properties": {
-              "sessionID": {
-                "type": "string",
-                "pattern": "^ses"
-              }
-            },
-            "required": ["sessionID"],
-            "additionalProperties": false
-          }
-        },
-        "required": ["id", "type", "data"],
-        "additionalProperties": false
-      },
-      "QuestionAsked": {
-        "type": "object",
-        "properties": {
-          "id": {
-            "type": "string",
-            "pattern": "^evt_"
-          },
-          "metadata": {
-            "type": "object"
-          },
-          "type": {
-            "type": "string",
-            "enum": ["question.asked"]
-          },
-          "durable": {
-            "type": "object",
-            "properties": {
-              "aggregateID": {
-                "type": "string"
-              },
-              "seq": {
-                "type": "integer"
-              },
-              "version": {
-                "type": "integer"
-              }
-            },
-            "required": ["aggregateID", "seq", "version"],
-            "additionalProperties": false
-          },
-          "location": {
-            "$ref": "#/components/schemas/LocationRef"
-          },
-          "data": {
-            "type": "object",
-            "properties": {
-              "id": {
-                "type": "string",
-                "pattern": "^que"
-              },
-              "sessionID": {
-                "type": "string",
-                "pattern": "^ses"
-              },
-              "questions": {
-                "type": "array",
-                "items": {
-                  "$ref": "#/components/schemas/QuestionInfo"
-                },
-                "description": "Questions to ask"
-              },
-              "tool": {
-                "$ref": "#/components/schemas/QuestionTool"
-              }
-            },
-            "required": ["id", "sessionID", "questions"],
-            "additionalProperties": false
-          }
-        },
-        "required": ["id", "type", "data"],
-        "additionalProperties": false
-      },
-      "SessionCompacted": {
-        "type": "object",
-        "properties": {
-          "id": {
-            "type": "string",
-            "pattern": "^evt_"
-          },
-          "metadata": {
-            "type": "object"
-          },
-          "type": {
-            "type": "string",
-            "enum": ["session.compacted"]
-          },
-          "durable": {
-            "type": "object",
-            "properties": {
-              "aggregateID": {
-                "type": "string"
-              },
-              "seq": {
-                "type": "integer"
-              },
-              "version": {
-                "type": "integer"
-              }
-            },
-            "required": ["aggregateID", "seq", "version"],
-            "additionalProperties": false
-          },
-          "location": {
-            "$ref": "#/components/schemas/LocationRef"
-          },
-          "data": {
-            "type": "object",
-            "properties": {
-              "sessionID": {
-                "type": "string",
-                "pattern": "^ses"
-              }
-            },
-            "required": ["sessionID"],
-            "additionalProperties": false
-          }
-        },
-        "required": ["id", "type", "data"],
-        "additionalProperties": false
-      },
-      "VcsBranchUpdated": {
-        "type": "object",
-        "properties": {
-          "id": {
-            "type": "string",
-            "pattern": "^evt_"
-          },
-          "metadata": {
-            "type": "object"
-          },
-          "type": {
-            "type": "string",
-            "enum": ["vcs.branch.updated"]
-          },
-          "durable": {
-            "type": "object",
-            "properties": {
-              "aggregateID": {
-                "type": "string"
-              },
-              "seq": {
-                "type": "integer"
-              },
-              "version": {
-                "type": "integer"
-              }
-            },
-            "required": ["aggregateID", "seq", "version"],
-            "additionalProperties": false
-          },
-          "location": {
-            "$ref": "#/components/schemas/LocationRef"
-          },
-          "data": {
-            "type": "object",
-            "properties": {
-              "branch": {
-                "type": "string"
-              }
-            },
-            "additionalProperties": false
-          }
-        },
-        "required": ["id", "type", "data"],
-        "additionalProperties": false
-      },
-      "WorkspaceReady": {
-        "type": "object",
-        "properties": {
-          "id": {
-            "type": "string",
-            "pattern": "^evt_"
-          },
-          "metadata": {
-            "type": "object"
-          },
-          "type": {
-            "type": "string",
-            "enum": ["workspace.ready"]
-          },
-          "durable": {
-            "type": "object",
-            "properties": {
-              "aggregateID": {
-                "type": "string"
-              },
-              "seq": {
-                "type": "integer"
-              },
-              "version": {
-                "type": "integer"
-              }
-            },
-            "required": ["aggregateID", "seq", "version"],
-            "additionalProperties": false
-          },
-          "location": {
-            "$ref": "#/components/schemas/LocationRef"
-          },
-          "data": {
-            "type": "object",
-            "properties": {
-              "name": {
-                "type": "string"
-              }
-            },
-            "required": ["name"],
-            "additionalProperties": false
-          }
-        },
-        "required": ["id", "type", "data"],
-        "additionalProperties": false
-      },
-      "WorkspaceFailed": {
-        "type": "object",
-        "properties": {
-          "id": {
-            "type": "string",
-            "pattern": "^evt_"
-          },
-          "metadata": {
-            "type": "object"
-          },
-          "type": {
-            "type": "string",
-            "enum": ["workspace.failed"]
-          },
-          "durable": {
-            "type": "object",
-            "properties": {
-              "aggregateID": {
-                "type": "string"
-              },
-              "seq": {
-                "type": "integer"
-              },
-              "version": {
-                "type": "integer"
-              }
-            },
-            "required": ["aggregateID", "seq", "version"],
-            "additionalProperties": false
-          },
-          "location": {
-            "$ref": "#/components/schemas/LocationRef"
-          },
-          "data": {
-            "type": "object",
-            "properties": {
-              "message": {
-                "type": "string"
-              }
-            },
-            "required": ["message"],
-            "additionalProperties": false
-          }
-        },
-        "required": ["id", "type", "data"],
-        "additionalProperties": false
-      },
-      "WorkspaceStatus": {
-        "type": "object",
-        "properties": {
-          "id": {
-            "type": "string",
-            "pattern": "^evt_"
-          },
-          "metadata": {
-            "type": "object"
-          },
-          "type": {
-            "type": "string",
-            "enum": ["workspace.status"]
-          },
-          "durable": {
-            "type": "object",
-            "properties": {
-              "aggregateID": {
-                "type": "string"
-              },
-              "seq": {
-                "type": "integer"
-              },
-              "version": {
-                "type": "integer"
-              }
-            },
-            "required": ["aggregateID", "seq", "version"],
-            "additionalProperties": false
-          },
-          "location": {
-            "$ref": "#/components/schemas/LocationRef"
-          },
-          "data": {
-            "type": "object",
-            "properties": {
-              "workspaceID": {
-                "type": "string",
-                "pattern": "^wrk"
-              },
-              "status": {
-                "type": "string",
-                "enum": ["connected", "connecting", "disconnected", "error"]
-              }
-            },
-            "required": ["workspaceID", "status"],
-            "additionalProperties": false
-          }
-        },
-        "required": ["id", "type", "data"],
-        "additionalProperties": false
-      },
-      "WorktreeReady": {
-        "type": "object",
-        "properties": {
-          "id": {
-            "type": "string",
-            "pattern": "^evt_"
-          },
-          "metadata": {
-            "type": "object"
-          },
-          "type": {
-            "type": "string",
-            "enum": ["worktree.ready"]
-          },
-          "durable": {
-            "type": "object",
-            "properties": {
-              "aggregateID": {
-                "type": "string"
-              },
-              "seq": {
-                "type": "integer"
-              },
-              "version": {
-                "type": "integer"
-              }
-            },
-            "required": ["aggregateID", "seq", "version"],
-            "additionalProperties": false
-          },
-          "location": {
-            "$ref": "#/components/schemas/LocationRef"
-          },
-          "data": {
-            "type": "object",
-            "properties": {
-              "name": {
-                "type": "string"
-              },
-              "branch": {
-                "type": "string"
-              }
-            },
-            "required": ["name"],
-            "additionalProperties": false
-          }
-        },
-        "required": ["id", "type", "data"],
-        "additionalProperties": false
-      },
-      "WorktreeFailed": {
-        "type": "object",
-        "properties": {
-          "id": {
-            "type": "string",
-            "pattern": "^evt_"
-          },
-          "metadata": {
-            "type": "object"
-          },
-          "type": {
-            "type": "string",
-            "enum": ["worktree.failed"]
-          },
-          "durable": {
-            "type": "object",
-            "properties": {
-              "aggregateID": {
-                "type": "string"
-              },
-              "seq": {
-                "type": "integer"
-              },
-              "version": {
-                "type": "integer"
-              }
-            },
-            "required": ["aggregateID", "seq", "version"],
-            "additionalProperties": false
-          },
-          "location": {
-            "$ref": "#/components/schemas/LocationRef"
-          },
-          "data": {
-            "type": "object",
-            "properties": {
-              "message": {
-                "type": "string"
-              }
-            },
-            "required": ["message"],
-            "additionalProperties": false
-          }
-        },
-        "required": ["id", "type", "data"],
-        "additionalProperties": false
-      },
-      "ServerConnected": {
-        "type": "object",
-        "properties": {
-          "id": {
-            "type": "string",
-            "pattern": "^evt_"
-          },
-          "metadata": {
-            "type": "object"
           },
           "type": {
             "type": "string",
             "enum": ["server.connected"]
-          },
-          "durable": {
-            "type": "object",
-            "properties": {
-              "aggregateID": {
-                "type": "string"
-              },
-              "seq": {
-                "type": "integer"
-              },
-              "version": {
-                "type": "integer"
-              }
-            },
-            "required": ["aggregateID", "seq", "version"],
-            "additionalProperties": false
-          },
-          "location": {
-            "$ref": "#/components/schemas/LocationRef"
-          },
-          "data": {
-            "type": "object",
-            "properties": {}
-          }
-        },
-        "required": ["id", "type", "data"],
-        "additionalProperties": false
-      },
-      "GlobalDisposed": {
-        "type": "object",
-        "properties": {
-          "id": {
-            "type": "string",
-            "pattern": "^evt_"
-          },
-          "metadata": {
-            "type": "object"
-          },
-          "type": {
-            "type": "string",
-            "enum": ["global.disposed"]
-          },
-          "durable": {
-            "type": "object",
-            "properties": {
-              "aggregateID": {
-                "type": "string"
-              },
-              "seq": {
-                "type": "integer"
-              },
-              "version": {
-                "type": "integer"
-              }
-            },
-            "required": ["aggregateID", "seq", "version"],
-            "additionalProperties": false
-          },
-          "location": {
-            "$ref": "#/components/schemas/LocationRef"
           },
           "data": {
             "type": "object",
@@ -35549,6 +34386,62 @@
                 ]
               }
             },
+            "additionalProperties": false
+          }
+        },
+        "required": ["id", "type", "properties"],
+        "additionalProperties": false
+      },
+      "EventSessionAskToolActivity": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^evt_"
+          },
+          "type": {
+            "type": "string",
+            "enum": ["session.ask.tool.activity"]
+          },
+          "properties": {
+            "type": "object",
+            "properties": {
+              "sessionID": {
+                "type": "string",
+                "pattern": "^ses"
+              },
+              "requestID": {
+                "$ref": "#/components/schemas/SessionAskRequestID"
+              },
+              "threadID": {
+                "type": "string",
+                "pattern": "^ask_"
+              },
+              "turnID": {
+                "type": "string",
+                "pattern": "^atn_"
+              },
+              "callID": {
+                "type": "string"
+              },
+              "tool": {
+                "type": "string"
+              },
+              "status": {
+                "type": "string",
+                "enum": ["running", "completed", "error"]
+              },
+              "input": {
+                "type": "string"
+              },
+              "output": {
+                "type": "string"
+              },
+              "error": {
+                "type": "string"
+              }
+            },
+            "required": ["sessionID", "requestID", "threadID", "turnID", "callID", "tool", "status", "input"],
             "additionalProperties": false
           }
         },

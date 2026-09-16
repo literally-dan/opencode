@@ -46,7 +46,7 @@ const EventSchema = Schema.Union([
 ]).annotate({ identifier: "Event" })
 
 export const ServerApi = makeApi({
-  definitions: EventManifest.Latest.values().toArray(),
+  definitions: EventManifest.ServerDefinitions,
   locationMiddleware: LocationMiddleware,
   sessionLocationMiddleware: SessionLocationMiddleware,
 })

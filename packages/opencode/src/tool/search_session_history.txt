@@ -1,0 +1,14 @@
+Search a session's message history for parts containing literal text. Useful when older content has been compacted or scrolled out of your context window and you need to locate specific tool outputs, text, or reasoning without re-running tools.
+
+WHEN NOT TO USE
+- Searching workspace files — use `grep`; this only searches conversation history.
+- Idempotent operations you can cheaply re-derive — re-run the original tool.
+- The current message — it's already in context.
+
+PARAMETERS
+- pattern: case-insensitive literal text, 1-256 characters. Regex syntax has no special meaning.
+- session_id: optional; defaults to the current session. Subagents can search the parent via the `parent-session-id` from the `<subagent-context>` marker.
+- tool: optional tool-name filter (e.g. "bash", "read"); otherwise all part types are searched.
+- limit: optional, 1-50 matches (default 20).
+
+Returns matches newest-first, each with `part_id` (for follow-up `read_part`), `message_id`, part type, tool name (if applicable), a bounded context snippet, and timestamp. Search scans at most 256,000 characters per part and 2,000,000 characters total; `truncated` reports when a match/output or scan bound was reached. Pass any `part_id` to `read_part` for verbatim content.

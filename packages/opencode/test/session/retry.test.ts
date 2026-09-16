@@ -4,7 +4,8 @@ import { SessionV1 } from "@opencode-ai/core/v1/session"
 import type { NamedError } from "@opencode-ai/core/util/error"
 import { APICallError } from "ai"
 import { setTimeout as sleep } from "node:timers/promises"
-import { Effect, Schedule, Schema } from "effect"
+import { Clock, Duration, Effect, Fiber, Schedule, Schema } from "effect"
+import * as TestClock from "effect/testing/TestClock"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { SessionRetry } from "../../src/session/retry"
 import { MessageV2 } from "../../src/session/message-v2"
@@ -18,12 +19,17 @@ const providerID = ProviderV2.ID.make("test")
 const retryProvider = "test"
 const it = testEffect(LayerNode.compile(LayerNode.group([SessionStatus.node, CrossSpawnSpawner.node])))
 
-function apiError(headers?: Record<string, string>): SessionV1.APIError {
+function apiError(
+  headers?: Record<string, string>,
+  message = "boom",
+  metadata?: Record<string, string>,
+): SessionV1.APIError {
   return Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
     new SessionV1.APIError({
-      message: "boom",
+      message,
       isRetryable: true,
       responseHeaders: headers,
+      metadata,
     }).toObject(),
   )
 }
@@ -146,6 +152,124 @@ describe("session.retry.delay", () => {
       expect(attempts).toStrictEqual([1, 2, 3, 4, 5])
     }),
   )
+
+  // Each header or chunk timeout already waited the full provider timeout
+  // (5 minutes by default), so a stalled endpoint must surface after two retries
+  // instead of after half an hour.
+  for (const timeout of [
+    new ProviderError.HeaderTimeoutError(300_000),
+    new ProviderError.ResponseStreamError("SSE read timed out", { timeout: true }),
+  ]) {
+    it.instance(`policy retries a ${timeout.name} timeout at most twice`, () =>
+      Effect.gen(function* () {
+        const classified = MessageV2.fromError(timeout, { providerID }) as SessionV1.APIError
+        // Zero retry-after keeps the test from sleeping through real backoff.
+        const error = apiError({ "retry-after-ms": "0" }, timeout.message, classified.data.metadata)
+        const attempts: number[] = []
+        const step = yield* Schedule.toStepWithMetadata(
+          SessionRetry.policy({
+            provider: "test",
+            parse: Schema.decodeUnknownSync(SessionV1.APIError.Schema),
+            set: (info) =>
+              Effect.sync(() => {
+                attempts.push(info.attempt)
+              }),
+          }),
+        )
+
+        yield* Effect.forEach(Array.from({ length: SessionRetry.RETRY_MAX_RETRIES + 1 }), () =>
+          Effect.ignore(step(error)),
+        )
+
+        expect(attempts).toStrictEqual([1, 2])
+      }),
+    )
+  }
+
+  it.instance("policy counts only timeouts toward the timeout retry limit", () =>
+    Effect.gen(function* () {
+      const attempts: number[] = []
+      const timeout = apiError({ "retry-after-ms": "0" }, "SSE read timed out", {
+        code: "ProviderResponseStreamError",
+        timeout: "true",
+      })
+      // A stream error that is not our own timeout, such as a WebSocket closed
+      // before completion, keeps the normal retry budget.
+      const reset = apiError({ "retry-after-ms": "0" }, "WebSocket closed before response.completed", {
+        code: "ProviderResponseStreamError",
+      })
+      const step = yield* Schedule.toStepWithMetadata(
+        SessionRetry.policy({
+          provider: "test",
+          parse: Schema.decodeUnknownSync(SessionV1.APIError.Schema),
+          set: (info) =>
+            Effect.sync(() => {
+              attempts.push(info.attempt)
+            }),
+        }),
+      )
+
+      yield* Effect.forEach([timeout, reset, timeout, reset, timeout], (error) => Effect.ignore(step(error)))
+
+      expect(attempts).toStrictEqual([1, 2, 3, 4])
+    }),
+  )
+
+  // A transport-classified error never carries responseHeaders, so the policy
+  // falls back to exponential backoff. Drive that real path rather than
+  // short-circuiting it with retry-after-ms, so the cap is exercised against the
+  // delays it will actually see.
+  for (const code of ["ECONNRESET", "ConnectionRefused", "TimeoutError", "NETWORK_ERROR"]) {
+    it.effect(`policy bounds transient transport retries for ${code}`, () =>
+      Effect.gen(function* () {
+        const attempts: number[] = []
+        const delays: number[] = []
+        const failures: SessionV1.APIError[] = []
+
+        const fiber = yield* Effect.gen(function* () {
+          const current = apiError(undefined, `boom ${failures.length + 1}`, { code })
+          failures.push(current)
+          return yield* Effect.fail(current)
+        }).pipe(
+          Effect.retry(
+            SessionRetry.policy({
+              provider: "test",
+              parse: Schema.decodeUnknownSync(SessionV1.APIError.Schema),
+              set: (info) =>
+                Effect.gen(function* () {
+                  attempts.push(info.attempt)
+                  delays.push(info.next - (yield* Clock.currentTimeMillis))
+                }),
+            }),
+          ),
+          Effect.flip,
+          Effect.forkScoped,
+        )
+
+        // Walk the real backoff ladder rather than collapsing it, so the cap is
+        // exercised against the delays production will actually see.
+        for (let step = 0; step <= SessionRetry.RETRY_MAX_RETRIES; step++) {
+          yield* TestClock.adjust(Duration.seconds(30))
+          yield* Effect.yieldNow
+        }
+        const failure = yield* Fiber.join(fiber)
+
+        const terminal = failures.at(-1)
+        if (!terminal) throw new Error("expected retry failures")
+        expect(failure).toBe(terminal)
+        expect(failure.data.message).toBe(`boom ${SessionRetry.RETRY_MAX_RETRIES + 1}`)
+        expect(attempts).toEqual(Array.from({ length: SessionRetry.RETRY_MAX_RETRIES }, (_, index) => index + 1))
+        expect(failures).toHaveLength(SessionRetry.RETRY_MAX_RETRIES + 1)
+        // 2s, 4s, 8s, 16s with 25% jitter, then clamped at 30s.
+        expect(delays).toHaveLength(SessionRetry.RETRY_MAX_RETRIES)
+        for (const [index, base] of [2_000, 4_000, 8_000, 16_000].entries()) {
+          expect(delays[index]).toBeGreaterThanOrEqual(base)
+          expect(delays[index]).toBeLessThanOrEqual(base * (1 + SessionRetry.RETRY_JITTER_FACTOR))
+        }
+        expect(delays.at(-1)).toBe(30_000)
+      }),
+    )
+  }
 })
 
 describe("session.retry.retryable", () => {
@@ -244,6 +368,27 @@ describe("session.retry.retryable", () => {
     expect(SessionRetry.retryable(error, retryProvider)).toEqual({ message: "Request failed" })
   })
 
+  test("does not retry a classifier rejection whose body also matches a transient pattern", () => {
+    const error = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
+      new SessionV1.APIError({
+        message: "Provider request failed with HTTP 400",
+        isRetryable: false,
+        statusCode: 400,
+        responseBody: JSON.stringify({
+          error: { message: "Output blocked by content filtering policy", request_id: "req_500" },
+        }),
+      }).toObject(),
+    )
+    expect(SessionRetry.retryable(error, retryProvider)).toBeUndefined()
+  })
+
+  test("does not retry a content filter verdict", () => {
+    const error = Schema.decodeUnknownSync(SessionV1.ContentFilterError.Schema)(
+      new SessionV1.ContentFilterError({ message: "Response was blocked by the content filter" }).toObject(),
+    )
+    expect(SessionRetry.retryable(error, retryProvider)).toBeUndefined()
+  })
+
   test("retries transport timeout errors", () => {
     const request = MessageV2.fromError(new ProviderError.HeaderTimeoutError(10000), { providerID })
     expect(SessionV1.APIError.isInstance(request)).toBe(true)
@@ -309,6 +454,19 @@ describe("session.retry.retryable", () => {
     expect(SessionRetry.retryable(error, retryProvider)).toEqual({ message: "Service unavailable" })
   })
 
+  test("retries a 503 whose body mentions the content policy service", () => {
+    const error = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
+      new SessionV1.APIError({
+        message: "Service unavailable",
+        isRetryable: false,
+        statusCode: 503,
+        responseBody: "The content policy service is temporarily unavailable",
+      }).toObject(),
+    )
+
+    expect(SessionRetry.retryable(error, retryProvider)).toEqual({ message: "Service unavailable" })
+  })
+
   test("does not retry 4xx errors when isRetryable is false", () => {
     const error = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
       new SessionV1.APIError({
@@ -320,6 +478,22 @@ describe("session.retry.retryable", () => {
 
     expect(SessionRetry.retryable(error, retryProvider)).toBeUndefined()
   })
+
+  test.each(["ENOTFOUND", "ECONNREFUSED"])(
+    "does not retry permanent transport code %s even when the API error is retryable",
+    (code) => {
+      const error = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(
+        new SessionV1.APIError({
+          message: "Connection failed",
+          isRetryable: true,
+          statusCode: 503,
+          metadata: { code },
+        }).toObject(),
+      )
+
+      expect(SessionRetry.retryable(error, retryProvider)).toBeUndefined()
+    },
+  )
 
   test("retries ZlibError decompression failures", () => {
     const error = Schema.decodeUnknownSync(SessionV1.APIError.Schema)(

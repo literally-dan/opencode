@@ -1817,13 +1817,6 @@ export default function Page() {
     setFollowup("edit", id, undefined)
   }
 
-  const halt = (sessionID: string) =>
-    busy(sessionID)
-      ? sdk()
-          .api.session.interrupt({ sessionID })
-          .catch(() => {})
-      : Promise.resolve()
-
   const revertMutation = useMutation(() => ({
     mutationFn: async (input: { sessionID: string; messageID: string }) => {
       const session = sdk().api.session
@@ -1836,7 +1829,7 @@ export default function Page() {
           roll(input.sessionID, { messageID: input.messageID }, target)
           prompt.set(value)
         },
-        request: () => halt(input.sessionID).then(() => session.revert.stage(input)),
+        request: () => session.revert.stage(input),
         complete: () => undefined,
         rollback: () => roll(input.sessionID, last, target),
         fail,
@@ -1868,8 +1861,8 @@ export default function Page() {
         },
         request: () =>
           !next
-            ? halt(sessionID).then(() => session.revert.clear({ sessionID }))
-            : halt(sessionID).then(() => session.revert.stage({ sessionID, messageID: next.id }).then(() => undefined)),
+            ? session.revert.clear({ sessionID })
+            : session.revert.stage({ sessionID, messageID: next.id }).then(() => undefined),
         complete: () => undefined,
         rollback: () => roll(sessionID, last, target),
         fail,

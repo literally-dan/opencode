@@ -1,18 +1,15 @@
 import type { PermissionRequest, QuestionRequest, Session } from "@opencode-ai/sdk/v2/client"
+import { isTaskChild } from "@/utils/task-session"
 
-function sessionTreeRequest<T>(
-  session: Session[],
-  request: Record<string, T[] | undefined>,
-  sessionID?: string,
-  include: (item: T) => boolean = () => true,
-) {
-  if (!sessionID) return
-
-  const map = session.reduce((acc, item) => {
-    if (!item.parentID) return acc
-    const list = acc.get(item.parentID)
-    if (list) list.push(item.id)
-    if (!list) acc.set(item.parentID, [item.id])
+export function sessionRequestTree(session: Session[], sessionID: string) {
+  const sessions = new Map(session.map((item) => [item.id, item]))
+  const map = session.reduce((acc, child) => {
+    if (!child.parentID) return acc
+    const parent = sessions.get(child.parentID)
+    if (!parent || !isTaskChild(parent, child)) return acc
+    const list = acc.get(parent.id)
+    if (list) list.push(child.id)
+    if (!list) acc.set(parent.id, [child.id])
     return acc
   }, new Map<string, string[]>())
 
@@ -27,8 +24,18 @@ function sessionTreeRequest<T>(
       ids.push(child)
     }
   }
+  return ids
+}
 
-  const id = ids.find((id) => request[id]?.some(include))
+function sessionTreeRequest<T>(
+  session: Session[],
+  request: Record<string, T[] | undefined>,
+  sessionID?: string,
+  include: (item: T) => boolean = () => true,
+) {
+  if (!sessionID) return
+
+  const id = sessionRequestTree(session, sessionID).find((id) => request[id]?.some(include))
   if (!id) return
   return request[id]?.find(include)
 }

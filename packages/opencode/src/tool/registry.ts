@@ -4,12 +4,18 @@ import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { PlanExitTool } from "./plan"
 import { Session } from "@/session/session"
 import { QuestionTool } from "./question"
+import { CompactResultsTool } from "./compact_results"
+import { ReadPartTool } from "./read_part"
+import { SearchSessionHistoryTool } from "./search_session_history"
+import { ListContextTool } from "./list_context"
+import { CompactBulkTool } from "./compact_bulk"
 import { ShellTool } from "./shell"
 import { EditTool } from "./edit"
 import { GlobTool } from "./glob"
 import { GrepTool } from "./grep"
 import { ReadTool } from "./read"
 import { TaskTool } from "./task"
+import { TaskControlTool } from "./task_control"
 import { Database } from "@opencode-ai/core/database/database"
 import { TodoWriteTool } from "./todo"
 import { WebFetchTool } from "./webfetch"
@@ -70,6 +76,7 @@ type ReadDef = Tool.InferDef<typeof ReadTool>
 type State = {
   custom: Tool.Def[]
   builtin: Tool.Def[]
+  ask: readonly Tool.Def[]
   task: TaskDef
   read: ReadDef
 }
@@ -78,6 +85,7 @@ export interface Interface {
   readonly ids: () => Effect.Effect<string[]>
   readonly all: () => Effect.Effect<Tool.Def[]>
   readonly named: () => Effect.Effect<{ task: TaskDef; read: ReadDef }>
+  readonly askTools: (input: { providerID: ProviderV2.ID }) => Effect.Effect<readonly Tool.Def[]>
   readonly tools: (model: {
     providerID: ProviderV2.ID
     modelID: ModelV2.ID
@@ -100,6 +108,7 @@ const layer = Layer.effect(
 
     const invalid = yield* InvalidTool
     const task = yield* TaskTool
+    const taskControl = yield* TaskControlTool
     const read = yield* ReadTool
     const question = yield* QuestionTool
     const todo = yield* TodoWriteTool
@@ -117,6 +126,11 @@ const layer = Layer.effect(
     const agent = yield* Agent.Service
     const codeMode = flags.experimentalCodeMode ? yield* Effect.promise(() => import("./code-mode")) : undefined
     const codeModeTool = codeMode ? yield* codeMode.CodeModeTool : undefined
+    const compactResults = yield* CompactResultsTool
+    const readPart = yield* ReadPartTool
+    const searchSessionHistory = yield* SearchSessionHistoryTool
+    const listContext = yield* ListContextTool
+    const compactBulk = yield* CompactBulkTool
 
     const state = yield* InstanceState.make<State>(
       Effect.fn("ToolRegistry.state")(function* (ctx) {
@@ -180,6 +194,23 @@ const layer = Layer.effect(
           }
         }
 
+        const askTool = yield* Effect.all({
+          read: Tool.init(read),
+          glob: Tool.init(globtool),
+          grep: Tool.init(greptool),
+          fetch: Tool.init(webfetch),
+          search: Tool.init(websearch),
+          lsp: Tool.init(lsptool),
+        })
+        const ask = [
+          askTool.read,
+          askTool.glob,
+          askTool.grep,
+          askTool.fetch,
+          askTool.search,
+          ...(flags.experimentalLspTool ? [askTool.lsp] : []),
+        ]
+
         const dirs = yield* config.directories()
         const matches = dirs.flatMap((dir) =>
           Glob.scanSync("{tool,tools}/*.{js,ts}", { cwd: dir, absolute: true, dot: true, symlink: true }),
@@ -205,29 +236,32 @@ const layer = Layer.effect(
 
         yield* config.get()
         const questionEnabled = ["app", "cli", "desktop"].includes(flags.client) || flags.enableQuestionTool
-
-        const tool = yield* Effect.all({
-          invalid: Tool.init(invalid),
-          shell: Tool.init(shell),
-          read: Tool.init(read),
-          glob: Tool.init(globtool),
-          grep: Tool.init(greptool),
-          edit: Tool.init(edit),
-          write: Tool.init(writetool),
-          task: Tool.init(task),
-          fetch: Tool.init(webfetch),
-          todo: Tool.init(todo),
-          search: Tool.init(websearch),
-          skill: Tool.init(skilltool),
-          patch: Tool.init(patchtool),
-          question: Tool.init(question),
-          lsp: Tool.init(lsptool),
-          plan: Tool.init(plan),
-          ...(codeModeTool ? { execute: Tool.init(codeModeTool) } : {}),
-        })
+        const tool = {
+          ...askTool,
+          ...(yield* Effect.all({
+            invalid: Tool.init(invalid),
+            shell: Tool.init(shell),
+            edit: Tool.init(edit),
+            write: Tool.init(writetool),
+            task: Tool.init(task),
+            task_control: Tool.init(taskControl),
+            todo: Tool.init(todo),
+            skill: Tool.init(skilltool),
+            patch: Tool.init(patchtool),
+            question: Tool.init(question),
+            plan: Tool.init(plan),
+            ...(codeModeTool ? { execute: Tool.init(codeModeTool) } : {}),
+            compact_results: Tool.init(compactResults),
+            read_part: Tool.init(readPart),
+            search_session_history: Tool.init(searchSessionHistory),
+            list_context: Tool.init(listContext),
+            compact_bulk: Tool.init(compactBulk),
+          })),
+        }
 
         return {
           custom,
+          ask,
           builtin: [
             tool.invalid,
             ...(questionEnabled ? [tool.question] : []),
@@ -238,6 +272,7 @@ const layer = Layer.effect(
             tool.edit,
             tool.write,
             tool.task,
+            tool.task_control,
             tool.fetch,
             tool.todo,
             tool.search,
@@ -246,6 +281,20 @@ const layer = Layer.effect(
             ...(tool.execute ? [tool.execute] : []),
             ...(flags.experimentalLspTool ? [tool.lsp] : []),
             ...(flags.experimentalPlanMode && flags.client === "cli" ? [tool.plan] : []),
+            // One switch for the whole feature. The recovery tools only exist to
+            // read back what compaction replaced, so shipping them with
+            // compaction off costs description tokens for nothing and hands every
+            // subagent read access to its parent's transcript with nothing to
+            // recover.
+            ...(flags.disableContextCompaction
+              ? []
+              : [
+                  tool.compact_results,
+                  tool.compact_bulk,
+                  tool.read_part,
+                  tool.search_session_history,
+                  tool.list_context,
+                ]),
           ],
           task: tool.task,
           read: tool.read,
@@ -262,8 +311,17 @@ const layer = Layer.effect(
       return (yield* all()).map((tool) => tool.id)
     })
 
+    const askTools: Interface["askTools"] = Effect.fn("ToolRegistry.askTools")(function* (input) {
+      const s = yield* InstanceState.get(state)
+      return s.ask.filter(
+        (tool) =>
+          tool.id !== WebSearchTool.id ||
+          webSearchEnabled(input.providerID, { exa: flags.enableExa, parallel: flags.enableParallel }),
+      )
+    })
+
     const describeTask = Effect.fn("ToolRegistry.describeTask")(function* (agent: Agent.Info) {
-      const items = (yield* agents.list()).filter((item) => item.mode !== "primary")
+      const items = (yield* agents.list()).filter((item) => item.mode !== "primary" && !item.hidden)
       const filtered = items.filter(
         (item) => Permission.evaluate("task", item.name, agent.permission).action !== "deny",
       )
@@ -344,7 +402,7 @@ const layer = Layer.effect(
       return { task: s.task, read: s.read }
     })
 
-    return Service.of({ ids, all, named, tools })
+    return Service.of({ ids, all, named, askTools, tools })
   }),
 )
 

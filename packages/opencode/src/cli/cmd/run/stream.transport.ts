@@ -5,18 +5,14 @@
 // produce scrollback commits and footer patches, which get forwarded to the
 // footer through stream.ts.
 //
-// Prompt turns are one-at-a-time: runPromptTurn() sends the prompt, arms a
-// deferred Wait, and resolves when the session becomes idle.
-// Prefer session.status idle events, but also poll session.status because some
-// transports can miss status events while still delivering message events. If
-// the turn is aborted (user interrupt), it flushes any in-progress parts as
+// Prompt turns are one-at-a-time: runPromptTurn() sends the prompt, shell, or
+// command request and resolves when that request returns. The session can stay
+// busy after that while background Task results are pending, so a turn does not
+// wait for idle. Later turns that deliver those results render from events. If
+// the turn is aborted (footer closed), it flushes any in-progress parts as
 // interrupted entries.
-//
-// The tick counter prevents stale idle events from resolving the wrong turn.
-// We also re-check live session status before resolving an idle event so a
-// delayed idle from an older turn cannot complete a newer busy turn.
 import type { Event, GlobalEvent, OpencodeClient } from "@opencode-ai/sdk/v2"
-import { Context, Deferred, Effect, Exit, Layer, Scope, Stream } from "effect"
+import { Context, Deferred, Effect, Exit, Layer, Option, Scope, Stream } from "effect"
 import { makeRuntime } from "@/effect/run-service"
 import {
   blockerStatus,
@@ -31,6 +27,7 @@ import { replayActiveText, replayLocalRows, replaySession } from "./session-repl
 import {
   bootstrapSubagentCalls,
   bootstrapSubagentData,
+  bootstrapSubagentTabs,
   createSubagentData,
   listSubagentPermissions,
   listSubagentQuestions,
@@ -42,6 +39,7 @@ import {
   SUBAGENT_CALL_BOOTSTRAP_LIMIT,
   type SubagentData,
 } from "./subagent-data"
+import { DescendantFetchError, fetchDescendants } from "./tree"
 import { traceFooterOutput, writeSessionOutput } from "./stream"
 import type {
   FooterApi,
@@ -81,11 +79,10 @@ type StreamInput = {
 }
 
 type Wait = {
-  tick: number
-  armed: boolean
-  live: boolean
   onVisibleOutput?: (anchor: LocalReplayAnchor) => void
   done: Deferred.Deferred<void, unknown>
+  // Completes when the server reports a session error during this turn.
+  reported: Deferred.Deferred<void>
 }
 
 export type SessionTurnInput = {
@@ -115,7 +112,6 @@ type State = {
   data: SessionData
   subagent: SubagentData
   wait?: Wait
-  tick: number
   fault?: unknown
   footerView: FooterView
   blockerTick: number
@@ -206,30 +202,10 @@ function isMatchingDisposeEvent(value: unknown, directory: string | undefined): 
   return value.payload.type === "server.instance.disposed"
 }
 
-function active(event: Event, sessionID: string): boolean {
-  if (sid(event) !== sessionID) {
-    return false
-  }
-
-  if (event.type === "message.updated") {
-    return event.properties.info.role === "assistant"
-  }
-
-  if (event.type === "message.part.delta" || event.type === "message.part.updated") {
-    return false
-  }
-
-  if (event.type !== "session.status") {
-    return true
-  }
-
-  return event.properties.status.type !== "idle"
-}
-
 // Races the turn's deferred completion against an abort signal.
 function waitTurn(done: Wait["done"], signal: AbortSignal) {
   return Effect.raceAll([
-    Deferred.await(done).pipe(Effect.as("idle" as const), Effect.exit),
+    Deferred.await(done).pipe(Effect.as("done" as const), Effect.exit),
     Effect.callback<"abort">((resume) => {
       if (signal.aborted) {
         resume(Effect.succeed("abort"))
@@ -247,27 +223,41 @@ function waitTurn(done: Wait["done"], signal: AbortSignal) {
   ]).pipe(Effect.flatMap((exit) => (Exit.isFailure(exit) ? Effect.failCause(exit.cause) : Effect.succeed(exit.value))))
 }
 
+// A turn failed after the server showed the failure as a session error row. The turn still fails, so the
+// runtime keeps its files and local rows, but it does not show the failure again.
+export class ShownTurnError extends Error {
+  constructor(cause: unknown) {
+    super(formatUnknownError(cause), { cause })
+    this.name = "ShownTurnError"
+  }
+}
+
 export function formatUnknownError(error: unknown): string {
   if (typeof error === "string") {
     return error
   }
 
-  if (error instanceof Error) {
-    return error.message || error.name
+  if (!error || typeof error !== "object") {
+    return "unknown error"
   }
 
-  if (error && typeof error === "object") {
-    const value = error as { message?: unknown; name?: unknown }
-    if (typeof value.message === "string" && value.message.trim()) {
-      return value.message
-    }
-
-    if (typeof value.name === "string" && value.name.trim()) {
-      return value.name
-    }
+  // A NamedError keeps its text in `data`, and its `message` is only the name. An SDK error keeps the
+  // server response body in `cause`. A server defect adds a `ref` that matches its server log entry.
+  const value = error as {
+    message?: unknown
+    name?: unknown
+    data?: { message?: unknown; ref?: unknown }
+    cause?: { body?: { data?: { message?: unknown; ref?: unknown } } }
+  }
+  const data = value.data ?? value.cause?.body?.data
+  const message = [data?.message, value.message, value.name].find(
+    (item): item is string => typeof item === "string" && item.trim().length > 0,
+  )
+  if (!message) {
+    return "unknown error"
   }
 
-  return "unknown error"
+  return typeof data?.ref === "string" ? `${message} (ref: ${data.ref})` : message
 }
 
 function sameView(a: FooterView, b: FooterView) {
@@ -446,7 +436,6 @@ function createLayer(input: StreamInput) {
         const state: State = {
           data: createSessionData(),
           subagent: createSubagentData(),
-          tick: 0,
           footerView: { type: "prompt" },
           blockerTick: 0,
           blockers: new Map(),
@@ -643,38 +632,34 @@ function createLayer(input: StreamInput) {
 
         const bootstrapSubagentHistory = Effect.fn("RunStreamTransport.bootstrapSubagentHistory")(function* (
           sessions: string[],
+          children: Set<string>,
         ) {
-          yield* Effect.forEach(
+          const histories = yield* Effect.forEach(
             sessions,
             (sessionID) =>
               messages(sessionID, SUBAGENT_CALL_BOOTSTRAP_LIMIT).pipe(
-                Effect.tap((messagesList) =>
-                  Effect.sync(() => {
-                    if (
-                      !bootstrapSubagentCalls({
-                        data: state.subagent,
-                        sessionID,
-                        messages: messagesList,
-                        thinking: input.thinking,
-                        limits: input.limits(),
-                      })
-                    ) {
-                      return
-                    }
-
-                    syncFooter([], undefined, currentSubagentState())
-                  }),
-                ),
+                Effect.map((messages) => ({ sessionID, messages })),
               ),
-            {
-              concurrency: 4,
-              discard: true,
-            },
+            { concurrency: 4 },
           )
+          const changed = histories.reduce((changed, history) => {
+            const tabs = bootstrapSubagentTabs({ data: state.subagent, messages: history.messages, children })
+            const calls = bootstrapSubagentCalls({
+              data: state.subagent,
+              sessionID: history.sessionID,
+              messages: history.messages,
+              thinking: input.thinking,
+              limits: input.limits(),
+            })
+            return tabs || calls || changed
+          }, false)
+          if (!changed) return
+          syncFooter([], undefined, currentSubagentState())
+          yield* drainBuffered()
         })
 
         const bootstrap = Effect.fn("RunStreamTransport.bootstrap")(function* () {
-          const [messagesList, children, permissions, questions] = yield* Effect.all(
+          const [messagesList, descendants, statuses, permissions, questions] = yield* Effect.all(
             [
               messages(
                 input.sessionID,
@@ -684,13 +669,30 @@ function createLayer(input: StreamInput) {
                     : Math.max(input.replayLimit, SUBAGENT_BOOTSTRAP_LIMIT)
                   : SUBAGENT_BOOTSTRAP_LIMIT,
               ),
-              Effect.promise(() =>
-                input.sdk.session.children({
-                  sessionID: input.sessionID,
+              // Bootstrap with the full descendant tree, not just direct
+              // children. `bootstrapSubagentData` only registers blocker
+              // tabs for sessions in the `children` set, so a one-level
+              // fetch silently drops grandchild prompts that were already
+              // pending when the transport started.
+              Effect.tryPromise({
+                try: () => fetchDescendants(input.sdk, input.sessionID, { signal: abort.signal }),
+                catch: (error) => ({ error }),
+              }).pipe(
+                Effect.catch((failure) => {
+                  const error = failure.error
+                  if (!(error instanceof DescendantFetchError)) return Effect.fail(error)
+                  input.trace?.write("bootstrap.descendants.partial", {
+                    failures: error.failures.map((item) => item.sessionID),
+                    descendants: error.partial.map((item) => item.id),
+                  })
+                  return Effect.logWarning("using partial descendant data after bootstrap lookup failure", {
+                    failures: error.failures.map((item) => item.sessionID),
+                  }).pipe(Effect.as(error.partial))
                 }),
-              ).pipe(
-                Effect.map((item) => item.data ?? []),
-                Effect.orElseSucceed(() => []),
+              ),
+              Effect.promise(() => input.sdk.session.status()).pipe(
+                Effect.map((item) => item.data ?? {}),
+                Effect.orElseSucceed(() => ({})),
               ),
               Effect.promise(() => input.sdk.permission.list()).pipe(
                 Effect.map((item) => item.data ?? []),
@@ -750,7 +752,8 @@ function createLayer(input: StreamInput) {
           bootstrapSubagentData({
             data: state.subagent,
             messages: messagesList,
-            children,
+            children: descendants,
+            statuses,
             permissions,
             questions,
           })
@@ -788,26 +791,16 @@ function createLayer(input: StreamInput) {
           booting = false
           yield* drainBuffered()
 
-          const sessions = [...state.subagent.tabs.keys()]
+          const sessions = descendants.map((item) => item.id)
           if (sessions.length === 0) {
             return
           }
 
-          yield* bootstrapSubagentHistory(sessions).pipe(
+          yield* bootstrapSubagentHistory(sessions, new Set(sessions)).pipe(
             Effect.forkIn(scope, { startImmediately: true }),
             Effect.asVoid,
           )
         })
-
-        const idle = Effect.fn("RunStreamTransport.idle")((fallback: boolean) =>
-          Effect.promise(() => input.sdk.session.status()).pipe(
-            Effect.map((out) => {
-              const item = out.data?.[input.sessionID]
-              return !item || item.type === "idle"
-            }),
-            Effect.orElseSucceed(() => fallback),
-          ),
-        )
 
         const fail = Effect.fn("RunStreamTransport.fail")(function* (error: unknown) {
           if (state.fault) {
@@ -822,53 +815,6 @@ function createLayer(input: StreamInput) {
           }
 
           yield* Deferred.fail(next.done, error).pipe(Effect.ignore)
-        })
-
-        const touch = (event: Event) => {
-          const next = state.wait
-          if (!next || !active(event, input.sessionID)) {
-            return
-          }
-
-          next.live = true
-        }
-
-        const complete = Effect.fn("RunStreamTransport.complete")(function* (next: Wait, fallback: boolean) {
-          if (state.wait !== next || !next.armed || !next.live) {
-            return
-          }
-
-          if (!(yield* idle(fallback)) || state.wait !== next) {
-            return
-          }
-
-          state.tick = next.tick + 1
-          state.wait = undefined
-          yield* Deferred.succeed(next.done, undefined).pipe(Effect.ignore)
-        })
-
-        const mark = Effect.fn("RunStreamTransport.mark")(function* (event: Event) {
-          if (
-            event.type !== "session.status" ||
-            event.properties.sessionID !== input.sessionID ||
-            event.properties.status.type !== "idle"
-          ) {
-            return
-          }
-
-          const next = state.wait
-          if (!next) {
-            return
-          }
-
-          yield* complete(next, true)
-        })
-
-        const poll = Effect.fn("RunStreamTransport.poll")(function* (next: Wait, signal: AbortSignal) {
-          while (state.wait === next && !signal.aborted && !input.footer.isClosed && !closed) {
-            yield* Effect.sleep("250 millis")
-            yield* complete(next, false)
-          }
         })
 
         const flush = (type: "turn.abort" | "turn.cancel") => {
@@ -944,10 +890,19 @@ function createLayer(input: StreamInput) {
           }
           releaseBlocker(event)
 
-          syncFooter(next.commits, next.footer?.patch, changed ? currentSubagentState() : undefined)
+          if (event.type === "session.error" && event.properties.sessionID === input.sessionID && state.wait) {
+            yield* Deferred.succeed(state.wait.reported, undefined)
+          }
 
-          touch(event)
-          yield* mark(event)
+          // A delivered background Task result starts a root turn without a local prompt. Root status
+          // drives the footer phase then, so the turn shows as running and Esc can interrupt it.
+          const status =
+            !state.wait && event.type === "session.status" && event.properties.sessionID === input.sessionID
+              ? event.properties.status.type === "idle"
+                ? ({ phase: "idle", status: "" } satisfies FooterPatch)
+                : ({ phase: "running" } satisfies FooterPatch)
+              : undefined
+          syncFooter(next.commits, status ?? next.footer?.patch, changed ? currentSubagentState() : undefined)
         })
 
         const drainBuffered = Effect.fn("RunStreamTransport.drainBuffered")(function* () {
@@ -1200,11 +1155,9 @@ function createLayer(input: StreamInput) {
           }
 
           const item: Wait = {
-            tick: state.tick,
-            armed: false,
-            live: false,
             onVisibleOutput: next.onVisibleOutput,
             done: yield* Deferred.make<void, unknown>(),
+            reported: yield* Deferred.make<void>(),
           }
           state.wait = item
           state.data.announced = false
@@ -1215,7 +1168,6 @@ function createLayer(input: StreamInput) {
           }
           next.signal?.addEventListener("abort", stop, { once: true })
           abort.signal.addEventListener("abort", stop, { once: true })
-          yield* poll(item, turn.signal).pipe(Effect.forkIn(scope, { startImmediately: true }), Effect.asVoid)
 
           const req = {
             sessionID: input.sessionID,
@@ -1242,17 +1194,19 @@ function createLayer(input: StreamInput) {
                     resolveShellAgent(next.agent)
                       .pipe(
                         Effect.flatMap((agent) =>
-                          Effect.promise(() =>
-                            input.sdk.session.shell(
-                              {
-                                sessionID: input.sessionID,
-                                agent,
-                                model: next.model,
-                                command: next.prompt.text,
-                              },
-                              { signal: turn.signal, throwOnError: true },
-                            ),
-                          ),
+                          Effect.tryPromise({
+                            try: () =>
+                              input.sdk.session.shell(
+                                {
+                                  sessionID: input.sessionID,
+                                  agent,
+                                  model: next.model,
+                                  command: next.prompt.text,
+                                },
+                                { signal: turn.signal, throwOnError: true },
+                              ),
+                            catch: (error) => error,
+                          }),
                         ),
                       )
                       .pipe(
@@ -1261,8 +1215,6 @@ function createLayer(input: StreamInput) {
                             input.trace?.write("send.shell.ok", {
                               sessionID: input.sessionID,
                             })
-                            item.armed = true
-                            item.live = true
                           }),
                         ),
                         Effect.flatMap(() => Deferred.succeed(item.done, undefined).pipe(Effect.ignore)),
@@ -1277,34 +1229,34 @@ function createLayer(input: StreamInput) {
                     input.trace?.write("send.command", { sessionID: input.sessionID, command: command.name })
                   }).pipe(
                     Effect.andThen(
-                      Effect.promise(() =>
-                        input.sdk.session.command(
-                          {
-                            sessionID: input.sessionID,
-                            messageID: next.prompt.messageID,
-                            agent: next.agent,
-                            model: next.model ? `${next.model.providerID}/${next.model.modelID}` : undefined,
-                            variant: next.variant,
-                            command: command.name,
-                            arguments: command.arguments,
-                            parts: [
-                              ...(next.includeFiles ? next.files : []),
-                              ...next.prompt.parts.filter(
-                                (item): item is Extract<RunPromptPart, { type: "file" }> => item.type === "file",
-                              ),
-                            ],
-                          },
-                          { signal: turn.signal },
-                        ),
-                      ).pipe(
+                      Effect.tryPromise({
+                        try: () =>
+                          input.sdk.session.command(
+                            {
+                              sessionID: input.sessionID,
+                              messageID: next.prompt.messageID,
+                              agent: next.agent,
+                              model: next.model ? `${next.model.providerID}/${next.model.modelID}` : undefined,
+                              variant: next.variant,
+                              command: command.name,
+                              arguments: command.arguments,
+                              parts: [
+                                ...(next.includeFiles ? next.files : []),
+                                ...next.prompt.parts.filter(
+                                  (item): item is Extract<RunPromptPart, { type: "file" }> => item.type === "file",
+                                ),
+                              ],
+                            },
+                            { signal: turn.signal, throwOnError: true },
+                          ),
+                        catch: (error) => error,
+                      }).pipe(
                         Effect.tap(() =>
                           Effect.sync(() => {
                             input.trace?.write("send.command.ok", {
                               sessionID: input.sessionID,
                               command: command.name,
                             })
-                            item.armed = true
-                            item.live = true
                           }),
                         ),
                         Effect.flatMap(() => Deferred.succeed(item.done, undefined).pipe(Effect.ignore)),
@@ -1318,19 +1270,26 @@ function createLayer(input: StreamInput) {
                     input.trace?.write("send.prompt", req)
                   }).pipe(
                     Effect.andThen(
-                      Effect.promise(() =>
-                        input.sdk.session.promptAsync(req, {
-                          signal: turn.signal,
-                        }),
+                      Effect.tryPromise({
+                        try: () =>
+                          input.sdk.session.prompt(req, {
+                            signal: turn.signal,
+                            throwOnError: true,
+                          }),
+                        catch: (error) => error,
+                      }).pipe(
+                        Effect.tap(() =>
+                          Effect.sync(() => {
+                            input.trace?.write("send.prompt.ok", {
+                              sessionID: input.sessionID,
+                            })
+                          }),
+                        ),
+                        Effect.flatMap(() => Deferred.succeed(item.done, undefined).pipe(Effect.ignore)),
+                        Effect.catch((error) => Deferred.fail(item.done, error).pipe(Effect.ignore)),
+                        Effect.forkIn(scope, { startImmediately: true }),
+                        Effect.asVoid,
                       ),
-                    ),
-                    Effect.tap(() =>
-                      Effect.sync(() => {
-                        input.trace?.write("send.prompt.ok", {
-                          sessionID: input.sessionID,
-                        })
-                        item.armed = true
-                      }),
                     ),
                   )
 
@@ -1354,13 +1313,6 @@ function createLayer(input: StreamInput) {
                 })
               }
 
-              if (state.tick > item.tick) {
-                if (state.wait === item) {
-                  state.wait = undefined
-                }
-                return Effect.void
-              }
-
               return waitTurn(item.done, turn.signal).pipe(
                 Effect.flatMap((status) =>
                   Effect.sync(() => {
@@ -1376,25 +1328,37 @@ function createLayer(input: StreamInput) {
               )
             }),
             Effect.catch((error) => {
-              if (state.wait === item) {
-                state.wait = undefined
-              }
-
               const canceled = turn.signal.aborted || next.signal?.aborted === true || input.footer.isClosed || closed
-              if (canceled) {
-                flush("turn.cancel")
-                return Effect.void
-              }
+              // The server publishes session.error before it fails a request, and that event already shows
+              // the error. The event can arrive after the response, so wait briefly for it before failing the turn.
+              const reported =
+                canceled || error === state.fault
+                  ? Effect.succeedNone
+                  : Deferred.await(item.reported).pipe(Effect.timeoutOption("250 millis"))
+              return reported.pipe(
+                Effect.flatMap((shown) => {
+                  if (state.wait === item) {
+                    state.wait = undefined
+                  }
 
-              if (error === state.fault) {
-                return Effect.fail(error)
-              }
+                  if (canceled) {
+                    flush("turn.cancel")
+                    return Effect.void
+                  }
 
-              input.trace?.write("send.prompt.error", {
-                sessionID: input.sessionID,
-                error: formatUnknownError(error),
-              })
-              return Effect.fail(error)
+                  if (Option.isSome(shown)) {
+                    return Effect.fail(new ShownTurnError(error))
+                  }
+
+                  if (error !== state.fault) {
+                    input.trace?.write("send.prompt.error", {
+                      sessionID: input.sessionID,
+                      error: formatUnknownError(error),
+                    })
+                  }
+                  return Effect.fail(error)
+                }),
+              )
             }),
             Effect.ensuring(
               Effect.sync(() => {
@@ -1443,9 +1407,9 @@ function createLayer(input: StreamInput) {
 // Opens an SDK event subscription and returns a SessionTransport.
 //
 // The background `watch` loop consumes every SDK event, runs it through the
-// reducer, and writes output to the footer. When a session.status idle
-// event arrives, it resolves the current turn's Wait so runPromptTurn()
-// can return.
+// reducer, and writes output to the footer, with or without an active turn.
+// runPromptTurn() returns when its request returns, or fails when the
+// request or the event stream fails.
 //
 // The transport is single-turn: only one runPromptTurn() call can be active
 // at a time. The prompt queue enforces this from above.

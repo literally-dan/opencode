@@ -26,6 +26,7 @@ import { Spinner } from "../../component/spinner"
 import { createSyntaxStyleMemo, generateSubtleSyntax, selectedForeground, useTheme } from "../../context/theme"
 import { BoxRenderable, ScrollBoxRenderable, addDefaultParsers, TextAttributes, RGBA } from "@opentui/core"
 import { Prompt, type PromptRef } from "../../component/prompt"
+import { sessionTree, sessionTreeBusy } from "./tree"
 import type {
   AssistantMessage,
   Part,
@@ -63,7 +64,7 @@ import stripAnsi from "strip-ansi"
 import { usePromptRef } from "../../context/prompt"
 import { useEpilogue } from "../../context/epilogue"
 import { normalizePath } from "../../util/path"
-import { PermissionPrompt } from "./permission"
+import { isAskPermission, normalPermissionCallID, PermissionPrompt } from "./permission"
 import { QuestionPrompt } from "./question"
 import { DialogExportOptions } from "../../ui/dialog-export-options"
 import * as Model from "../../util/model"
@@ -90,6 +91,13 @@ const GO_UPSELL_ACCOUNT_RATE_LIMIT_LAST_SEEN_AT = "go_upsell_account_rate_limit_
 const GO_UPSELL_ACCOUNT_RATE_LIMIT_DONT_SHOW = "go_upsell_account_rate_limit_dont_show"
 const GO_UPSELL_WINDOW = 86_400_000 // 24 hrs
 const GO_UPSELL_PROVIDERS = new Set(["opencode", "opencode-go"])
+
+export function isMarkdownPartComplete(
+  part: Pick<TextPart, "time"> | Pick<ReasoningPart, "time">,
+  message: Pick<AssistantMessage, "time">,
+) {
+  return part.time?.end !== undefined || message.time.completed !== undefined
+}
 
 export const alwaysSeparate = new WeakSet<BoxRenderable>()
 
@@ -209,6 +217,15 @@ export function Session() {
       .filter((x) => x.parentID === parentID || x.id === parentID)
       .toSorted((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
   })
+  // Root + every transitive subagent. The prompt UI scopes to descendants
+  // (not just direct children) so blockers raised inside a nested
+  // subagent surface against the root view the user is looking at.
+  const descendants = createMemo(() => {
+    const s = session()
+    if (!s || s.parentID) return []
+    return sessionTree(sync.data.session, s.id)
+  })
+  const interruptible = createMemo(() => sessionTreeBusy(sync.data.session, sync.data.session_status, route.sessionID))
   const messages = createMemo(() => sync.data.message[route.sessionID] ?? [])
   const messagesBeforeRevert = () => {
     const messageID = session()?.revert?.messageID
@@ -216,26 +233,15 @@ export function Session() {
     const index = messages().findIndex((message) => message.id === messageID)
     return index === -1 ? messages() : messages().slice(0, index)
   }
-  const foregroundTasks = createMemo(() =>
-    sync.data.capabilities.experimentalBackgroundSubagents
-      ? messages().flatMap((message) =>
-          (sync.data.part[message.id] ?? []).filter(
-            (part): part is ToolPart =>
-              part.type === "tool" &&
-              part.tool === "task" &&
-              part.state.status === "running" &&
-              part.state.metadata?.background !== true,
-          ),
-        )
-      : [],
-  )
   const permissions = createMemo(() => {
     if (session()?.parentID) return []
-    return children().flatMap((x) => sync.data.permission[x.id] ?? [])
+    return descendants().flatMap((x) =>
+      (sync.data.permission[x.id] ?? []).filter((request) => !isAskPermission(request)),
+    )
   })
   const questions = createMemo(() => {
     if (session()?.parentID) return []
-    return children().flatMap((x) => sync.data.question[x.id] ?? [])
+    return descendants().flatMap((x) => sync.data.question[x.id] ?? [])
   })
   const visible = createMemo(() => !session()?.parentID && permissions().length === 0 && questions().length === 0)
   const disabled = createMemo(() => permissions().length > 0 || questions().length > 0)
@@ -313,6 +319,8 @@ export function Session() {
       await sync.session.sync(sessionID)
       if (route.sessionID === sessionID && scroll) scroll.scrollBy(100_000)
     })().catch((error) => {
+      // Quitting aborts in-flight SDK calls.
+      if (error instanceof Error && error.name === "AbortError") return
       if (route.sessionID !== sessionID) return
       toast.show({
         message: errorMessage(error),
@@ -614,9 +622,8 @@ export function Session() {
       slash: {
         name: "undo",
       },
-      run: async () => {
-        const status = sync.data.session_status?.[route.sessionID]
-        if (status?.type !== "idle") await sdk.client.session.abort({ sessionID: route.sessionID }).catch(() => {})
+      run: () => {
+        // Revert stops a running turn itself. Abort would also cancel background Tasks that the revert keeps.
         const message = messagesBeforeRevert().findLast((item) => item.role === "user")
         if (!message) return
         void sdk.client.session
@@ -1019,20 +1026,6 @@ export function Session() {
       },
     },
     {
-      title: "Background subagents",
-      value: "session.background",
-      category: "Session",
-      hidden: true,
-      enabled: foregroundTasks().length > 0,
-      run: () => {
-        void sdk.client.experimental.session.background({
-          sessionID: route.sessionID,
-          workspace: project.workspace.current(),
-        })
-        dialog.clear()
-      },
-    },
-    {
       title: "Go to child session",
       value: "session.child.first",
       category: "Session",
@@ -1110,13 +1103,6 @@ export function Session() {
   useBindings(() => ({
     mode: OPENCODE_BASE_MODE,
     bindings: tuiConfig.keybinds.gather("session", sessionBindingCommands),
-  }))
-
-  useBindings(() => ({
-    mode: OPENCODE_BASE_MODE,
-    enabled: foregroundTasks().length > 0,
-    priority: 1,
-    bindings: tuiConfig.keybinds.get("session.background"),
   }))
 
   const revertInfo = createMemo(() => session()?.revert)
@@ -1294,17 +1280,15 @@ export function Session() {
                 </For>
               </scrollbox>
               <box flexShrink={0}>
-                <Show when={permissions().length > 0}>
-                  <PermissionPrompt
-                    request={permissions()[0]}
-                    directory={sync.session.get(permissions()[0].sessionID)?.directory}
-                  />
+                <Show when={permissions()[0]} keyed>
+                  {(request) => (
+                    <PermissionPrompt request={request} directory={sync.session.get(request.sessionID)?.directory} />
+                  )}
                 </Show>
-                <Show when={permissions().length === 0 && questions().length > 0}>
-                  <QuestionPrompt
-                    request={questions()[0]}
-                    directory={sync.session.get(questions()[0].sessionID)?.directory}
-                  />
+                <Show when={permissions().length === 0 && questions()[0]} keyed>
+                  {(request) => (
+                    <QuestionPrompt request={request} directory={sync.session.get(request.sessionID)?.directory} />
+                  )}
                 </Show>
                 <Show when={session()?.parentID}>
                   <SubagentFooter />
@@ -1323,6 +1307,7 @@ export function Session() {
                       visible={visible()}
                       ref={bind}
                       disabled={disabled()}
+                      interruptible={interruptible()}
                       onSubmit={() => {
                         toBottom()
                       }}
@@ -1487,7 +1472,6 @@ function AssistantMessage(props: { message: AssistantMessage; parts: Part[]; las
   })
 
   const childShortcut = useCommandShortcut("session.child.first")
-  const backgroundShortcut = useCommandShortcut("session.background")
 
   return (
     <>
@@ -1511,22 +1495,6 @@ function AssistantMessage(props: { message: AssistantMessage; parts: Part[]; las
           <text fg={theme.text}>
             {childShortcut()}
             <span style={{ fg: theme.textMuted }}> view subagents</span>
-            <Show
-              when={
-                sync.data.capabilities.experimentalBackgroundSubagents &&
-                props.parts.some(
-                  (x) =>
-                    x.type === "tool" &&
-                    x.tool === "task" &&
-                    x.state.status === "running" &&
-                    x.state.metadata?.background !== true,
-                )
-              }
-            >
-              <span style={{ fg: theme.textMuted }}> · </span>
-              {backgroundShortcut()}
-              <span style={{ fg: theme.textMuted }}> background</span>
-            </Show>
           </text>
         </box>
       </Show>
@@ -1635,7 +1603,7 @@ function ReasoningPart(props: { last: boolean; part: ReasoningPart; message: Ass
             <code
               filetype="markdown"
               drawUnstyledText={false}
-              streaming={true}
+              streaming={!isMarkdownPartComplete(props.part, props.message)}
               syntaxStyle={syntax()}
               content={summary().body}
               conceal={ctx.conceal()}
@@ -1691,7 +1659,7 @@ function TextPart(props: { last: boolean; part: TextPart; message: AssistantMess
       <box ref={(el: BoxRenderable) => alwaysSeparate.add(el)} paddingLeft={3} marginTop={1} flexShrink={0}>
         <markdown
           syntaxStyle={syntax()}
-          streaming={true}
+          streaming={!isMarkdownPartComplete(props.part, props.message)}
           internalBlockMode="top-level"
           content={props.part.text.trim()}
           tableOptions={{ style: "grid" }}
@@ -1854,7 +1822,7 @@ function InlineTool(props: {
   const [errorExpanded, setErrorExpanded] = createSignal(false)
 
   const permission = createMemo(() => {
-    const callID = sync.data.permission[ctx.sessionID]?.at(0)?.tool?.callID
+    const callID = normalPermissionCallID(sync.data.permission[ctx.sessionID])
     if (!callID) return false
     return callID === props.part.callID
   })
@@ -2220,22 +2188,40 @@ function Task(props: ToolProps) {
 
   onMount(() => {
     const sessionID = stringValue(props.metadata.sessionId)
-    if (sessionID && !sync.data.message[sessionID]?.length) void sync.session.sync(sessionID)
+    if (!sessionID || sync.data.message[sessionID]?.length) return
+    sync.session.sync(sessionID).catch((error) => {
+      // Quitting aborts in-flight SDK calls.
+      if (error instanceof Error && error.name === "AbortError") return
+      console.error("Failed to sync subagent session", error)
+    })
   })
 
   const sessionID = createMemo(() => stringValue(props.metadata.sessionId))
   const messages = createMemo(() => sync.data.message[sessionID() ?? ""] ?? [])
 
-  const tools = createMemo(() => {
-    return messages().flatMap((msg) =>
-      (sync.data.part[msg.id] ?? [])
-        .filter((part): part is ToolPart => part.type === "tool")
-        .map((part) => ({ tool: part.tool, state: part.state })),
-    )
-  })
-
-  const current = createMemo(() =>
-    tools().findLast((x) => (x.state.status === "running" || x.state.status === "completed") && x.state.title),
+  // Walk subagent messages newest to oldest for the most recent running or
+  // completed tool with a title. The structural-equality memo is what earns its
+  // keep: adding a text part no longer notifies consumers, because the result
+  // compares equal. Early exit keeps the common case short, though a subagent
+  // with no titled tool still scans everything.
+  const current = createMemo<{ tool: string; title: string } | undefined>(
+    () => {
+      const msgs = messages()
+      for (let i = msgs.length - 1; i >= 0; i--) {
+        const parts = sync.data.part[msgs[i].id] ?? []
+        for (let j = parts.length - 1; j >= 0; j--) {
+          const p = parts[j]
+          if (p.type !== "tool") continue
+          const status = p.state.status
+          if ((status === "running" || status === "completed") && p.state.title) {
+            return { tool: p.tool, title: p.state.title }
+          }
+        }
+      }
+      return undefined
+    },
+    undefined,
+    { equals: (a, b) => a?.tool === b?.tool && a?.title === b?.title },
   )
 
   const status = createMemo(() => sync.data.session_status[sessionID() ?? ""])
@@ -2250,6 +2236,19 @@ function Task(props: ToolProps) {
     const value = status()
     if (value?.type !== "retry") return
     return value
+  })
+
+  // Count only — primitive output means Solid's referential equality
+  // short-circuits downstream consumers when the count is unchanged
+  // (which is most of the time during a tool call's lifetime).
+  const toolCount = createMemo(() => {
+    let n = 0
+    for (const msg of messages()) {
+      for (const p of sync.data.part[msg.id] ?? []) {
+        if (p.type === "tool") n++
+      }
+    }
+    return n
   })
 
   const duration = createMemo(() => {
@@ -2273,16 +2272,14 @@ function Task(props: ToolProps) {
     const retrying = retry()
     if (isRunning() && retrying) {
       content.push(`↳ ${formatSubagentRetry(retrying.attempt, Locale.truncate(retrying.message, 80))}`)
-    } else if (isRunning() && tools().length > 0) {
-      if (current()) {
-        const state = current()!.state
-        const title = state.status === "running" || state.status === "completed" ? state.title : undefined
-        content.push(`↳ ${Locale.titlecase(current()!.tool)} ${title}`)
-      } else content.push(`↳ ${formatSubagentToolcalls(tools().length)}`)
+    } else if (isRunning() && toolCount() > 0) {
+      const cur = current()
+      if (cur) content.push(`↳ ${Locale.titlecase(cur.tool)} ${cur.title}`)
+      else content.push(`↳ ${formatSubagentToolcalls(toolCount())}`)
     }
 
     if (!isRunning() && props.part.state.status === "completed") {
-      content.push(`↳ ${formatCompletedSubagentDetail(tools().length, Locale.duration(duration()))}`)
+      content.push(`↳ ${formatCompletedSubagentDetail(toolCount(), Locale.duration(duration()))}`)
     }
 
     return content.join("\n")

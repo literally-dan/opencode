@@ -180,10 +180,12 @@ export const ContentPart = Schema.Union([TextPart, MediaPart, ToolCallPart, Tool
 )
 export type ContentPart = Schema.Schema.Type<typeof ContentPart>
 
+// Internal request-planning metadata. Protocol lowerers intentionally do not serialize it.
 export class Message extends Schema.Class<Message>("LLM.Message")({
   id: Schema.optional(Schema.String),
   role: MessageRole,
   content: Schema.Array(ContentPart),
+  cacheable: Schema.optional(Schema.Boolean),
   metadata: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)),
   native: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)),
 }) {}

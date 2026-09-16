@@ -90,6 +90,8 @@ export function make(input: {
   if (events) input.eventSubscription?.(events)
   const runUntilIdle = <A>(sessionId: string, fn: () => Promise<A>) =>
     events ? events.runUntilIdle(sessionId, fn) : fn()
+  // Counts session/cancel notifications per session, so a prompt can tell whether a cancel arrived while it ran.
+  const cancels = new Map<string, number>()
 
   const initialize = Effect.fn("ACP.initialize")(function* (params: InitializeRequest) {
     const started = performance.now()
@@ -356,6 +358,7 @@ export function make(input: {
 
   const cancel = Effect.fn("ACP.cancel")(function* (params: CancelNotification) {
     const current = yield* session.get(params.sessionId)
+    cancels.set(current.id, (cancels.get(current.id) ?? 0) + 1)
     yield* abortBackingSession(current)
   })
 
@@ -508,6 +511,8 @@ export function make(input: {
     setSessionModel,
     prompt: Effect.fn("ACP.prompt")(function* (params: PromptRequest) {
       const current = yield* session.get(params.sessionId)
+      const cancelsBefore = cancels.get(current.id) ?? 0
+      const cancelled = () => (cancels.get(current.id) ?? 0) !== cancelsBefore
       const snapshot = yield* directorySnapshot(current.cwd)
       const selected = current.model ?? selectDefaultModel(snapshot)
       if (!current.model) {
@@ -540,7 +545,7 @@ export function make(input: {
           "session",
         )
         yield* sendUsageUpdate(input.usage, input.sdk, input.connection, current.id, current.cwd)
-        return yield* promptResponse(response.info, params.messageId)
+        return yield* promptResponse(response.info, params.messageId, cancelled())
       }
 
       const known = snapshot.availableCommands.find((item) => item.name === command.name)
@@ -564,7 +569,7 @@ export function make(input: {
           "session",
         )
         yield* sendUsageUpdate(input.usage, input.sdk, input.connection, current.id, current.cwd)
-        return yield* promptResponse(response.info, params.messageId)
+        return yield* promptResponse(response.info, params.messageId, cancelled())
       }
 
       if (command.name === "compact") {
@@ -586,7 +591,7 @@ export function make(input: {
       }
 
       yield* sendUsageUpdate(input.usage, input.sdk, input.connection, current.id, current.cwd)
-      return yield* promptResponse(undefined, params.messageId)
+      return yield* promptResponse(undefined, params.messageId, cancelled())
     }),
     cancel,
   }
@@ -839,7 +844,18 @@ function detectSlashCommand(parts: ReturnType<typeof promptContentToParts>) {
 const promptResponse = Effect.fn("ACP.promptResponse")(function* (
   info: AssistantInfo,
   messageId: string | null | undefined,
+  cancelled: boolean,
 ) {
+  // A prompt that saw session/cancel answers cancelled, also when its turn ended before the cancel and the prompt
+  // waited for background Tasks.
+  if (cancelled) {
+    return {
+      stopReason: "cancelled" as const,
+      ...(info ? { usage: UsageService.buildUsage(info) } : {}),
+      ...(messageId ? { userMessageId: messageId } : {}),
+      _meta: {},
+    }
+  }
   if (!info?.error) {
     return {
       stopReason: "end_turn" as const,

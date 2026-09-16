@@ -84,7 +84,6 @@ type RunFooterOptions = {
   theme: RunTheme
   keymap: Keymap<Renderable, KeyEvent>
   tuiConfig: RunTuiConfig
-  backgroundSubagents: boolean
   diffStyle: RunDiffStyle
   onPermissionReply: (input: PermissionReply) => void | Promise<void>
   onQuestionReply: (input: QuestionReply) => void | Promise<void>
@@ -93,7 +92,6 @@ type RunFooterOptions = {
   onModelSelect?: (model: NonNullable<RunInput["model"]>) => CycleResult | void | Promise<CycleResult | void>
   onVariantSelect?: (variant: string | undefined) => CycleResult | void | Promise<CycleResult | void>
   onInterrupt?: () => void
-  onBackground?: () => void
   onEditorOpen: (input: { value: string }) => Promise<string | undefined>
   onExit?: () => void
   onSubagentSelect?: (sessionID: string | undefined) => void
@@ -162,6 +160,10 @@ function eventPatch(next: FooterEvent): FooterPatch | undefined {
   }
 
   return undefined
+}
+
+export function canInterruptRun(state: FooterState, subagent: FooterSubagentState) {
+  return state.phase === "running" || subagent.tabs.some((item) => item.status === "running")
 }
 
 export class RunFooter implements FooterApi {
@@ -320,7 +322,6 @@ export class RunFooter implements FooterApi {
               theme: footer.theme,
               diffStyle: options.diffStyle,
               tuiConfig: options.tuiConfig,
-              backgroundSubagents: options.backgroundSubagents,
               history: options.history,
               agent: options.agentLabel,
               onSubmit: footer.handlePrompt,
@@ -329,7 +330,6 @@ export class RunFooter implements FooterApi {
               onQuestionReject: footer.handleQuestionReject,
               onCycle: footer.handleCycle,
               onInterrupt: footer.handleInterrupt,
-              onBackground: options.onBackground,
               onEditorOpen: options.onEditorOpen,
               onInputClear: footer.handleInputClear,
               onExitRequest: footer.handleExit,
@@ -965,7 +965,7 @@ export class RunFooter implements FooterApi {
   // second press within 5 seconds fires onInterrupt. The timer resets the
   // counter if the user doesn't follow through.
   private handleInterrupt = (): boolean => {
-    if (this.isClosed || this.state().phase !== "running") {
+    if (this.isClosed || !canInterruptRun(this.state(), this.subagent())) {
       return false
     }
 

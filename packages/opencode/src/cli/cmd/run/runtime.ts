@@ -51,7 +51,6 @@ type RunRuntimeInput = {
   files: RunInput["files"]
   initialInput?: string
   thinking: boolean
-  backgroundSubagents: boolean
   replay?: boolean
   replayLimit?: number
   demo?: RunInput["demo"]
@@ -70,7 +69,6 @@ type RunLocalInput = {
   files: RunInput["files"]
   initialInput?: string
   thinking: boolean
-  backgroundSubagents: boolean
   replay?: boolean
   replayLimit?: number
   demo?: RunInput["demo"]
@@ -78,7 +76,7 @@ type RunLocalInput = {
 
 type StreamTransportModule = Pick<
   Awaited<typeof import("./stream.transport")>,
-  "createSessionTransport" | "formatUnknownError"
+  "createSessionTransport" | "formatUnknownError" | "ShownTurnError"
 >
 
 export type RunRuntimeDeps = {
@@ -243,7 +241,6 @@ async function runInteractiveRuntime(input: RunRuntimeInput, deps: RunRuntimeDep
     model: state.model,
     variant: state.activeVariant,
     tuiConfig,
-    backgroundSubagents: input.backgroundSubagents,
     onPermissionReply: async (next) => {
       if (state.demo?.permission(next)) {
         return
@@ -351,10 +348,6 @@ async function runInteractiveRuntime(input: RunRuntimeInput, deps: RunRuntimeDep
         .finally(() => {
           state.aborting = false
         })
-    },
-    onBackground: () => {
-      if (!hasSession(input, state)) return
-      void ctx.sdk.experimental.session.background({ sessionID: state.sessionID }).catch(() => {})
     },
     onSubagentSelect: (sessionID) => {
       state.selectSubagent?.(sessionID)
@@ -670,9 +663,13 @@ async function runInteractiveRuntime(input: RunRuntimeInput, deps: RunRuntimeDep
             return
           }
 
-          const text =
-            (await state.stream?.then((item) => item.mod).catch(() => undefined))?.formatUnknownError(error) ??
-            (error instanceof Error ? error.message : String(error))
+          const mod = await state.stream?.then((item) => item.mod).catch(() => undefined)
+          // The server already showed this failure as a session error row.
+          if (mod && error instanceof mod.ShownTurnError) {
+            return
+          }
+
+          const text = mod?.formatUnknownError(error) ?? (error instanceof Error ? error.message : String(error))
           const commit = {
             kind: "error",
             text,
@@ -744,7 +741,6 @@ export async function runInteractiveLocalMode(input: RunLocalInput): Promise<voi
     files: input.files,
     initialInput: input.initialInput,
     thinking: input.thinking,
-    backgroundSubagents: input.backgroundSubagents,
     replay: input.replay,
     replayLimit: input.replayLimit,
     demo: input.demo,
@@ -793,7 +789,6 @@ export async function runInteractiveMode(
       files: input.files,
       initialInput: input.initialInput,
       thinking: input.thinking,
-      backgroundSubagents: input.backgroundSubagents,
       replay: input.replay,
       replayLimit: input.replayLimit,
       demo: input.demo,

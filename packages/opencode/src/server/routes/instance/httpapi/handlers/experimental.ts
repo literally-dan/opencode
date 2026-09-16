@@ -1,9 +1,7 @@
 import { Account } from "@/account/account"
 import { Agent } from "@/agent/agent"
-import { BackgroundJob } from "@/background/job"
 import { Config } from "@/config/config"
 import { InstanceState } from "@/effect/instance-state"
-import { RuntimeFlags } from "@/effect/runtime-flags"
 import { MCP } from "@/mcp"
 import { Project } from "@/project/project"
 import { Session } from "@/session/session"
@@ -33,11 +31,9 @@ export const experimentalHandlers = HttpApiBuilder.group(InstanceHttpApi, "exper
     const registry = yield* ToolRegistry.Service
     const worktreeSvc = yield* Worktree.Service
     const sessions = yield* Session.Service
-    const background = yield* BackgroundJob.Service
-    const flags = yield* RuntimeFlags.Service
 
     const capabilities = Effect.fn("ExperimentalHttpApi.capabilities")(function* () {
-      return { backgroundSubagents: flags.experimentalBackgroundSubagents }
+      return { backgroundSubagents: true }
     })
 
     const getConsole = Effect.fn("ExperimentalHttpApi.console")(function* () {
@@ -156,21 +152,6 @@ export const experimentalHandlers = HttpApiBuilder.group(InstanceHttpApi, "exper
       })
     })
 
-    const sessionBackground = Effect.fn("ExperimentalHttpApi.sessionBackground")(function* (ctx: {
-      params: { sessionID: SessionID }
-    }) {
-      if (!flags.experimentalBackgroundSubagents) return false
-      const jobs = (yield* background.list()).filter(
-        (job) =>
-          job.type === "task" &&
-          job.status === "running" &&
-          job.metadata?.parentSessionId === ctx.params.sessionID &&
-          job.metadata.background !== true,
-      )
-      const promoted = yield* Effect.forEach(jobs, (job) => background.promote(job.id), { concurrency: "unbounded" })
-      return promoted.some((job) => job !== undefined)
-    })
-
     const resource = Effect.fn("ExperimentalHttpApi.resource")(function* () {
       return yield* mcp.resources()
     })
@@ -187,7 +168,6 @@ export const experimentalHandlers = HttpApiBuilder.group(InstanceHttpApi, "exper
       .handle("worktreeRemove", worktreeRemove)
       .handle("worktreeReset", worktreeReset)
       .handle("session", session)
-      .handle("sessionBackground", sessionBackground)
       .handle("resource", resource)
   }),
 )

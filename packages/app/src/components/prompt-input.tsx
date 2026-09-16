@@ -80,6 +80,7 @@ import { PromptDragOverlay } from "./prompt-input/drag-overlay"
 import { promptPlaceholder } from "./prompt-input/placeholder"
 import { createPromptInputTransientState } from "./prompt-input/transient-state"
 import { showToast } from "@/utils/toast"
+import { turnRunning } from "@/utils/session-message"
 import { ImagePreview } from "@opencode-ai/ui/image-preview"
 import type { ReferenceInfo } from "@opencode-ai/sdk/v2/client"
 
@@ -253,6 +254,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
   })
   const info = createMemo(() => (props.controls.session.id ? sync().session.get(props.controls.session.id) : undefined))
   const working = createMemo(() => sync().data.session_working(props.controls.session.id ?? ""))
+  const running = createMemo(() => working() && turnRunning(sync().data.message[props.controls.session.id ?? ""]))
   const imageAttachments = createMemo(() =>
     prompt.current().filter((part): part is ImageAttachmentPart => part.type === "image"),
   )
@@ -1280,8 +1282,9 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
         return
       }
 
-      if (working()) {
-        void abort()
+      // Keyboard interrupts stop only the running turn. Background tasks keep running.
+      if (running()) {
+        void abort("turn")
         event.preventDefault()
         event.stopPropagation()
         return
@@ -1349,8 +1352,8 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
         event.preventDefault()
         return
       }
-      if (working()) {
-        void abort()
+      if (running()) {
+        void abort("turn")
         event.preventDefault()
       }
       return

@@ -6,7 +6,8 @@ import type { FollowupDraft } from "./submit"
 export type PromptInputState = ReturnType<typeof usePrompt>
 
 export type PromptInputSubmission = {
-  abort: () => Promise<void> | void
+  /** `turn` stops only the running turn. Without it, background tasks are also cancelled. */
+  abort: (scope?: "turn") => Promise<void> | void
   handleSubmit: (event: Event) => Promise<void> | void
 }
 

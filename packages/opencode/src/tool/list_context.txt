@@ -1,0 +1,12 @@
+List the parts currently in your context window with their `prt_…` ids, sizes, and a short preview, so you can decide what to compact or re-read. Inventory companion to `compact_results` and `read_part` (a live part's id is not otherwise shown to you).
+
+OUTPUT: one line per part, largest first — `prt_…` id, turn, role, kind (or `tool:<name>`), char count, status, and a preview. Status is `compactable`, `already compacted`, or `keep (<reason>)` (user messages, current turn, pending tools, structural/empty text).
+
+Use before a `compact_results` pass to target the heavy, settled parts, to find the id of something you remember, or to check what's still costing context.
+
+PARAMETERS
+- compactable_only: only list parts you can compact now (default false).
+- min_chars: only parts at least this large (default 0).
+- limit: 1-200 rows, largest first (default 80).
+
+Read-only. To act, pass ids to `compact_results` (or use its `select` filters).

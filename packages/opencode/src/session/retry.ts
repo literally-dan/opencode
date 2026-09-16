@@ -29,6 +29,10 @@ export const RETRY_JITTER_FACTOR = 0.25
 export const RETRY_MAX_DELAY_NO_HEADERS = 30_000 // 30 seconds
 export const RETRY_MAX_DELAY = 2_147_483_647 // max 32-bit signed integer for setTimeout
 export const RETRY_MAX_RETRIES = 5
+// A header or chunk timeout has already waited the whole provider timeout
+// (5 minutes by default) before it fails. Retrying it as often as a fast
+// transport error would hide a stalled endpoint for about half an hour.
+export const RETRY_MAX_TIMEOUT_RETRIES = 2
 
 const RETRYABLE_MESSAGE_PATTERNS = [
   /429|500|502|503|504|524/i,
@@ -39,6 +43,12 @@ const RETRYABLE_MESSAGE_PATTERNS = [
   /try your request again|retry your request|resource exhausted|resource_exhausted/i,
   /\btry again (?:later|in\b)|\b(?:currently|temporarily) at capacity\b/i,
 ]
+
+// A safety classifier reports its verdict in the response body, and the patterns
+// above are substring matches — a rejection body that merely contains "500" or
+// "terminated" would otherwise be retried until the attempts run out.
+const CONTENT_POLICY_PATTERN =
+  /content[-_\s]?polic|content[-_\s]?filter|prohibited[-_\s]?content|safety[-_\s]?(?:filter|polic|classifier|setting)|blocked by (?:the )?(?:content|safety|provider)|guardrail/i
 
 function cap(ms: number) {
   return Math.min(ms, RETRY_MAX_DELAY)
@@ -85,8 +95,15 @@ function exponential(attempt: number, random: number) {
 export function retryable(error: Err, provider: string) {
   // context overflow errors should not be retried
   if (SessionV1.ContextOverflowError.isInstance(error)) return undefined
+  // A classifier rejection is a verdict on the request, not a transport fault.
+  // Every retry re-sends the same prompt for the same verdict.
+  if (SessionV1.ContentFilterError.isInstance(error)) return undefined
+  const contentPolicy =
+    isRecord(error.data) && (matchesContentPolicy(error.data.message) || matchesContentPolicy(error.data.responseBody))
   if (SessionV1.APIError.isInstance(error)) {
+    if (MessageV2.isPermanentTransportCode(error.data.metadata?.code)) return undefined
     const status = error.data.statusCode
+    if ((status === undefined || status < 500) && contentPolicy) return undefined
     // 5xx errors are transient server failures and should always be retried,
     // even when the provider SDK doesn't explicitly mark them as retryable.
     if (
@@ -144,6 +161,7 @@ export function retryable(error: Err, provider: string) {
     }
     return { message: error.data.message.includes("Overloaded") ? "Provider is overloaded" : error.data.message }
   }
+  if (contentPolicy) return undefined
 
   const message = isRecord(error.data) ? error.data.message : undefined
   if (typeof message !== "string") return undefined
@@ -156,6 +174,10 @@ export function retryable(error: Err, provider: string) {
 
 function matchesRetryableMessage(value: unknown) {
   return typeof value === "string" && RETRYABLE_MESSAGE_PATTERNS.some((pattern) => pattern.test(value))
+}
+
+function matchesContentPolicy(value: unknown) {
+  return typeof value === "string" && CONTENT_POLICY_PATTERN.test(value)
 }
 
 function str(value: unknown) {
@@ -186,22 +208,32 @@ export function policy(opts: {
   set: (input: { attempt: number; message: string; action?: Retryable["action"]; next: number }) => Effect.Effect<void>
 }) {
   return Schedule.fromStepWithMetadata(
-    Effect.succeed((meta: Schedule.InputMetadata<unknown>) => {
-      const error = opts.parse(meta.input)
-      const retry = retryable(error, opts.provider)
-      if (!retry) return Cause.done(meta.attempt)
-      if (meta.attempt > RETRY_MAX_RETRIES) return Cause.done(meta.attempt)
-      return Effect.gen(function* () {
-        const wait = delay(meta.attempt, SessionV1.APIError.isInstance(error) ? error : undefined)
-        const now = yield* Clock.currentTimeMillis
-        yield* opts.set({
-          attempt: meta.attempt,
-          message: retry.message,
-          action: retry.action,
-          next: now + wait,
+    Effect.sync(() => {
+      const timeouts = { count: 0 }
+      return (meta: Schedule.InputMetadata<unknown>) => {
+        const error = opts.parse(meta.input)
+        const retry = retryable(error, opts.provider)
+        if (!retry) return Cause.done(meta.attempt)
+        if (meta.attempt > RETRY_MAX_RETRIES) return Cause.done(meta.attempt)
+        if (
+          SessionV1.APIError.isInstance(error) &&
+          (error.data.metadata?.code === "ProviderHeaderTimeoutError" || error.data.metadata?.timeout === "true")
+        ) {
+          timeouts.count++
+          if (timeouts.count > RETRY_MAX_TIMEOUT_RETRIES) return Cause.done(meta.attempt)
+        }
+        return Effect.gen(function* () {
+          const wait = delay(meta.attempt, SessionV1.APIError.isInstance(error) ? error : undefined)
+          const now = yield* Clock.currentTimeMillis
+          yield* opts.set({
+            attempt: meta.attempt,
+            message: retry.message,
+            action: retry.action,
+            next: now + wait,
+          })
+          return [meta.attempt, Duration.millis(wait)] as [number, Duration.Duration]
         })
-        return [meta.attempt, Duration.millis(wait)] as [number, Duration.Duration]
-      })
+      }
     }),
   )
 }

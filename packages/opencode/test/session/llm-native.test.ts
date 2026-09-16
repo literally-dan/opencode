@@ -332,6 +332,26 @@ describe("session.llm-native.request", () => {
     ])
   })
 
+  test("marks native messages at and after the exclusive cache prefix limit", () => {
+    const request = LLMNative.request({
+      model: baseModel,
+      messages: [
+        { role: "system", content: "System" },
+        { role: "user", content: "Stable user" },
+        { role: "assistant", content: "Full context receipt" },
+        { role: "user", content: "Pressure reminder" },
+      ],
+      cachePrefixLimit: 2,
+    })
+
+    expect(request.messages.map((message) => message.cacheable)).toEqual([undefined, false, false])
+    expect(request.messages.map((message) => message.content[0])).toMatchObject([
+      { type: "text", text: "Stable user" },
+      { type: "text", text: "Full context receipt" },
+      { type: "text", text: "Pressure reminder" },
+    ])
+  })
+
   test("selects native request routes for provider packages", () => {
     const openai = LLMNative.model({
       model: { ...baseModel, api: { ...baseModel.api, url: "", npm: "@ai-sdk/openai" } },
@@ -540,7 +560,7 @@ describe("session.llm-native.request", () => {
     }),
   )
 
-  it.effect("emits native tool calls before overlapping local settlements complete", () =>
+  it.live("holds native step and finish events until overlapping local settlements complete", () =>
     Effect.gen(function* () {
       const observed: string[] = []
       const started: string[] = []
@@ -568,6 +588,7 @@ describe("session.llm-native.request", () => {
           Stream.fromIterable([
             LLMEvent.toolCall({ id: "call-1", name: "lookup", input: {} }),
             LLMEvent.toolCall({ id: "call-2", name: "lookup", input: {} }),
+            LLMEvent.stepFinish({ index: 0, reason: "tool-calls" }),
             LLMEvent.finish({ reason: "tool-calls" }),
           ]),
         generate: () => Effect.die("unused"),
@@ -590,13 +611,62 @@ describe("session.llm-native.request", () => {
         Effect.forkScoped,
       )
       yield* Effect.promise(() => bothStarted)
+      yield* Effect.sleep("50 millis")
 
+      // A consumer may stop at a step boundary, so the step cannot finish while
+      // its local tools are still running.
       expect(started).toEqual(["call-1", "call-2"])
-      expect(observed).toEqual(["tool-call", "tool-call", "finish"])
+      expect(observed).toEqual(["tool-call", "tool-call"])
 
       release?.()
       yield* Fiber.join(fiber)
-      expect(observed).toEqual(["tool-call", "tool-call", "finish", "tool-result", "tool-result"])
+      expect(observed).toEqual(["tool-call", "tool-call", "tool-result", "tool-result", "step-finish", "finish"])
+    }),
+  )
+
+  it.effect("passes provider-executed tool events through without local dispatch", () =>
+    Effect.gen(function* () {
+      const executed: string[] = []
+      const events = [
+        LLMEvent.toolCall({ id: "search-1", name: "web_search", input: {}, providerExecuted: true }),
+        LLMEvent.toolResult({
+          id: "search-1",
+          name: "web_search",
+          result: { type: "json", value: {} },
+          providerExecuted: true,
+        }),
+        LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+        LLMEvent.finish({ reason: "stop" }),
+      ]
+      const native = LLMNativeRuntime.stream({
+        model: baseModel,
+        provider: providerInfo,
+        auth: undefined,
+        llmClient: {
+          prepare: () => Effect.die("unused"),
+          stream: () => Stream.fromIterable(events),
+          generate: () => Effect.die("unused"),
+        } as LLMClientShape,
+        messages: [],
+        tools: {
+          web_search: {
+            description: "Local tool with a provider tool name",
+            inputSchema: jsonSchema({ type: "object" }),
+            execute: async (_args: unknown, options: { toolCallId: string }) => {
+              executed.push(options.toolCallId)
+              return { output: "local" }
+            },
+          } satisfies Tool,
+        },
+        headers: {},
+        abort: new AbortController().signal,
+      })
+      if (native.type === "unsupported") throw new Error(native.reason)
+
+      const observed = Array.from(yield* Stream.runCollect(native.stream))
+
+      expect(observed.map((event) => event.type)).toEqual(["tool-call", "tool-result", "step-finish", "finish"])
+      expect(executed).toEqual([])
     }),
   )
 

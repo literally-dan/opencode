@@ -2,13 +2,23 @@ import { describe, expect, test } from "bun:test"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { APICallError } from "ai"
 import { MessageV2 } from "../../src/session/message-v2"
+import { SessionRetry } from "../../src/session/retry"
 import { ProviderTransform } from "@/provider/transform"
+import { ProviderError } from "@/provider/error"
 import type { Provider } from "@/provider/provider"
 
 import { SessionID, MessageID, PartID } from "../../src/session/schema"
 import { Question } from "../../src/question"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
+import {
+  compactionOf,
+  contextManagementReceiptKind,
+  contextManagementReceiptSummary,
+  eligibility,
+  isCollapsedContextManagementReceipt,
+  isFullContextManagementReceipt,
+} from "../../src/session/compaction-pruning"
 
 const sessionID = SessionID.make("session")
 const providerID = ProviderV2.ID.make("test")
@@ -244,6 +254,58 @@ describe("session.message-v2.toModelMessage", () => {
         content: [{ type: "text", text: "assistant" }],
       },
     ])
+  })
+
+  test("experiment: stampUser stamps only user messages with a stable per-message ts + 4 bytes", async () => {
+    const userID = "m-user"
+    const input: SessionV1.WithParts[] = [
+      {
+        info: userInfo(userID),
+        parts: [{ ...basePart(userID, "p1"), type: "text", text: "hello" }] as SessionV1.Part[],
+      },
+      {
+        info: assistantInfo("m-assistant", userID),
+        parts: [{ ...basePart("m-assistant", "a1"), type: "text", text: "assistant" }] as SessionV1.Part[],
+      },
+    ]
+
+    // default (no stampUser) leaves everything untouched
+    expect(await MessageV2.toModelMessages(input, model)).toStrictEqual([
+      { role: "user", content: [{ type: "text", text: "hello" }] },
+      { role: "assistant", content: [{ type: "text", text: "assistant" }] },
+    ])
+
+    const stamped = await MessageV2.toModelMessages(input, model, { stampUser: true })
+    // assistant message is untouched
+    expect(stamped[1]).toStrictEqual({ role: "assistant", content: [{ type: "text", text: "assistant" }] })
+    // user message gains exactly one trailing JSON stamp text part
+    const userContent = stamped[0].content as Array<{ type: string; text?: string }>
+    expect(userContent[0]).toStrictEqual({ type: "text", text: "hello" })
+    expect(userContent.length).toBe(2)
+    expect(userContent[1].type).toBe("text")
+    expect(userContent[1].text!).toMatch(/^<message-metadata>\{"ts":0,"rand":"[0-9a-f]{8}"\}<\/message-metadata>$/)
+
+    // Stability is load-bearing: a stamp that changed per request would rewrite
+    // the tail of every historical user message and break prompt caching.
+    const again = await MessageV2.toModelMessages(input, model, { stampUser: true })
+    expect((again[0].content as Array<{ text?: string }>)[1].text).toBe(userContent[1].text)
+
+    // ts carries the message's own creation time, not the time of the request,
+    // which is what makes it usable for reasoning about gaps between turns.
+    const later: SessionV1.WithParts[] = [
+      {
+        info: { ...userInfo("m-user-later"), time: { created: 1_700_000_000_000 } },
+        parts: [{ ...basePart("m-user-later", "p1"), type: "text", text: "hello" }],
+      },
+    ]
+    const laterStamp = (
+      (await MessageV2.toModelMessages(later, model, { stampUser: true }))[0].content as Array<{
+        text?: string
+      }>
+    )[1].text!
+    expect(laterStamp).toContain('"ts":1700000000000')
+    // Distinct per message, so repeated identical prompts do not read as one input.
+    expect(laterStamp).not.toBe(userContent[1].text)
   })
 
   test("converts user text/file parts and injects compaction/subtask prompts", async () => {
@@ -684,7 +746,7 @@ describe("session.message-v2.toModelMessage", () => {
     ])
   })
 
-  test("replaces compacted tool output with placeholder", async () => {
+  test("replaces compacted tool output with a marker plus a covering note", async () => {
     const userID = "m-user"
     const assistantID = "m-assistant"
 
@@ -713,7 +775,7 @@ describe("session.message-v2.toModelMessage", () => {
               output: "this should be cleared",
               title: "Bash",
               metadata: {},
-              time: { start: 0, end: 1, compacted: 1 },
+              time: { start: 0, end: 1, compacted: 0 },
             },
           },
         ] as SessionV1.Part[],
@@ -744,11 +806,996 @@ describe("session.message-v2.toModelMessage", () => {
             type: "tool-result",
             toolCallId: "call-1",
             toolName: "bash",
-            output: { type: "text", value: "[Old tool result content cleared]" },
+            output: {
+              type: "text",
+              value: [
+                '<compacted prt="prt_a1"/>',
+                '<compaction-summary parts="prt_a1">',
+                "Older tool output, pruned automatically to reclaim context. Use read_part to recover it verbatim.",
+                "</compaction-summary>",
+              ].join("\n"),
+            },
           },
         ],
       },
     ])
+  })
+
+  test("projects collapsed context-management receipts from structured metadata", async () => {
+    const assistantID = MessageID.ascending()
+    const cases = [
+      {
+        tool: "list_context" as const,
+        metadata: { total: 12, compactable: 7, charsCompactable: 34_567 },
+        details: "total parts=12; compactable parts=7; estimated reclaimable characters=34567",
+      },
+      {
+        tool: "compact_results" as const,
+        metadata: { compacted: 4, skipped: 2, charsFreed: 12_345 },
+        details: "compacted parts=4; skipped parts=2; net characters freed=12345",
+      },
+      {
+        tool: "compact_bulk" as const,
+        metadata: { compacted: 9, skipped: 3, charsFreed: 98_765, summarizerCalls: 2 },
+        details: "compacted parts=9; skipped parts=3; net characters freed=98765; summarizer calls=2",
+      },
+    ]
+
+    for (const item of cases) {
+      const state: SessionV1.ToolStateCompleted = {
+        status: "completed",
+        input: { keep: "original input" },
+        output: `FULL_${item.tool}_OUTPUT`,
+        title: item.tool,
+        metadata: item.metadata,
+        time: { start: 0, end: 1, compacted: 2 },
+      }
+      const part = {
+        id: PartID.ascending(),
+        sessionID,
+        messageID: assistantID,
+        type: "tool",
+        tool: item.tool,
+        callID: `call-${item.tool}`,
+        state,
+      } satisfies SessionV1.ToolPart
+      const expected = `Context-management receipt ${part.id} (${item.tool}): ${item.details}. Use read_part with part_id="${part.id}" to recover the original full result.`
+      const input = [{ info: assistantInfo(assistantID, "m-user"), parts: [part] }]
+      const first = await MessageV2.toModelMessages(input, model)
+      const second = await MessageV2.toModelMessages(input, model)
+      const serialized = JSON.stringify(first)
+
+      expect(contextManagementReceiptSummary(part)).toBe(expected)
+      expect(first).toStrictEqual(second)
+      expect(serialized).toContain(item.details)
+      expect(serialized).toContain(part.id)
+      expect(serialized).toContain("read_part")
+      expect(serialized).toContain("original input")
+      expect(serialized).toContain(`call-${item.tool}`)
+      expect(serialized).not.toContain(`FULL_${item.tool}_OUTPUT`)
+      expect(state.output).toBe(`FULL_${item.tool}_OUTPUT`)
+    }
+  })
+
+  test("classifies receipts for automatic collapse without suppressing overflow handling", () => {
+    const state: SessionV1.ToolStateCompleted = {
+      status: "completed",
+      input: {},
+      output: "full inventory",
+      title: "inventory",
+      metadata: { total: 1, compactable: 0, charsCompactable: 0 },
+      time: { start: 0, end: 1, compacted: undefined },
+    }
+    const part = {
+      id: PartID.ascending(),
+      sessionID,
+      messageID: MessageID.ascending(),
+      type: "tool",
+      tool: "list_context",
+      callID: "call-list-context",
+      state,
+    } satisfies SessionV1.ToolPart
+
+    expect(contextManagementReceiptKind(part)).toBe("list_context")
+    expect(isFullContextManagementReceipt(part)).toBe(true)
+    expect(
+      eligibility(part, { role: "assistant", current: false, live: false }),
+    ).toStrictEqual({
+      ok: false,
+      reason: "is a context-management receipt that collapses automatically after one request",
+    })
+    state.time.compacted = 2
+    expect(isFullContextManagementReceipt(part)).toBe(false)
+    expect(isCollapsedContextManagementReceipt(part)).toBe(true)
+    expect(compactionOf(part)?.native).toBeUndefined()
+    const manuallyCompacted = [part].some((candidate) => compactionOf(candidate)?.native === false)
+    expect(manuallyCompacted).toBe(false)
+
+    const native = structuredClone(part)
+    native.tool = "bash"
+    expect(compactionOf(native)?.native).toBe(true)
+
+    const manual = structuredClone(native)
+    delete manual.state.time.compacted
+    manual.state.compactionGroup = "manual-group"
+    manual.state.compactionSummary = "manual summary"
+    expect(compactionOf(manual)?.native).toBe(false)
+  })
+
+  test("keeps a model-authored summary on a manually compacted context receipt", async () => {
+    const assistantID = MessageID.ascending()
+    const part: SessionV1.ToolPart = {
+      id: PartID.ascending(),
+      sessionID,
+      messageID: assistantID,
+      type: "tool",
+      tool: "compact_results",
+      callID: "call-manual-receipt",
+      state: {
+        status: "completed",
+        input: {},
+        output: "full manual receipt",
+        title: "manual receipt",
+        metadata: { compacted: 1, skipped: 0, charsFreed: 100 },
+        time: { start: 0, end: 1 },
+        compactionGroup: "manual-receipt-group",
+        compactionSummary: "model-authored receipt summary",
+        compactionGeneration: 1,
+      },
+    }
+
+    const serialized = JSON.stringify(
+      await MessageV2.toModelMessages([{ info: assistantInfo(assistantID, "m-user"), parts: [part] }], model),
+    )
+    expect(serialized).toContain("model-authored receipt summary")
+    expect(serialized).not.toContain("Context-management receipt")
+    expect(serialized).not.toContain("full manual receipt")
+  })
+
+  test("replaces compacted assistant text with a covering summary block", async () => {
+    const userID = "m-user"
+    const assistantID = "m-assistant"
+
+    const input: SessionV1.WithParts[] = [
+      {
+        info: userInfo(userID),
+        parts: [{ ...basePart(userID, "u1"), type: "text", text: "hi" }] as SessionV1.Part[],
+      },
+      {
+        info: assistantInfo(assistantID, userID),
+        parts: [
+          {
+            ...basePart(assistantID, "a1"),
+            type: "text",
+            text: "a long stale note the model already acted on",
+            compacted: 0,
+            compactionSummary: "did X",
+          },
+          { ...basePart(assistantID, "a2"), type: "text", text: "current answer" },
+        ] as SessionV1.Part[],
+      },
+    ]
+
+    const serialized = JSON.stringify(await MessageV2.toModelMessages(input, model))
+    // Assistant text has no structural footprint, so the part disappears and is
+    // named in the covering summary instead of leaving a marker of its own.
+    expect(serialized).toContain('parts=\\"prt_a1\\"')
+    expect(serialized).toContain("did X")
+    expect(serialized).not.toContain("a long stale note the model already acted on")
+    expect(serialized).toContain("current answer")
+  })
+
+  test("renders one summary for a group that spans messages", async () => {
+    const group = "shared-group"
+    const firstID = "m-assistant-first"
+    const laterID = "m-assistant-later"
+    const input: SessionV1.WithParts[] = [
+      {
+        info: assistantInfo(firstID, "m-user"),
+        parts: [
+          {
+            ...basePart(firstID, "first"),
+            type: "text",
+            text: "first stale note",
+            compacted: 1,
+            compactionGroup: group,
+            compactionSummary: "shared useful summary",
+          },
+        ] as SessionV1.Part[],
+      },
+      {
+        info: assistantInfo(laterID, "m-user"),
+        parts: [
+          {
+            ...basePart(laterID, "later"),
+            type: "text",
+            text: "later stale note",
+            compacted: 1,
+            compactionGroup: group,
+            compactionSummary: "shared useful summary",
+          },
+        ] as SessionV1.Part[],
+      },
+    ]
+
+    // The latest occurrence carries the group's note, so prefix slicing keeps
+    // the summary whenever any part of the group remains in context.
+    const full = JSON.stringify(await MessageV2.toModelMessages(input, model))
+    const sliced = JSON.stringify(await MessageV2.toModelMessages(input.slice(1), model))
+    expect(full.split("shared useful summary")).toHaveLength(2)
+    expect(full).toContain('parts=\\"prt_first prt_later\\"')
+    expect(sliced.split("shared useful summary")).toHaveLength(2)
+    expect(sliced).not.toContain('parts=\\"prt_first\\"')
+  })
+
+  test("partitions cross-role groups and preserves non-carrier turns", async () => {
+    const group = "cross-role"
+    const compacted = {
+      compacted: 1,
+      compactionGroup: group,
+      compactionSummary: "shared cross-role summary",
+    }
+    const input: SessionV1.WithParts[] = [
+      {
+        info: userInfo("u1"),
+        parts: [{ ...basePart("u1", "u1"), type: "text", text: "old user request", ...compacted }] as SessionV1.Part[],
+      },
+      {
+        info: assistantInfo("a1", "msg_u1"),
+        parts: [
+          { ...basePart("a1", "a1"), type: "text", text: "old assistant answer", ...compacted },
+        ] as SessionV1.Part[],
+      },
+      {
+        info: userInfo("u2"),
+        parts: [
+          { ...basePart("u2", "u2"), type: "text", text: "later user request", ...compacted },
+        ] as SessionV1.Part[],
+      },
+      {
+        info: assistantInfo("a2", "msg_u2"),
+        parts: [
+          { ...basePart("a2", "a2"), type: "text", text: "later assistant answer", ...compacted },
+        ] as SessionV1.Part[],
+      },
+    ]
+
+    const result = await MessageV2.toModelMessages(input, model)
+    const full = JSON.stringify(result)
+    const prefix = JSON.stringify(await MessageV2.toModelMessages(input.slice(0, 2), model))
+    const suffix = JSON.stringify(await MessageV2.toModelMessages(input.slice(2), model))
+    const middle = JSON.stringify(await MessageV2.toModelMessages(input.slice(1, 3), model))
+
+    expect(result.map((message) => message.role)).toEqual(["user", "assistant", "user", "assistant"])
+    expect(full.split("shared cross-role summary")).toHaveLength(3)
+    expect(full).toContain('<compaction-ref group=\\"cross-role\\" channel=\\"user\\" parts=\\"prt_u1\\">')
+    expect(full).toContain('<compaction-ref group=\\"cross-role\\" channel=\\"assistant\\" parts=\\"prt_a1\\">')
+    expect(full).toContain('channel=\\"user\\" parts=\\"prt_u1 prt_u2\\"')
+    expect(full).toContain('channel=\\"assistant\\" parts=\\"prt_a1 prt_a2\\"')
+    for (const slice of [prefix, suffix, middle]) expect(slice.split("shared cross-role summary")).toHaveLength(3)
+  })
+
+  test("chooses a group carrier from messages that reach the provider", async () => {
+    const group = "shared-group"
+    const aborted = new SessionV1.AbortedError({ message: "aborted" }).toObject() as SessionV1.Assistant["error"]
+    const input: SessionV1.WithParts[] = [
+      {
+        info: assistantInfo("a1", "u1"),
+        parts: [
+          {
+            ...basePart("a1", "first"),
+            type: "reasoning",
+            text: "old reasoning",
+            compacted: 0,
+            compactionGroup: group,
+            compactionGeneration: 1,
+            compactionSummary: "surviving summary",
+          },
+        ] as SessionV1.Part[],
+      },
+      {
+        info: assistantInfo("a2", "u1", aborted),
+        parts: [
+          {
+            ...basePart("a2", "skipped"),
+            type: "reasoning",
+            text: "aborted reasoning",
+            compacted: 0,
+            compactionGroup: group,
+            compactionGeneration: 1,
+            compactionSummary: "surviving summary",
+          },
+        ] as SessionV1.Part[],
+      },
+    ]
+
+    const serialized = JSON.stringify(await MessageV2.toModelMessages(input, model))
+    expect(serialized.split("surviving summary")).toHaveLength(2)
+    expect(serialized).toContain("prt_first")
+    expect(serialized).not.toContain("prt_skipped")
+  })
+
+  test("uses the first nonblank group summary and never promises a missing one", async () => {
+    const summarized: SessionV1.WithParts[] = [
+      {
+        info: assistantInfo("a1", "u1"),
+        parts: [
+          {
+            ...basePart("a1", "blank"),
+            type: "text",
+            text: "old blank entry",
+            compacted: 0,
+            compactionGroup: "malformed-summary",
+            compactionSummary: "   ",
+          },
+        ] as SessionV1.Part[],
+      },
+      {
+        info: assistantInfo("a2", "u1"),
+        parts: [
+          {
+            ...basePart("a2", "valid"),
+            type: "text",
+            text: "old valid entry",
+            compacted: 0,
+            compactionGroup: "malformed-summary",
+            compactionSummary: "usable later summary",
+          },
+        ] as SessionV1.Part[],
+      },
+    ]
+    const missing = summarized.map((message) => ({
+      ...message,
+      parts: message.parts.map((part) => ({ ...part, compactionGroup: "missing-summary", compactionSummary: "" })),
+    })) as SessionV1.WithParts[]
+
+    const valid = JSON.stringify(await MessageV2.toModelMessages(summarized, model))
+    const absent = JSON.stringify(await MessageV2.toModelMessages(missing, model))
+    expect(valid.split("usable later summary")).toHaveLength(2)
+    expect(valid).not.toContain("No summary was recorded")
+    expect(absent).not.toContain("The full summary is carried")
+    expect(absent).toContain("No summary was recorded")
+  })
+
+  test("drops compacted reasoning and emits a text breadcrumb (no reasoning block)", async () => {
+    const userID = "m-user"
+    const assistantID = "m-assistant"
+
+    const input: SessionV1.WithParts[] = [
+      {
+        info: userInfo(userID),
+        parts: [{ ...basePart(userID, "u1"), type: "text", text: "hi" }] as SessionV1.Part[],
+      },
+      {
+        info: assistantInfo(assistantID, userID),
+        parts: [
+          {
+            ...basePart(assistantID, "r1"),
+            type: "reasoning",
+            text: "a very long finished chain of thought",
+            time: { start: 0, end: 1 },
+            compacted: 0,
+          },
+          { ...basePart(assistantID, "a2"), type: "text", text: "final answer" },
+        ] as SessionV1.Part[],
+      },
+    ]
+
+    const result = await MessageV2.toModelMessages(input, model)
+    const serialized = JSON.stringify(result)
+    expect(serialized).toContain('parts=\\"prt_r1\\"')
+    expect(serialized).not.toContain("a very long finished chain of thought")
+    // The compacted reasoning must NOT be replayed as a reasoning block.
+    const assistant = result.find((m) => m.role === "assistant")
+    const hasReasoning =
+      Array.isArray(assistant?.content) && assistant.content.some((p: { type: string }) => p.type === "reasoning")
+    expect(hasReasoning).toBe(false)
+  })
+
+  test("partitions a mixed run while preserving schema-valid tool inputs", async () => {
+    const userID = "m-user"
+    const assistantID = "m-assistant"
+    const group = "g-mixed"
+
+    const input: SessionV1.WithParts[] = [
+      {
+        info: userInfo(userID),
+        parts: [{ ...basePart(userID, "u1"), type: "text", text: "hi" }] as SessionV1.Part[],
+      },
+      {
+        info: assistantInfo(assistantID, userID),
+        parts: [
+          {
+            ...basePart(assistantID, "r1"),
+            type: "reasoning",
+            text: "stale thinking",
+            time: { start: 0, end: 1 },
+            compacted: 0,
+            compactionGroup: group,
+            compactionSummary: "one note for the whole run",
+          },
+          {
+            ...basePart(assistantID, "t1"),
+            type: "tool",
+            tool: "grep",
+            callID: "c1",
+            metadata: {
+              openai: { itemId: "stale-provider-item" },
+              google: { thoughtSignature: "current-turn-signature" },
+            },
+            state: {
+              status: "completed",
+              input: { pattern: "historical query" },
+              output: "first big output",
+              title: "",
+              metadata: {},
+              time: { start: 0, end: 1 },
+              compactionGroup: group,
+              compactionSummary: "one note for the whole run",
+            },
+          },
+          {
+            ...basePart(assistantID, "t2"),
+            type: "tool",
+            tool: "read",
+            callID: "c2",
+            state: {
+              status: "completed",
+              input: { filePath: "/tmp/example.txt" },
+              output: "second big output",
+              title: "",
+              metadata: {},
+              time: { start: 0, end: 1 },
+              compactionGroup: group,
+              compactionSummary: "one note for the whole run",
+            },
+          },
+          { ...basePart(assistantID, "a1"), type: "text", text: "final answer" },
+        ] as SessionV1.Part[],
+      },
+    ]
+
+    const result = await MessageV2.toModelMessages(input, model)
+    const serialized = JSON.stringify(result)
+    expect(serialized).not.toContain("first big output")
+    expect(serialized).not.toContain("second big output")
+    expect(serialized).not.toContain("stale thinking")
+    expect(serialized).toContain("historical query")
+    expect(serialized).not.toContain("stale-provider-item")
+    // Gemini rejects a current-turn function call without its signature, and
+    // compaction must not turn a valid request into a 400.
+    expect(serialized).toContain("current-turn-signature")
+    // The shared stored summary appears once in each rendered channel.
+    expect(serialized.split("one note for the whole run")).toHaveLength(3)
+    // Both tool results survive as blocks so each tool_use stays paired, and
+    // the reasoning part is named in the note rather than leaving a marker.
+    expect(serialized).toContain('<compacted prt=\\"prt_t1\\" group=\\"g-mixed\\"/>')
+    expect(serialized).toContain('<compacted prt=\\"prt_t2\\" group=\\"g-mixed\\"/>')
+    expect(serialized).toContain('channel=\\"assistant\\" parts=\\"prt_r1\\"')
+    expect(serialized).toContain('channel=\\"tool\\" parts=\\"prt_t1 prt_t2\\"')
+    expect(result.map((message) => message.role)).toEqual(["user", "assistant", "tool"])
+    const assistant = result.find((m) => m.role === "assistant")
+    const texts = Array.isArray(assistant?.content)
+      ? assistant.content.flatMap((p) => (p.type === "text" ? [p.text] : []))
+      : []
+    expect(texts).toHaveLength(2)
+    expect(texts[0]).toContain('channel="assistant"')
+    expect(texts[1]).toBe("final answer")
+    const calls = Array.isArray(assistant?.content) ? assistant.content.filter((part) => part.type === "tool-call") : []
+    expect(calls.map((call) => call.input)).toEqual([{ pattern: "historical query" }, { filePath: "/tmp/example.txt" }])
+  })
+
+  test("recomputes assistant and tool carriers independently for history slices", async () => {
+    const group = "mixed-slices"
+    const mixed = (messageID: string, textID: string, toolID: string, callID: string): SessionV1.WithParts => ({
+      info: assistantInfo(messageID, "u1"),
+      parts: [
+        {
+          ...basePart(messageID, textID),
+          type: "text",
+          text: `assistant content ${textID}`,
+          compacted: 0,
+          compactionGroup: group,
+          compactionSummary: "mixed slice summary",
+        },
+        {
+          ...basePart(messageID, toolID),
+          type: "tool",
+          tool: "read",
+          callID,
+          state: {
+            status: "completed",
+            input: {},
+            output: `tool output ${toolID}`,
+            title: "",
+            metadata: {},
+            time: { start: 0, end: 1 },
+            compactionGroup: group,
+            compactionSummary: "mixed slice summary",
+          },
+        },
+      ] as SessionV1.Part[],
+    })
+    const input = [mixed("a1", "text1", "tool1", "c1"), mixed("a2", "text2", "tool2", "c2")]
+    const full = await MessageV2.toModelMessages(input, model)
+    const prefix = await MessageV2.toModelMessages(input.slice(0, 1), model)
+    const suffix = await MessageV2.toModelMessages(input.slice(1), model)
+    const assistantTexts = (messages: typeof full) =>
+      messages.flatMap((message) =>
+        message.role === "assistant" && Array.isArray(message.content)
+          ? message.content.flatMap((part) => (part.type === "text" ? [part.text] : []))
+          : [],
+      )
+    const toolTexts = (messages: typeof full) =>
+      messages.flatMap((message) =>
+        message.role === "tool"
+          ? message.content.flatMap((part) =>
+              part.type === "tool-result" && part.output.type === "text" ? [part.output.value] : [],
+            )
+          : [],
+      )
+
+    expect(full.map((message) => message.role)).toEqual(["assistant", "tool", "assistant", "tool"])
+    expect(
+      full.flatMap((message) =>
+        message.role === "assistant" && Array.isArray(message.content)
+          ? [message.content.filter((part) => part.type === "tool-call").length]
+          : [],
+      ),
+    ).toEqual([1, 1])
+    expect(full.flatMap((message) => (message.role === "tool" ? [message.content.length] : []))).toEqual([1, 1])
+    expect(assistantTexts(full)[0]).toContain(
+      '<compaction-ref group="mixed-slices" channel="assistant" parts="prt_text1">',
+    )
+    expect(assistantTexts(full)[1]).toContain(
+      '<compaction-summary group="mixed-slices" channel="assistant" parts="prt_text1 prt_text2">',
+    )
+    expect(toolTexts(full)[0]).toContain('<compaction-ref group="mixed-slices" channel="tool" parts="prt_tool1">')
+    expect(toolTexts(full)[1]).toContain(
+      '<compaction-summary group="mixed-slices" channel="tool" parts="prt_tool1 prt_tool2">',
+    )
+
+    for (const [slice, textID, toolID] of [
+      [prefix, "text1", "tool1"],
+      [suffix, "text2", "tool2"],
+    ] as const) {
+      expect(slice.map((message) => message.role)).toEqual(["assistant", "tool"])
+      expect(assistantTexts(slice)).toHaveLength(1)
+      expect(assistantTexts(slice)[0]).toContain(
+        `<compaction-summary group="mixed-slices" channel="assistant" parts="prt_${textID}">`,
+      )
+      expect(toolTexts(slice)).toHaveLength(1)
+      expect(toolTexts(slice)[0]).toContain(
+        `<compaction-summary group="mixed-slices" channel="tool" parts="prt_${toolID}">`,
+      )
+      expect(JSON.stringify(slice).split("mixed slice summary")).toHaveLength(3)
+    }
+  })
+
+  test("associates cross-message tool markers with their covering summary", async () => {
+    const group = "tool-group"
+    const tool = (messageID: string, id: string, callID: string): SessionV1.ToolPart => ({
+      ...basePart(messageID, id),
+      type: "tool",
+      tool: "read",
+      callID,
+      state: {
+        status: "completed",
+        input: {},
+        output: `large output ${id}`,
+        title: "",
+        metadata: {},
+        time: { start: 0, end: 1 },
+        compactionGroup: group,
+        compactionSummary: "tools summarized once",
+      },
+    })
+    const input: SessionV1.WithParts[] = [
+      { info: assistantInfo("a1", "u1"), parts: [tool("a1", "t1", "c1")] },
+      { info: assistantInfo("a2", "u1"), parts: [tool("a2", "t2", "c2")] },
+    ]
+
+    const serialized = JSON.stringify(await MessageV2.toModelMessages(input, model))
+    expect(serialized.split("tools summarized once")).toHaveLength(2)
+    expect(serialized).toContain('<compacted prt=\\"prt_t1\\" group=\\"tool-group\\"/>')
+    expect(serialized).toContain('<compacted prt=\\"prt_t2\\" group=\\"tool-group\\"/>')
+    expect(serialized).toContain('<compaction-ref group=\\"tool-group\\" channel=\\"tool\\" parts=\\"prt_t1\\">')
+    expect(serialized).toContain('parts=\\"prt_t1 prt_t2\\"')
+    expect(serialized.split('"type":"tool-call"')).toHaveLength(3)
+    expect(serialized.split('"type":"tool-result"')).toHaveLength(3)
+  })
+
+  test("preserves provider-executed context tool replay despite stale compaction markers", async () => {
+    const assistantID = "m-assistant"
+    const input: SessionV1.WithParts[] = [
+      {
+        info: assistantInfo(assistantID, "m-user"),
+        parts: [
+          {
+            ...basePart(assistantID, "provider-tool"),
+            type: "tool",
+            tool: "list_context",
+            callID: "provider-call",
+            metadata: { providerExecuted: true, openai: { itemId: "provider-item" } },
+            state: {
+              status: "completed",
+              input: { query: "original provider query" },
+              output: "original provider result",
+              title: "",
+              metadata: { total: 10, compactable: 5, charsCompactable: 2_000 },
+              time: { start: 0, end: 1, compacted: 1 },
+              compactionGroup: "stale-group",
+              compactionGeneration: 1,
+              compactionSummary: "must not replace provider state",
+            },
+          },
+        ] as SessionV1.Part[],
+      },
+    ]
+
+    const serialized = JSON.stringify(await MessageV2.toModelMessages(input, model))
+    expect(serialized).toContain("original provider query")
+    expect(serialized).toContain("original provider result")
+    expect(serialized).toContain("provider-item")
+    expect(serialized).not.toContain("must not replace provider state")
+    expect(serialized).not.toContain("<compacted")
+  })
+
+  test("emits mixed channel notes once with assistant text before the tool call", async () => {
+    const userID = "m-user"
+    const assistantID = "m-assistant"
+    const group = "g-tail"
+
+    const input: SessionV1.WithParts[] = [
+      {
+        info: userInfo(userID),
+        parts: [{ ...basePart(userID, "u1"), type: "text", text: "hi" }] as SessionV1.Part[],
+      },
+      {
+        info: assistantInfo(assistantID, userID),
+        parts: [
+          {
+            ...basePart(assistantID, "t1"),
+            type: "tool",
+            tool: "grep",
+            callID: "c1",
+            state: {
+              status: "completed",
+              input: {},
+              output: "big output",
+              title: "",
+              metadata: {},
+              time: { start: 0, end: 1 },
+              compactionGroup: group,
+              compactionSummary: "one note only",
+            },
+          },
+          {
+            ...basePart(assistantID, "a1"),
+            type: "text",
+            text: "stale commentary",
+            compacted: 0,
+            compactionGroup: group,
+            compactionSummary: "one note only",
+          },
+        ] as SessionV1.Part[],
+      },
+    ]
+
+    const result = await MessageV2.toModelMessages(input, model)
+    const serialized = JSON.stringify(result)
+    expect(serialized.split("one note only")).toHaveLength(3)
+    expect(result.map((message) => message.role)).toEqual(["user", "assistant", "tool"])
+    const assistant = result.find((m) => m.role === "assistant")
+    const kinds = Array.isArray(assistant?.content) ? assistant.content.map((part) => part.type) : []
+    expect(kinds).toEqual(["text", "tool-call"])
+    expect(serialized).toContain('channel=\\"assistant\\" parts=\\"prt_a1\\"')
+    expect(serialized).toContain('channel=\\"tool\\" parts=\\"prt_t1\\"')
+    expect(serialized).not.toContain("stale commentary")
+  })
+
+  test("holds a run's note until after surviving signed reasoning", async () => {
+    const userID = "m-user"
+    const assistantID = "m-assistant"
+
+    const input: SessionV1.WithParts[] = [
+      {
+        info: userInfo(userID),
+        parts: [{ ...basePart(userID, "u1"), type: "text", text: "hi" }] as SessionV1.Part[],
+      },
+      {
+        info: assistantInfo(assistantID, userID),
+        parts: [
+          {
+            ...basePart(assistantID, "r1"),
+            type: "reasoning",
+            text: "compacted thinking",
+            time: { start: 0, end: 1 },
+            compacted: 0,
+            compactionSummary: "folded away",
+          },
+          {
+            ...basePart(assistantID, "r2"),
+            type: "reasoning",
+            text: "live signed thinking",
+            time: { start: 0, end: 1 },
+            metadata: { anthropic: { signature: "sig" } },
+          },
+          { ...basePart(assistantID, "a1"), type: "text", text: "final answer" },
+        ] as SessionV1.Part[],
+      },
+    ]
+
+    const result = await MessageV2.toModelMessages(input, model)
+    const assistant = result.find((m) => m.role === "assistant")
+    const kinds = Array.isArray(assistant?.content) ? assistant.content.map((p: { type: string }) => p.type) : []
+    // Anthropic requires thinking to lead the turn, so the note for the run
+    // that precedes a surviving signed block must not be emitted before it.
+    expect(kinds.indexOf("reasoning")).toBeLessThan(kinds.indexOf("text"))
+    expect(JSON.stringify(result)).toContain("folded away")
+  })
+
+  test("keeps channel-scoped spans and tool results separate across a fully folded stretch", async () => {
+    const group = "g-span"
+    const folded = {
+      compacted: 0,
+      compactionGroup: group,
+      compactionGeneration: 2,
+      compactionSummary: "the whole investigation, folded",
+    }
+    const input: SessionV1.WithParts[] = [
+      {
+        info: userInfo("u1"),
+        parts: [{ ...basePart("u1", "p1"), type: "text", text: "old request", ...folded }] as SessionV1.Part[],
+      },
+      {
+        info: assistantInfo("a1", "msg_u1"),
+        parts: [
+          {
+            ...basePart("a1", "p2"),
+            type: "tool",
+            tool: "grep",
+            callID: "c1",
+            state: {
+              status: "completed",
+              input: {},
+              output: "huge grep output",
+              title: "",
+              metadata: {},
+              time: { start: 0, end: 1 },
+              compactionGroup: group,
+              compactionGeneration: 2,
+              compactionSummary: "the whole investigation, folded",
+            },
+          },
+        ] as SessionV1.Part[],
+      },
+      {
+        info: userInfo("u2"),
+        parts: [{ ...basePart("u2", "p3"), type: "text", text: "follow up", ...folded }] as SessionV1.Part[],
+      },
+      {
+        info: assistantInfo("a2", "msg_u2"),
+        parts: [{ ...basePart("a2", "p4"), type: "text", text: "live answer" }] as SessionV1.Part[],
+      },
+    ]
+
+    const result = await MessageV2.toModelMessages(input, model)
+    const serialized = JSON.stringify(result)
+    // A tool-bearing turn cannot become assistant text: the call and result
+    // remain paired in their assistant/tool channels.
+    expect(result).toHaveLength(5)
+    expect(result.map((message) => message.role)).toEqual(["user", "assistant", "tool", "user", "assistant"])
+    expect(serialized).not.toContain("huge grep output")
+    expect(serialized).not.toContain("old request")
+    expect(serialized).toContain('<compacted prt=\\"prt_p2\\" group=\\"g-span\\"/>')
+    expect(serialized).toContain('group=\\"g-span\\" channel=\\"user\\"')
+    expect(serialized).toContain('group=\\"g-span\\" channel=\\"tool\\"')
+    expect(serialized.split("the whole investigation, folded")).toHaveLength(3)
+    expect(serialized).toContain("live answer")
+  })
+
+  test("shrinks a span until the transcript still alternates", async () => {
+    const group = "g-span"
+    const input: SessionV1.WithParts[] = [
+      {
+        info: userInfo("u1"),
+        parts: [
+          {
+            ...basePart("u1", "p1"),
+            type: "text",
+            text: "old request",
+            compacted: 0,
+            compactionGroup: group,
+            compactionGeneration: 2,
+            compactionSummary: "folded",
+          },
+        ] as SessionV1.Part[],
+      },
+      {
+        info: assistantInfo("a1", "msg_u1"),
+        parts: [
+          {
+            ...basePart("a1", "p2"),
+            type: "text",
+            text: "old answer",
+            compacted: 0,
+            compactionGroup: group,
+            compactionGeneration: 2,
+            compactionSummary: "folded",
+          },
+        ] as SessionV1.Part[],
+      },
+      {
+        info: userInfo("u2"),
+        parts: [{ ...basePart("u2", "p3"), type: "text", text: "live request" }] as SessionV1.Part[],
+      },
+    ]
+
+    // User and assistant content get separate span carriers, so neither role is
+    // erased and the transcript remains alternating.
+    const result = await MessageV2.toModelMessages(input, model)
+    const serialized = JSON.stringify(result)
+    expect(result).toHaveLength(3)
+    expect(result.map((message) => message.role)).toEqual(["user", "assistant", "user"])
+    expect(serialized).toContain('messages=\\"1\\"')
+    expect(serialized.split("folded")).toHaveLength(3)
+    expect(serialized).not.toContain("old request")
+    expect(serialized).not.toContain("old answer")
+  })
+
+  test("judges alternation against the messages the renderer will actually emit", async () => {
+    const group = "g-span"
+    const folded = {
+      compacted: 0,
+      compactionGroup: group,
+      compactionGeneration: 2,
+      compactionSummary: "folded stretch",
+    }
+    // The maximal span is user->assistant->user, and the message straight after
+    // it is an assistant turn that errored, so it never reaches the provider.
+    // Comparing against it says the collapse is safe; comparing against the next
+    // message that survives says it is not.
+    const input: SessionV1.WithParts[] = [
+      {
+        info: userInfo("u0"),
+        parts: [{ ...basePart("u0", "p1"), type: "text", text: "first request", ...folded }] as SessionV1.Part[],
+      },
+      {
+        info: assistantInfo("a1", "u0"),
+        parts: [{ ...basePart("a1", "p2"), type: "text", text: "first answer", ...folded }] as SessionV1.Part[],
+      },
+      {
+        info: userInfo("u2"),
+        parts: [{ ...basePart("u2", "p3"), type: "text", text: "second request", ...folded }] as SessionV1.Part[],
+      },
+      {
+        info: assistantInfo("a3", "u2", { name: "ProviderAuthError", data: { providerID: "anthropic", message: "x" } }),
+        parts: [{ ...basePart("a3", "p4"), type: "text", text: "never delivered" }] as SessionV1.Part[],
+      },
+      {
+        info: userInfo("u4"),
+        parts: [{ ...basePart("u4", "p5"), type: "text", text: "live request" }] as SessionV1.Part[],
+      },
+    ]
+
+    const serialized = JSON.stringify(await MessageV2.toModelMessages(input, model))
+    // Folding all three would drop the assistant turn between two user turns and
+    // leave the carrier adjacent to the live user request.
+    expect(serialized).not.toContain('messages=\\"3\\"')
+    expect(serialized).toContain("live request")
+  })
+
+  test("never revives an errored turn as a span carrier", async () => {
+    const group = "g-span"
+    const folded = {
+      compacted: 0,
+      compactionGroup: group,
+      compactionGeneration: 2,
+      compactionSummary: "folded stretch",
+    }
+    const failed = { name: "ProviderAuthError" as const, data: { providerID: "anthropic", message: "boom" } }
+    // Both assistant turns errored, so the renderer drops them. They share the
+    // group with the user turn between them, which used to be enough to make the
+    // first of them the carrier — putting a turn the model never saw back into
+    // the transcript underneath a summary.
+    const input: SessionV1.WithParts[] = [
+      {
+        info: assistantInfo("a0", "u0", failed),
+        parts: [{ ...basePart("a0", "p1"), type: "text", text: "failed attempt", ...folded }] as SessionV1.Part[],
+      },
+      {
+        info: userInfo("u1"),
+        parts: [{ ...basePart("u1", "p2"), type: "text", text: "old request", ...folded }] as SessionV1.Part[],
+      },
+      {
+        info: assistantInfo("a2", "u1", failed),
+        parts: [{ ...basePart("a2", "p3"), type: "text", text: "second failure", ...folded }] as SessionV1.Part[],
+      },
+    ]
+
+    const result = await MessageV2.toModelMessages(input, model)
+    const serialized = JSON.stringify(result)
+    expect(serialized).not.toContain("failed attempt")
+    expect(serialized).not.toContain("second failure")
+    // Only the surviving user turn folds, and it folds alone.
+    expect(result).toHaveLength(1)
+    expect(result[0]!.role).toBe("user")
+    expect(serialized).toContain('messages=\\"1\\"')
+  })
+
+  test("does not span a message that still holds live content", async () => {
+    const group = "g-span"
+    const input: SessionV1.WithParts[] = [
+      {
+        info: userInfo("u1"),
+        parts: [
+          {
+            ...basePart("u1", "p1"),
+            type: "text",
+            text: "old request",
+            compacted: 0,
+            compactionGroup: group,
+            compactionGeneration: 2,
+            compactionSummary: "folded",
+          },
+        ] as SessionV1.Part[],
+      },
+      {
+        info: assistantInfo("a1", "msg_u1"),
+        parts: [
+          {
+            ...basePart("a1", "p2"),
+            type: "text",
+            text: "still needed",
+            compacted: undefined,
+          },
+          {
+            ...basePart("a1", "p3"),
+            type: "text",
+            text: "old note",
+            compacted: 0,
+            compactionGroup: group,
+            compactionGeneration: 2,
+            compactionSummary: "folded",
+          },
+        ] as SessionV1.Part[],
+      },
+    ]
+
+    const result = await MessageV2.toModelMessages(input, model)
+    const serialized = JSON.stringify(result)
+    // The user turn folds alone; the assistant turn keeps its live text and
+    // renders its folded note the ordinary way.
+    expect(serialized).toContain('messages=\\"1\\"')
+    expect(serialized).toContain("still needed")
+    expect(serialized).not.toContain("old note")
+    expect(result).toHaveLength(2)
+  })
+
+  test("leaves first-generation compaction as per-part markers", async () => {
+    const input: SessionV1.WithParts[] = [
+      {
+        info: userInfo("u1"),
+        parts: [
+          {
+            ...basePart("u1", "p1"),
+            type: "text",
+            text: "old request",
+            compacted: 0,
+            compactionGroup: "g1",
+            compactionGeneration: 1,
+            compactionSummary: "folded once",
+          },
+        ] as SessionV1.Part[],
+      },
+    ]
+
+    // Only content that has already been folded once earns full elision; a
+    // first pass keeps its ids addressable.
+    const serialized = JSON.stringify(await MessageV2.toModelMessages(input, model))
+    expect(serialized).not.toContain("<compacted-span")
+    expect(serialized).toContain('parts=\\"prt_p1\\"')
   })
 
   test("truncates tool output when requested", async () => {
@@ -1039,6 +2086,80 @@ describe("session.message-v2.toModelMessage", () => {
         ],
       },
     ])
+  })
+
+  test("replaces a classifier-rejected assistant turn with a note instead of dropping it", async () => {
+    const assistantID = "m-assistant"
+
+    const input: SessionV1.WithParts[] = [
+      {
+        info: assistantInfo(
+          assistantID,
+          "m-parent",
+          new SessionV1.ContentFilterError({
+            message: "blocked by content filtering policy",
+          }).toObject() as SessionV1.Assistant["error"],
+        ),
+        parts: [
+          {
+            ...basePart(assistantID, "a1"),
+            type: "text",
+            text: "the text that got refused",
+          },
+        ] as SessionV1.Part[],
+      },
+    ]
+
+    expect(await MessageV2.toModelMessages(input, model)).toStrictEqual([
+      {
+        role: "assistant",
+        content: [{ type: "text", text: MessageV2.CONTENT_FILTER_NOTE }],
+      },
+    ])
+  })
+
+  test("removes classifier-rejected stored parts from inventory-visible history", () => {
+    const assistantID = "m-assistant"
+    const rejected = {
+      info: assistantInfo(
+        assistantID,
+        "m-parent",
+        new SessionV1.ContentFilterError({
+          message: "blocked by content filtering policy",
+        }).toObject() as SessionV1.Assistant["error"],
+      ),
+      parts: [
+        {
+          ...basePart(assistantID, "rejected-text"),
+          type: "text",
+          text: "classifier rejected text",
+        },
+        {
+          ...basePart(assistantID, "rejected-tool"),
+          type: "tool",
+          callID: "rejected-call",
+          tool: "read",
+          state: {
+            status: "completed",
+            input: { filePath: "rejected.txt" },
+            output: "classifier rejected tool output",
+            title: "rejected",
+            metadata: {},
+            time: { start: 0, end: 1 },
+          },
+        },
+      ] as SessionV1.Part[],
+    } satisfies SessionV1.WithParts
+    const current = {
+      info: userInfo("m-current"),
+      parts: [{ ...basePart("m-current", "current"), type: "text", text: "continue" }] as SessionV1.Part[],
+    } satisfies SessionV1.WithParts
+
+    const projected = MessageV2.filterCompacted([current, rejected])
+
+    expect(projected.find((message) => message.info.id === assistantID)?.parts).toEqual([])
+    expect(JSON.stringify(projected)).not.toContain("classifier rejected")
+    expect(rejected.parts).toHaveLength(2)
   })
 
   test("preserves OpenRouter reasoning details through provider transform", async () => {
@@ -1551,6 +2672,285 @@ describe("session.message-v2.fromError", () => {
     const result = MessageV2.fromError(zlibError, { providerID, aborted: true })
 
     expect(result.name).toBe("MessageAbortedError")
+  })
+
+  test("classifies user-cancelled AbortError as AbortedError when ctx.aborted is true", () => {
+    const err = new DOMException("Aborted", "AbortError")
+    const result = MessageV2.fromError(err, { providerID, aborted: true })
+    expect(result.name).toBe("MessageAbortedError")
+  })
+
+  test("classifies a bare AbortError as a cancel regardless of ctx.aborted", () => {
+    // A bare AbortError only comes from controller.abort() with no reason —
+    // i.e. a user/parent cancel. Transport timeouts surface as their own
+    // specific errors (TimeoutError/HeaderTimeoutError/ResponseStreamError),
+    // so a bare AbortError must NOT be reclassified as retryable — otherwise
+    // a cancel races the failure channel and gets retried.
+    const err = new DOMException("The operation was aborted", "AbortError")
+    const result = MessageV2.fromError(err, { providerID })
+    expect(result.name).toBe("MessageAbortedError")
+  })
+
+  test("classifies TimeoutError DOMException as retryable APIError", () => {
+    // AbortSignal.timeout() in modern fetch surfaces as TimeoutError.
+    const err = new DOMException("The operation timed out", "TimeoutError")
+    const result = MessageV2.fromError(err, { providerID })
+    expect(SessionV1.APIError.isInstance(result)).toBe(true)
+    expect((result as SessionV1.APIError).data.isRetryable).toBe(true)
+  })
+
+  test.each([
+    ["ETIMEDOUT", "Network error (ETIMEDOUT)"],
+    ["EAI_AGAIN", "Network error (EAI_AGAIN)"],
+    ["EHOSTUNREACH", "Network error (EHOSTUNREACH)"],
+    ["ENETUNREACH", "Network error (ENETUNREACH)"],
+    ["EPIPE", "Network error (EPIPE)"],
+    ["UND_ERR_CONNECT_TIMEOUT", "Network error (UND_ERR_CONNECT_TIMEOUT)"],
+    ["UND_ERR_HEADERS_TIMEOUT", "Network error (UND_ERR_HEADERS_TIMEOUT)"],
+    ["UND_ERR_BODY_TIMEOUT", "Network error (UND_ERR_BODY_TIMEOUT)"],
+    ["UND_ERR_SOCKET", "Network error (UND_ERR_SOCKET)"],
+    ["ConnectionClosed", "Network error (ConnectionClosed)"],
+    // Bun reports DNS failure, refused connection, TLS mismatch and unroutable
+    // network all as ConnectionRefused, so it has to retry (bounded) rather than
+    // fail outright or a wifi flap kills the turn.
+    ["ConnectionRefused", "Network error (ConnectionRefused)"],
+    ["FailedToOpenSocket", "Network error (FailedToOpenSocket)"],
+    ["Timeout", "Network error (Timeout)"],
+  ])("classifies %s SystemError as retryable APIError", (code, expectedMessage) => {
+    const err = Object.assign(new Error(`${code} from test`), { code })
+    const result = MessageV2.fromError(err, { providerID })
+    expect(SessionV1.APIError.isInstance(result)).toBe(true)
+    expect((result as SessionV1.APIError).data.isRetryable).toBe(true)
+    expect((result as SessionV1.APIError).data.message).toBe(expectedMessage)
+  })
+
+  test.each([
+    ["SSE read timed out", new ProviderError.ResponseStreamError("SSE read timed out")],
+    ["header timeout", new ProviderError.HeaderTimeoutError(300_000)],
+  ])("retries a %s wrapped in a successful-response APICallError", (_name, cause) => {
+    // provider-utils >= 4.0.50 wraps every failed body read in this shape and
+    // marks it not retryable, even when the read failed on our own timeout.
+    const error = new APICallError({
+      message: "Failed to process successful response",
+      url: "https://api.githubcopilot.com/chat/completions",
+      requestBodyValues: {},
+      statusCode: 200,
+      cause,
+      isRetryable: false,
+    })
+    const result = MessageV2.fromError(error, { providerID })
+    expect(SessionV1.APIError.isInstance(result)).toBe(true)
+    expect((result as SessionV1.APIError).data.message).toBe(cause.message)
+    expect(SessionRetry.retryable(result, providerID)).toMatchObject({ message: cause.message })
+  })
+
+  test("retries a header timeout wrapped by a gateway error", () => {
+    const cause = new ProviderError.HeaderTimeoutError(300_000)
+    const result = MessageV2.fromError(new Error("Gateway request failed", { cause }), { providerID })
+    expect(SessionV1.APIError.isInstance(result)).toBe(true)
+    expect((result as SessionV1.APIError).data.isRetryable).toBe(true)
+  })
+
+  test("marks only our own stream timeouts as timeouts", () => {
+    const timeout = MessageV2.fromError(new ProviderError.ResponseStreamError("SSE read timed out", { timeout: true }), {
+      providerID,
+    }) as SessionV1.APIError
+    const closed = MessageV2.fromError(
+      new ProviderError.ResponseStreamError("WebSocket closed before response.completed"),
+      { providerID },
+    ) as SessionV1.APIError
+    expect(timeout.data.metadata?.timeout).toBe("true")
+    expect(closed.data.metadata?.timeout).toBeUndefined()
+    expect(closed.data.isRetryable).toBe(true)
+  })
+
+  test("does not unwrap a stream error whose connection failed permanently", () => {
+    // The experimental Responses WebSocket wraps a DNS failure in a stream error,
+    // and provider-utils wraps that in a 200 APICallError.
+    const dns = Object.assign(new Error("getaddrinfo ENOTFOUND api.invalid"), { code: "ENOTFOUND" })
+    const error = new APICallError({
+      message: "Failed to process successful response",
+      url: "https://api.invalid/v1/responses",
+      requestBodyValues: {},
+      statusCode: 200,
+      cause: new ProviderError.ResponseStreamError(dns.message, { cause: dns }),
+      isRetryable: false,
+    })
+    const result = MessageV2.fromError(error, { providerID }) as SessionV1.APIError
+    expect(result.data.isRetryable).toBe(false)
+  })
+
+  test("does not retry a wrapped timeout after the user aborts", () => {
+    const error = new APICallError({
+      message: "Failed to process successful response",
+      url: "https://api.githubcopilot.com/chat/completions",
+      requestBodyValues: {},
+      statusCode: 200,
+      cause: new ProviderError.ResponseStreamError("SSE read timed out"),
+      isRetryable: false,
+    })
+    expect(MessageV2.fromError(error, { providerID, aborted: true }).name).toBe("MessageAbortedError")
+  })
+
+  test("classifies a fetch failure with a transient cause as retryable", () => {
+    const cause = Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" })
+    const wrapper = Object.assign(new TypeError("fetch failed", { cause }), { code: "ERR_FETCH_FAILED" })
+    const result = MessageV2.fromError(wrapper, { providerID })
+    expect(SessionV1.APIError.isInstance(result)).toBe(true)
+    expect((result as SessionV1.APIError).data.metadata?.code).toBe("ECONNRESET")
+  })
+
+  test.each([
+    ["ENOTFOUND", "getaddrinfo"],
+    ["ECONNREFUSED", "connect"],
+    ["DNSResolveFailed", "getaddrinfo"],
+    ["DNSResolutionFailed", "getaddrinfo"],
+  ])("overrides retryable APICallError caused by %s", (code, syscall) => {
+    const cause = Object.assign(new Error(`${syscall} ${code} api.invalid`), { code, syscall })
+    const wrapper = Object.assign(new TypeError("fetch failed", { cause }), { code: "ERR_FETCH_FAILED" })
+    const error = new APICallError({
+      message: "Cannot connect to API",
+      url: "https://api.invalid/v1/messages",
+      requestBodyValues: { model: "test" },
+      cause: wrapper,
+      isRetryable: true,
+    })
+
+    const result = MessageV2.fromError(error, { providerID })
+    expect(SessionV1.APIError.isInstance(result)).toBe(true)
+    if (!SessionV1.APIError.isInstance(result)) throw new Error("expected APIError")
+    expect(result.data.isRetryable).toBe(false)
+    expect(result.data.metadata).toMatchObject({ code, syscall, url: "https://api.invalid/v1/messages" })
+    expect(SessionRetry.retryable(result, "test")).toBeUndefined()
+  })
+
+  test("keeps the response envelope when an APICallError wraps a transient fault", () => {
+    // Short-circuiting to a bare network error would drop retry-after and the
+    // body, which are the only useful diagnostics for a flapping provider.
+    const cause = Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET", syscall: "read" })
+    const error = new APICallError({
+      message: "Cannot reach API",
+      url: "https://api.test/v1/messages",
+      requestBodyValues: { model: "test" },
+      cause,
+      isRetryable: false,
+      statusCode: 503,
+      responseHeaders: { "retry-after": "7" },
+      responseBody: "upstream unavailable",
+    })
+
+    const result = MessageV2.fromError(error, { providerID })
+    if (!SessionV1.APIError.isInstance(result)) throw new Error("expected APIError")
+    expect(result.data.isRetryable).toBe(true)
+    expect(result.data.statusCode).toBe(503)
+    expect(result.data.responseHeaders).toMatchObject({ "retry-after": "7" })
+    expect(result.data.responseBody).toBe("upstream unavailable")
+    expect(result.data.metadata).toMatchObject({ code: "ECONNRESET", syscall: "read" })
+    // Still capped, so it cannot retry forever.
+    expect(MessageV2.isTransientTransportCode(result.data.metadata?.code)).toBe(true)
+  })
+
+  test.each(["ECONNRESET", "ConnectionRefused", "UND_ERR_SOCKET"])(
+    "classifies %s as an abort rather than a retry when the turn was cancelled",
+    (code) => {
+      // Abort can surface as a transport failure when it races the body read.
+      // Retrying a cancelled request would restart work the user just stopped.
+      const err = Object.assign(new Error(`${code} from test`), { code })
+      expect(MessageV2.fromError(err, { providerID, aborted: true }).name).toBe("MessageAbortedError")
+    },
+  )
+
+  test.each(["socket hang up", "terminated"])(
+    "classifies '%s' as an abort rather than a retry when the turn was cancelled",
+    (message) => {
+      expect(MessageV2.fromError(new Error(message), { providerID, aborted: true }).name).toBe("MessageAbortedError")
+    },
+  )
+
+  test("classifies a TimeoutError DOMException as an abort when the turn was cancelled", () => {
+    const err = new DOMException("The operation timed out", "TimeoutError")
+    expect(MessageV2.fromError(err, { providerID, aborted: true }).name).toBe("MessageAbortedError")
+  })
+
+  test("still reports a non-retryable failure during an abort", () => {
+    // The abort guard must only suppress retries, not rewrite permanent errors
+    // into cancellations and hide a real misconfiguration.
+    const cause = Object.assign(new Error("getaddrinfo ENOTFOUND api.invalid"), {
+      code: "ENOTFOUND",
+      syscall: "getaddrinfo",
+    })
+    const error = new APICallError({
+      message: "Cannot connect to API",
+      url: "https://api.invalid/v1/messages",
+      requestBodyValues: { model: "test" },
+      cause,
+      isRetryable: true,
+    })
+
+    const result = MessageV2.fromError(error, { providerID, aborted: true })
+    if (!SessionV1.APIError.isInstance(result)) throw new Error("expected APIError")
+    expect(result.data.isRetryable).toBe(false)
+  })
+
+  test("gives a nested permanent code precedence over a transient wrapper", () => {
+    const cause = Object.assign(new Error("getaddrinfo ENOTFOUND api.invalid"), { code: "ENOTFOUND" })
+    const wrapper = Object.assign(new Error("socket reset", { cause }), { code: "ECONNRESET" })
+    const result = MessageV2.fromError(wrapper, { providerID })
+    expect(result.name).toBe("UnknownError")
+  })
+
+  test("terminates on a cyclic cause chain instead of spinning", () => {
+    const first = Object.assign(new Error("first wrapper"), { code: "ERR_FIRST" })
+    const second = Object.assign(new Error("second wrapper", { cause: first }), { code: "ERR_SECOND" })
+    first.cause = second
+    expect(MessageV2.fromError(first, { providerID }).name).toBe("UnknownError")
+  })
+
+  test("still classifies a transient code reached through a cyclic chain", () => {
+    // Termination alone is not enough: the walk must keep inspecting codes up to
+    // the depth bound rather than bailing out on first revisit.
+    const transient = Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" })
+    const cycle = Object.assign(new Error("outer", { cause: transient }), { code: "ERR_OUTER" })
+    transient.cause = cycle
+    const result = MessageV2.fromError(cycle, { providerID })
+    expect(SessionV1.APIError.isInstance(result)).toBe(true)
+    expect((result as SessionV1.APIError).data.metadata?.code).toBe("ECONNRESET")
+  })
+
+  test("bounds deeply nested error causes", () => {
+    const cause = Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" })
+    const wrapper = Array.from({ length: 32 }, (_, index) => index).reduce<Error>(
+      (current, index) => new Error(`wrapper ${index}`, { cause: current }),
+      cause,
+    )
+    const result = MessageV2.fromError(wrapper, { providerID })
+    expect(result.name).toBe("UnknownError")
+  })
+
+  test.each(["socket hang up", "SSE read timed out", "other side closed", "terminated"])(
+    "classifies '%s' bare Error message as retryable APIError",
+    (message) => {
+      const result = MessageV2.fromError(new Error(message), { providerID })
+      expect(SessionV1.APIError.isInstance(result)).toBe(true)
+      expect((result as SessionV1.APIError).data.isRetryable).toBe(true)
+    },
+  )
+
+  test.each([
+    "fetch failed",
+    "Failed to fetch account configuration",
+    "network error: certificate has expired",
+    "Network request failed because access is forbidden",
+    "connect error: invalid provider base URL",
+    "request terminated because the API key is invalid",
+  ])("does not treat '%s' as a transient transport error", (message) => {
+    const result = MessageV2.fromError(new Error(message), { providerID })
+    expect(result.name).toBe("UnknownError")
+  })
+
+  test("leaves unrelated Error messages classified as Unknown", () => {
+    const result = MessageV2.fromError(new Error("Some unrelated bug"), { providerID })
+    expect(result.name).toBe("UnknownError")
   })
 })
 

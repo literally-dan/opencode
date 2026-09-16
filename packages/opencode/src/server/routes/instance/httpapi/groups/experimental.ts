@@ -97,7 +97,6 @@ export const ExperimentalPaths = {
   worktree: "/experimental/worktree",
   worktreeReset: "/experimental/worktree/reset",
   session: "/experimental/session",
-  sessionBackground: "/experimental/session/:sessionID/background",
   resource: "/experimental/resource",
 } as const
 
@@ -230,19 +229,6 @@ export const ExperimentalApi = HttpApi.make("experimental")
             summary: "List sessions",
             description:
               "Get a list of all OpenCode sessions across projects, sorted by most recently updated. Archived sessions are excluded by default.",
-          }),
-        ),
-        HttpApiEndpoint.post("sessionBackground", ExperimentalPaths.sessionBackground, {
-          params: { sessionID: SessionID },
-          query: WorkspaceRoutingQuery,
-          success: described(Schema.Boolean, "Backgrounded subagents"),
-          error: HttpApiError.BadRequest,
-        }).annotateMerge(
-          OpenApi.annotations({
-            identifier: "experimental.session.background",
-            summary: "Background subagents",
-            description:
-              "Detach any synchronous subagents currently blocking the session and continue them in the background.",
           }),
         ),
         HttpApiEndpoint.get("resource", ExperimentalPaths.resource, {

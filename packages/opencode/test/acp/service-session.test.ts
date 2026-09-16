@@ -1419,6 +1419,60 @@ describe("ACP service sessions", () => {
     expect(order).toEqual(["update", "response"])
   })
 
+  it("returns cancelled when session/cancel arrives after the turn ended while the prompt waits for idle", async () => {
+    const update = deferred<void>()
+    const release = deferred<void>()
+    const fixture = makeService([], {
+      sessionUpdate: (notification) => {
+        if (notification.update.sessionUpdate !== "agent_thought_chunk") return Promise.resolve()
+        update.resolve(undefined)
+        return release.promise
+      },
+    })
+    const session = await Effect.runPromise(fixture.service.newSession({ cwd: "/workspace", mcpServers: [] }))
+    // This update holds the event stream, so the idle event that the prompt waits for stays queued behind it, as
+    // when background Tasks keep the session busy after the turn.
+    fixture.events.push({
+      id: "evt_part",
+      type: "message.part.updated",
+      properties: {
+        sessionID: session.sessionId,
+        time: Date.now(),
+        part: {
+          id: "part_reasoning",
+          sessionID: session.sessionId,
+          messageID: "msg_assistant",
+          type: "reasoning",
+          text: "",
+          time: { start: Date.now() },
+        },
+      },
+    })
+    fixture.events.push({
+      id: "evt_delta",
+      type: "message.part.delta",
+      properties: {
+        sessionID: session.sessionId,
+        messageID: "msg_assistant",
+        partID: "part_reasoning",
+        field: "text",
+        delta: "thinking",
+      },
+    })
+    await update.promise
+    const result = Effect.runPromise(
+      fixture.service.prompt({ sessionId: session.sessionId, prompt: [{ type: "text", text: "hello" }] }),
+    )
+    // The turn ended: the prompt request returned and only the idle wait remains.
+    while (fixture.prompts.length === 0) await new Promise((resolve) => setTimeout(resolve, 1))
+
+    await Effect.runPromise(fixture.service.cancel({ sessionId: session.sessionId }))
+    release.resolve(undefined)
+
+    expect((await result).stopReason).toBe("cancelled")
+    expect(fixture.aborts).toEqual([session.sessionId])
+  })
+
   it("maps assistant prompt errors to request errors instead of end turn", async () => {
     const { service } = makeService([], {
       prompt: () =>

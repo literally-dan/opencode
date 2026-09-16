@@ -9,6 +9,7 @@ import { MessageV2 } from "./message-v2"
 import { SessionID, MessageID, PartID } from "./schema"
 import { SessionRunState } from "./run-state"
 import { SessionSummary } from "./summary"
+import { TaskTool } from "@/tool/task"
 
 export const RevertInput = Schema.Struct({
   sessionID: SessionID,
@@ -36,10 +37,22 @@ const layer = Layer.effect(
     const state = yield* SessionRunState.Service
 
     const revert = Effect.fn("SessionRevert.revert")(function* (input: RevertInput) {
-      yield* state.assertNotBusy(input.sessionID)
+      const initial = yield* sessions.messages({ sessionID: input.sessionID }).pipe(Effect.orDie)
+      const exists = initial.some(
+        (message) =>
+          (!input.partID && message.info.id === input.messageID) ||
+          message.parts.some((part) => part.id === input.partID),
+      )
+      if (!exists) return yield* sessions.get(input.sessionID).pipe(Effect.orDie)
+
+      // Revert stops a running turn itself and keeps background Tasks running, so clients do not need to abort
+      // first. It is busy only while another revert or unrevert of the Session runs.
+      yield* state.stopTurn(input.sessionID)
+      // Read again after the stopped turn has finalized its messages and patches.
       const all = yield* sessions.messages({ sessionID: input.sessionID }).pipe(Effect.orDie)
-      let lastUser: SessionV1.User | undefined
       const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
+
+      let lastUser: SessionV1.User | undefined
 
       let rev: Session.Info["revert"]
       const patches: Snapshot.Patch[] = []
@@ -67,12 +80,31 @@ const layer = Layer.effect(
 
       if (!rev) return session
 
+      const index = all.findIndex((msg) => msg.info.id === rev.messageID)
+      const range = index < 0 ? [] : all.slice(index)
+      // Only Tasks started or resumed in the reverted range are cancelled, and their results are discarded. Earlier
+      // Tasks keep running, and their results are held until the revert is committed or cleared. Cancel before files
+      // are restored, so a cancelled Task does not write over them.
+      yield* state.cancelTasks(
+        input.sessionID,
+        new Set(range.map((msg) => msg.info.id)),
+        new Set(
+          range.flatMap((msg) =>
+            msg.parts.flatMap((part) =>
+              part.type === "tool" &&
+              part.tool === TaskTool.id &&
+              part.state.status !== "pending" &&
+              typeof part.state.metadata?.sessionId === "string"
+                ? [part.state.metadata.sessionId]
+                : [],
+            ),
+          ),
+        ),
+      )
       rev.snapshot = session.revert?.snapshot ?? (yield* snap.track())
       if (session.revert?.snapshot) yield* snap.restore(session.revert.snapshot)
       yield* snap.revert(patches)
       if (rev.snapshot) rev.diff = yield* snap.diff(rev.snapshot)
-      const index = all.findIndex((msg) => msg.info.id === rev.messageID)
-      const range = index < 0 ? [] : all.slice(index)
       const diffs = yield* summary.computeDiff({ messages: range })
       yield* storage.write(["session_diff", input.sessionID], diffs).pipe(Effect.ignore)
       yield* events.publish(Session.Event.Diff, { sessionID: input.sessionID, diff: diffs })
@@ -86,17 +118,19 @@ const layer = Layer.effect(
         },
       })
       return yield* sessions.get(input.sessionID).pipe(Effect.orDie)
-    })
+    }, Effect.scoped)
 
     const unrevert = Effect.fn("SessionRevert.unrevert")(function* (input: { sessionID: SessionID }) {
       yield* Effect.logInfo("unreverting", { sessionID: input.sessionID })
-      yield* state.assertNotBusy(input.sessionID)
+      const initial = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
+      if (!initial.revert) return initial
+      yield* state.stopTurn(input.sessionID)
       const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
       if (!session.revert) return session
       if (session.revert.snapshot) yield* snap.restore(session.revert.snapshot)
       yield* sessions.clearRevert(input.sessionID)
       return yield* sessions.get(input.sessionID).pipe(Effect.orDie)
-    })
+    }, Effect.scoped)
 
     const cleanup = Effect.fn("SessionRevert.cleanup")(function* (session: Session.Info) {
       if (!session.revert) return
@@ -121,6 +155,8 @@ const layer = Layer.effect(
         }
       }
       yield* sessions.clearRevert(sessionID)
+      // Deliver Task results held while the revert was staged.
+      yield* state.revertChanged(sessionID)
     })
 
     return Service.of({ revert, unrevert, cleanup })

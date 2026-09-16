@@ -20,8 +20,12 @@ type LegacyClient = OpencodeClient
 type LegacyFor = (directory?: string) => LegacyClient
 type CompatibleSessionApi = Omit<
   SessionApi,
-  "prompt" | "command" | "shell" | "compact" | "rename" | "archive" | "remove"
+  "prompt" | "command" | "shell" | "compact" | "rename" | "archive" | "remove" | "interrupt"
 > & {
+  // Only V1 reads the scope. `turn` stops only the running turn, and background tasks keep running.
+  interrupt: (
+    input: Parameters<SessionApi["interrupt"]>[0] & { scope?: "turn" | "all" },
+  ) => ReturnType<SessionApi["interrupt"]>
   prompt: (input: SessionPromptInput & LegacyPrompt) => Promise<SessionPromptOutput>
   command: (input: SessionCommandInput) => Promise<SessionCommandOutput>
   shell: (input: SessionShellInput & LegacyPrompt) => Promise<SessionShellOutput>
@@ -58,10 +62,12 @@ function mime(uri: string) {
   return match?.[1] ?? "application/octet-stream"
 }
 
-function sessionInfo(session: Session): SessionInfo {
+// V2 SessionInfo has no taskParentID. Keep the V1 value so fetched Task children still match isTaskChild.
+function sessionInfo(session: Session): SessionInfo & Pick<Session, "taskParentID"> {
   return {
     id: session.id,
     parentID: session.parentID,
+    taskParentID: session.taskParentID,
     projectID: session.projectID,
     agent: session.agent,
     model: session.model && {
@@ -85,10 +91,28 @@ function sessionInfo(session: Session): SessionInfo {
 
 export function createCompatibleApi(input: CompatibleInput): CompatibleApi {
   const v1 = createV1Api(input)
+  const v2 = createV2Api(input.current)
   return lazyApi(
-    input.protocol.then((protocol) => (protocol === "v1" ? v1 : input.current)),
+    input.protocol.then((protocol) => (protocol === "v1" ? v1 : v2)),
     input.current,
   )
+}
+
+// A V2 revert does not stop the running turn, so interrupt first. A V1 revert stops the turn itself, and V1 abort
+// would also cancel background tasks.
+function createV2Api(current: ServerApi): ServerApi {
+  const interrupt = (sessionID: string) => current.session.interrupt({ sessionID }).catch(() => undefined)
+  return {
+    ...current,
+    session: {
+      ...current.session,
+      revert: {
+        ...current.session.revert,
+        stage: (value) => interrupt(value.sessionID).then(() => current.session.revert.stage(value)),
+        clear: (value) => interrupt(value.sessionID).then(() => current.session.revert.clear(value)),
+      },
+    },
+  }
 }
 
 function lazyApi<T extends object>(implementation: Promise<T>, shape: T): T {

@@ -9,8 +9,19 @@ import { SessionRevert } from "./revert"
 import { Session } from "./session"
 import { Agent } from "../agent/agent"
 import { Provider } from "@/provider/provider"
+import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
+import { estimateRequest, REQUEST_REMINDER_HEADROOM, usable } from "./overflow"
+import {
+  COMPACTION_PLANNING_SUMMARY,
+  compactionInventory,
+  compactionOf,
+  compactionSavings,
+  contextManagementReceiptKind,
+  isFullContextManagementReceipt,
+} from "./compaction-pruning"
+import { Superseded } from "./superseded"
 
-import { type Tool as AITool, tool, jsonSchema } from "ai"
+import { type ModelMessage, type Tool as AITool, tool, jsonSchema } from "ai"
 import type { JSONSchema7 } from "@ai-sdk/provider"
 import { SessionCompaction } from "./compaction"
 import { SystemPrompt } from "./system"
@@ -56,6 +67,7 @@ import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionReminders } from "./reminders"
 import { SessionTools } from "./tools"
 import { LLMEvent } from "@opencode-ai/llm"
+import { SessionAsk } from "./ask"
 
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -99,12 +111,222 @@ function isOrphanedInterruptedTool(part: SessionV1.ToolPart) {
   return part.state.status === "error" && part.state.metadata?.interrupted === true
 }
 
+// A command subtask that started in the background has no result for the model
+// yet. Another turn would send a request that ends with the synthetic task call,
+// which some thinking models reject. The task notification starts the next turn.
+function isBackgroundSubtaskLaunch(user: SessionV1.WithParts | undefined, assistant: SessionV1.WithParts | undefined) {
+  if (!user || assistant?.info.role !== "assistant" || assistant.info.parentID !== user.info.id) return false
+  return assistant.parts.some(
+    (part) =>
+      part.type === "tool" &&
+      part.tool === TaskTool.id &&
+      part.state.status === "completed" &&
+      part.state.metadata.background === true &&
+      user.parts.some(
+        (subtask) => subtask.type === "subtask" && !!subtask.command && subtask.command === part.state.input.command,
+      ),
+  )
+}
+
+function successfulContextCompaction(message: SessionV1.WithParts | undefined) {
+  return (
+    message?.parts.some((part) => {
+      if (!isFullContextManagementReceipt(part)) return false
+      const kind = contextManagementReceiptKind(part)
+      if (kind !== "compact_results" && kind !== "compact_bulk") return false
+      const charsFreed: unknown = part.state.metadata.charsFreed
+      return typeof charsFreed === "number" && charsFreed > 0
+    }) ?? false
+  )
+}
+
+function stableCachePrefixLimit(input: {
+  messages: SessionV1.WithParts[]
+  modelMessages: ModelMessage[]
+  ephemeralSuffix: boolean
+}) {
+  const receipt = input.messages.findLast(
+    (message) => message.info.role === "assistant" && message.parts.some(isFullContextManagementReceipt),
+  )
+  if (!receipt) return input.ephemeralSuffix ? input.modelMessages.length : undefined
+  const callIDs = new Set(receipt.parts.filter(isFullContextManagementReceipt).map((part) => part.callID))
+  const limit = input.modelMessages.findIndex(
+    (message) =>
+      message.role === "assistant" &&
+      Array.isArray(message.content) &&
+      message.content.some((part) => part.type === "tool-call" && callIDs.has(part.toolCallId)),
+  )
+  // Missing tool-call history is malformed, but caching no message history is
+  // safer than writing a one-use prefix through the volatile receipt.
+  return limit < 0 ? 0 : limit
+}
+
+// Two-stage context-pressure nudge. Native overflow compaction (whole-history
+// summarization) takes over at 100% of the usable budget and discards detail
+// wholesale, so we want the model to run a cheaper, surgical `compact_results`
+// pass with runway to spare before that cutover. A single large step can grow
+// context by well over 15%, so nudging only in the final stretch risks the
+// native pass preempting the model entirely. Start a gentle reminder at SOFT
+// (the loop dedupes it, so an ignored nudge stays cheap) and escalate to a
+// first-action imperative past HARD — where the model empirically starts acting
+// — while both stay below the 100% native cutover.
+const CONTEXT_PRESSURE_SOFT = 0.65
+const CONTEXT_PRESSURE_HARD = 0.85
+// Once nudging starts, aim below the trigger rather than at it. Without a gap
+// the model reclaims just enough to fall under SOFT, the next tool result puts
+// it straight back over, and the nudge fires every turn for the rest of the
+// session.
+const CONTEXT_PRESSURE_TARGET = 0.45
+const COMPACTION_MIN_RECLAIM_CHARS = 8_000
+
+// Context-pressure nudge: once usage crosses CONTEXT_PRESSURE_SOFT of the usable
+// window, remind the model to inspect a fresh inventory before compacting. Returns a
+// candidate fingerprint alongside the text so the caller can dedupe across
+// completed runs. Suppressed when compaction is disabled.
+// What the request about to be sent actually costs, rather than what the last
+// one cost. Provider usage arrives a round trip late, so steering off it means
+// a compaction is invisible until after the next response — the model gets
+// nudged again for pressure it already relieved, and growth from the tool
+// results in this very step is not counted at all.
+//
+// The char heuristic is calibrated against the last observed provider count for
+// a request we also estimated, which folds in tokenizer and per-message
+// overhead the heuristic cannot see.
+function liveContextTokens(input: {
+  system: string[]
+  messages: unknown[]
+  tools?: Record<string, AITool>
+  observed?: { estimated: number; actual: number }
+}) {
+  // Serialising the whole message array is the expensive part, so the raw
+  // estimate is returned alongside the calibrated one: the caller needs it to
+  // calibrate the next step and must not pay for a second pass to get it.
+  const estimated = estimateRequest(input)
+  const observed = input.observed
+  if (!observed || observed.estimated <= 0 || observed.actual <= 0) return { estimated, used: estimated }
+  // Clamped: a wild ratio means the previous request was not comparable (a
+  // native compaction landed between them, say), and scaling by it would be
+  // worse than not calibrating at all.
+  const ratio = Math.min(4, Math.max(0.25, observed.actual / observed.estimated))
+  return { estimated, used: Math.round(estimated * ratio) }
+}
+
+function contextPressureReminder(input: {
+  cfg: ConfigV1.Info
+  model: Provider.Model
+  used: number
+  messages: SessionV1.WithParts[]
+  durableMessages: SessionV1.WithParts[]
+  currentMessageID: string
+  // Steps spent above the soft threshold without the model reclaiming anything.
+  ignored: number
+}) {
+  if (input.cfg.compaction?.auto === false) return undefined
+  const budget = usable({ cfg: input.cfg, model: input.model })
+  if (budget <= 0) return undefined
+  const pct = input.used / budget
+  if (pct < CONTEXT_PRESSURE_SOFT) return undefined
+  const candidates = compactionCandidates(input.messages, input.durableMessages, input.currentMessageID)
+  const urgent = pct >= CONTEXT_PRESSURE_HARD
+  // Nothing fresh worth reclaiming. Normally that means going quiet rather than
+  // nagging about content that would cost more to re-fold than it frees — but
+  // when pressure is critical and the context is now mostly notes, folding
+  // those notes into a span is the last move left before native compaction
+  // discards the lot wholesale.
+  if (candidates.chars < COMPACTION_MIN_RECLAIM_CHARS) {
+    if (!urgent || candidates.folded.chars < COMPACTION_MIN_RECLAIM_CHARS) return undefined
+    return {
+      pct,
+      fingerprint: `hard:${candidates.fingerprint}`,
+      text: [
+        "<system-reminder>",
+        `Context is ~${Math.round(pct * 100)}% of its usable budget and automatic whole-history compaction is imminent. Everything readily compactable has already been compacted once: ${candidates.folded.parts.toLocaleString()} parts can still reclaim at least ${candidates.folded.chars.toLocaleString()} rendered characters. Call \`list_context\` for safe \`prt_…\` ids, then use \`compact_results\` with one shorter, coarser summary. Non-tool contiguous runs may collapse to a range marker; tool inputs remain intact for provider-valid replay. Prefer the oldest, most settled stretch and keep recent work at full detail.`,
+        "</system-reminder>",
+      ].join("\n"),
+    }
+  }
+  // Ask for the whole gap down to the target, not just enough to clear the
+  // threshold, so one compaction buys many turns instead of one.
+  const deficit = Math.max(0, Math.round(input.used - budget * CONTEXT_PRESSURE_TARGET))
+  const goal = `Aim to reclaim roughly ${deficit.toLocaleString()} tokens (down to about ${Math.round(CONTEXT_PRESSURE_TARGET * 100)}%), not just enough to clear the threshold.`
+  // Escalate only when the model has been told and has not acted. A model busy
+  // with the user's request gets a reminder; one that has ignored several gets
+  // told to stop and do it first.
+  const lead = urgent
+    ? `Context is ~${Math.round(pct * 100)}% of its usable budget — very high, and automatic whole-history compaction (which discards detail wholesale) is imminent. As your FIRST action this turn,`
+    : input.ignored >= 2
+      ? `Context is ~${Math.round(pct * 100)}% of its usable budget and you have passed on ${input.ignored} previous reminders. Before doing anything else,`
+      : `Context is ~${Math.round(pct * 100)}% of its usable budget and climbing. Before it gets critical,`
+  return {
+    pct,
+    fingerprint: `${urgent ? "hard" : "soft"}:${candidates.fingerprint}`,
+    text: [
+      "<system-reminder>",
+      `${lead} reclaim space by calling \`list_context\` first, then \`compact_results\`. Use only \`prt_…\` ids returned by that current \`list_context\` call; never copy id-like strings from prior messages or tool output. Content is dropped but stays recoverable via \`read_part\`. ${goal} Then continue with and complete the user's current request as normal — this reminder is housekeeping, not a replacement for the task.`,
+      "</system-reminder>",
+    ].join("\n"),
+  }
+}
+
+// Reuse the tool's eligibility and accounting for pressure and reminder
+// deduplication, but never expose part ids without a current `list_context`.
+function compactionCandidates(
+  messages: SessionV1.WithParts[],
+  durableMessages: SessionV1.WithParts[],
+  currentMessageID: string,
+) {
+  const inventory = compactionInventory(messages, currentMessageID, durableMessages)
+  const fresh: { id: string; chars: number; part: SessionV1.Part }[] = []
+  const folded: { id: string; chars: number; part: SessionV1.Part }[] = []
+  for (const [id, { part, allowed, savings }] of inventory.actionable) {
+    if (savings <= 0) continue
+    ;(allowed.generation > 0 ? folded : fresh).push({ id, chars: savings, part })
+  }
+  const reclaimable = (parts: typeof fresh) =>
+    parts.length
+      ? Math.max(
+          0,
+          compactionSavings(
+            parts.map((candidate) => candidate.part),
+            COMPACTION_PLANNING_SUMMARY,
+            inventory.roles,
+          ),
+        )
+      : 0
+  const chars = reclaimable(fresh)
+  const foldedChars = reclaimable(folded)
+  return {
+    chars,
+    folded: { parts: folded.length, chars: foldedChars },
+    fingerprint: [...fresh, ...folded]
+      .toSorted((a, b) => a.id.localeCompare(b.id))
+      .map((entry) => `${entry.id}:${entry.chars}`)
+      .join("|"),
+  }
+}
+
+export type NotificationContinuation = Effect.Effect<SessionV1.WithParts | undefined, Image.Error>
+
+/** The message that started a background Task. A result held during a revert is dropped when this message is removed. */
+export type NotificationSource = { readonly sessionID: SessionID; readonly messageID: MessageID }
+
 export interface Interface {
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
-  readonly prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
+  readonly checkpoint: (sessionID: SessionID) => Effect.Effect<number>
+  readonly ask: (input: AskInput) => Effect.Effect<AskOutput, unknown>
+  readonly prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error | Session.RemovingError>
+  readonly admitNotification: (
+    input: PromptInput,
+    checkpoint: number,
+    source?: NotificationSource,
+  ) => Effect.Effect<Option.Option<NotificationContinuation>, Image.Error>
+  readonly notify: (
+    input: PromptInput,
+    checkpoint: number,
+  ) => Effect.Effect<SessionV1.WithParts | undefined, Image.Error>
   readonly loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts>
   readonly shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError>
-  readonly command: (input: CommandInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
+  readonly command: (input: CommandInput) => Effect.Effect<SessionV1.WithParts, Image.Error | Session.RemovingError>
   readonly resolvePromptParts: (template: string) => Effect.Effect<PromptInput["parts"]>
 }
 
@@ -140,18 +362,47 @@ const layer = Layer.effect(
     const events = yield* EventV2Bridge.Service
     const flags = yield* RuntimeFlags.Service
     const database = yield* Database.Service
+    const asks = yield* SessionAsk.Service
     const { db } = database
-    const ops = Effect.fn("SessionPrompt.ops")(function* () {
+    type ContextState = {
+      calibration?: { estimated: number; actual: number }
+      estimate?: number
+      requestOverhead: number
+      reminder?: string
+    }
+    const contextStates = new Map<SessionID, ContextState>()
+    const contextState = (sessionID: SessionID) => {
+      const hit = contextStates.get(sessionID)
+      if (hit) return hit
+      if (contextStates.size >= 1_000) contextStates.delete(contextStates.keys().next().value!)
+      const next: ContextState = { requestOverhead: REQUEST_REMINDER_HEADROOM }
+      contextStates.set(sessionID, next)
+      return next
+    }
+    const ops = Effect.fn("SessionPrompt.ops")(function* (sessionID: SessionID) {
+      const checkpoint = yield* state.checkpoint(sessionID)
       return {
         cancel: (sessionID: SessionID) => cancel(sessionID),
+        checkpoint: (sessionID: SessionID) => state.checkpoint(sessionID),
+        retain: (sessionID: SessionID, checkpoint: number) => state.retain(sessionID, checkpoint),
+        admitIfCurrent: <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+          state.admitIfCurrent(sessionID, checkpoint, effect),
+        admitChild: <A, E, R>(childID: SessionID, effect: Effect.Effect<A, E, R>) =>
+          state.admit([{ sessionID, checkpoint }, { sessionID: childID }], effect),
         resolvePromptParts: (template: string) => resolvePromptParts(template),
         prompt: (input: PromptInput) => prompt(input).pipe(Effect.catch(Effect.die)),
+        admitNotification: (input: PromptInput, checkpoint: number, source?: NotificationSource) =>
+          admitNotification(input, checkpoint, source).pipe(Effect.catch(Effect.die)),
+        notify: (input: PromptInput, checkpoint: number) => notify(input, checkpoint).pipe(Effect.catch(Effect.die)),
       } satisfies TaskPromptOps
     })
 
     const cancel = Effect.fn("SessionPrompt.cancel")(function* (sessionID: SessionID) {
       yield* Effect.logInfo("cancel", { "session.id": sessionID })
-      yield* state.cancel(sessionID)
+      yield* Effect.all([state.cancel(sessionID), asks.cancel({ sessionID }).pipe(Effect.orDie)], {
+        concurrency: "unbounded",
+        discard: true,
+      })
     })
 
     const resolvePromptParts = Effect.fn("SessionPrompt.resolvePromptParts")(function* (template: string) {
@@ -262,7 +513,7 @@ const layer = Layer.effect(
     }) {
       const { task, model, lastUser, sessionID, session, msgs } = input
       const ctx = yield* InstanceState.context
-      const promptOps = yield* ops()
+      const promptOps = yield* ops(input.sessionID)
       const { task: taskTool } = yield* registry.named()
       const taskModel = task.model ? yield* getModel(task.model.providerID, task.model.modelID, sessionID) : model
       const assistantMessage: SessionV1.Assistant = yield* sessions.updateMessage({
@@ -427,7 +678,9 @@ const layer = Layer.effect(
         } satisfies SessionV1.ToolPart)
       }
 
-      if (!task.command) return
+      // A background start has no output to summarize yet. The loop exit check
+      // ends the turn, and the task notification starts the next turn.
+      if (!task.command || result?.metadata?.background === true) return
 
       const summaryUserMsg: SessionV1.User = {
         id: MessageID.ascending(),
@@ -632,7 +885,7 @@ const layer = Layer.effect(
       return yield* provider.defaultModel().pipe(Effect.orDie)
     })
 
-    const createUserMessage = Effect.fn("SessionPrompt.createUserMessage")(function* (input: PromptInput) {
+    const prepareUserMessage = Effect.fn("SessionPrompt.prepareUserMessage")(function* (input: PromptInput) {
       const agentName = input.agent
       const ag = agentName ? yield* agents.get(agentName) : yield* agents.defaultInfo()
       if (!ag) {
@@ -667,25 +920,6 @@ const layer = Layer.effect(
         },
         system: input.system,
         format: input.format,
-      }
-
-      const current = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
-      if (
-        current.agent !== info.agent ||
-        current.model?.providerID !== info.model.providerID ||
-        current.model?.id !== info.model.modelID ||
-        (current.model?.variant === "default" ? undefined : current.model?.variant) !== info.model.variant
-      ) {
-        yield* sessions.setAgentModel({
-          sessionID: input.sessionID,
-          agent: info.agent,
-          model: {
-            id: info.model.modelID,
-            providerID: info.model.providerID,
-            variant: info.model.variant ?? "default",
-          },
-          time: info.time.created,
-        })
       }
 
       yield* Effect.addFinalizer(() => instruction.clear(info.id))
@@ -989,6 +1223,10 @@ const layer = Layer.effect(
           ]
         }
 
+        if (part.type === "subtask") {
+          return [{ ...part, messageID: info.id, sessionID: input.sessionID, background: true }]
+        }
+
         return [{ ...part, messageID: info.id, sessionID: input.sessionID }]
       })
 
@@ -1043,18 +1281,33 @@ const layer = Layer.effect(
         })
       }
 
-      yield* sessions.updateMessage(info)
-      for (const part of parts) yield* sessions.updatePart(part)
-
       return { info, parts }
     }, Effect.scoped)
 
-    const prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error> = Effect.fn(
-      "SessionPrompt.prompt",
-    )(function* (input: PromptInput) {
+    const persistPrompt = Effect.fn("SessionPrompt.persistPrompt")(function* (
+      message: SessionV1.WithParts & { info: SessionV1.User },
+      input: PromptInput,
+    ) {
       const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
-      yield* revert.cleanup(session)
-      const message = yield* createUserMessage(input)
+      if (
+        session.agent !== message.info.agent ||
+        session.model?.providerID !== message.info.model.providerID ||
+        session.model?.id !== message.info.model.modelID ||
+        (session.model?.variant === "default" ? undefined : session.model?.variant) !== message.info.model.variant
+      ) {
+        yield* sessions.setAgentModel({
+          sessionID: input.sessionID,
+          agent: message.info.agent,
+          model: {
+            id: message.info.model.modelID,
+            providerID: message.info.model.providerID,
+            variant: message.info.model.variant ?? "default",
+          },
+          time: message.info.time.created,
+        })
+      }
+      yield* sessions.updateMessage(message.info)
+      for (const part of message.parts) yield* sessions.updatePart(part)
       yield* sessions.touch(input.sessionID)
 
       const permissions: PermissionV1.Rule[] = []
@@ -1066,9 +1319,42 @@ const layer = Layer.effect(
         yield* sessions.setPermission({ sessionID: session.id, permission: permissions })
       }
 
-      if (input.noReply === true) return message
-      return yield* loop({ sessionID: input.sessionID })
+      return message
     })
+
+    const savePrompt = Effect.fn("SessionPrompt.savePrompt")(function* (input: PromptInput) {
+      const prepared = yield* prepareUserMessage(input)
+      const save: Effect.Effect<SessionV1.WithParts & { info: SessionV1.User }, Session.RemovingError> = Effect.gen(
+        function* () {
+          const admitted = yield* state.admit(
+            [{ sessionID: input.sessionID }],
+            Effect.gen(function* () {
+              // No turn starts while a revert is in progress, and the revert can stage over this prompt.
+              // Wait until it finishes, then save the prompt, which commits a staged revert.
+              const reverting = yield* state.awaitRevert(input.sessionID, Effect.succeed(false))
+              if (Option.isSome(reverting)) return { held: reverting.value }
+              yield* revert.cleanup(yield* sessions.get(input.sessionID).pipe(Effect.orDie))
+              return yield* persistPrompt(prepared, input)
+            }),
+          )
+          if (Option.isNone(admitted)) return yield* new Session.RemovingError({ sessionID: input.sessionID })
+          if (!("held" in admitted.value)) return admitted.value
+          yield* admitted.value.held
+          return yield* save
+        },
+      )
+      return yield* save
+    })
+
+    const prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error | Session.RemovingError> =
+      Effect.fn("SessionPrompt.prompt")(function* (input: PromptInput) {
+        const message = yield* savePrompt(input)
+
+        if (input.noReply === true) return message
+        // This turn also answers the task results admitted while a turn-only interrupt paused their turns.
+        yield* state.resumeNotificationTurns(input.sessionID)
+        return yield* loop({ sessionID: input.sessionID })
+      })
 
     const lastAssistant = Effect.fnUntraced(function* (sessionID: SessionID) {
       const match = yield* sessions.findMessage(sessionID, (m) => m.info.role !== "user").pipe(Effect.orDie)
@@ -1083,17 +1369,33 @@ const layer = Layer.effect(
         const ctx = yield* InstanceState.context
         let structured: unknown
         let step = 0
+        const remembered = contextState(sessionID)
+        // Ratio between the last request's estimated and actual input tokens,
+        // used to correct the char heuristic for tokenizer and per-message
+        // overhead it cannot see.
+        let contextCalibration = remembered.calibration
+        let lastEstimate = remembered.estimate
+        let lastRequestOverhead = remembered.requestOverhead
+        let autoCompactionAttempts = 0
         const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
 
         while (true) {
           yield* status.set(sessionID, { type: "busy" })
           yield* Effect.logInfo("loop", { "session.id": sessionID, step })
 
-          let msgs = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
-            Effect.provideService(Database.Service, database),
-          )
+          let msgs = yield* compaction.collapseReceipts({ sessionID })
 
           const { user: lastUser, assistant: lastAssistant, finished: lastFinished, tasks } = MessageV2.latest(msgs)
+          // Calibrate the char heuristic against what the provider actually
+          // charged for the request we estimated last step. Cache reads and
+          // writes count: they are input the model still had to be sent.
+          if (lastEstimate !== undefined && lastFinished) {
+            const actual = lastFinished.tokens.input + lastFinished.tokens.cache.read + lastFinished.tokens.cache.write
+            if (actual > 0) {
+              contextCalibration = { estimated: lastEstimate, actual }
+              remembered.calibration = contextCalibration
+            }
+          }
 
           if (!lastUser) throw new Error("No user message found in stream. This should never happen.")
 
@@ -1109,10 +1411,12 @@ const layer = Layer.effect(
             ) ?? false
 
           if (
-            lastAssistant?.finish &&
-            !["tool-calls", "unknown"].includes(lastAssistant.finish) &&
-            !hasToolCalls &&
-            lastAssistant.parentID === lastUser.id
+            lastAssistant?.parentID === lastUser.id &&
+            ((lastAssistant.finish && !["tool-calls", "unknown"].includes(lastAssistant.finish) && !hasToolCalls) ||
+              isBackgroundSubtaskLaunch(
+                msgs.findLast((msg) => msg.info.id === lastUser.id),
+                lastAssistantMsg,
+              ))
           ) {
             const orphan = lastAssistantMsg?.parts.find(
               (part): part is SessionV1.ToolPart => part.type === "tool" && isOrphanedInterruptedTool(part),
@@ -1147,24 +1451,63 @@ const layer = Layer.effect(
           }
 
           if (task?.type === "compaction") {
+            const owner = msgs.find((message) => message.info.id === task.messageID)
+            if (!owner || owner.info.role !== "user") {
+              throw new Error(`Compaction owner must be a user message: ${task.messageID}`)
+            }
+            autoCompactionAttempts++
             const result = yield* compaction.process({
               messages: msgs,
-              parentID: lastUser.id,
+              parentID: owner.info.id,
               sessionID,
               auto: task.auto,
               overflow: task.overflow,
+              attempt: autoCompactionAttempts,
+              requestOverhead: lastRequestOverhead,
             })
             if (result === "stop") break
             continue
           }
 
-          if (
-            lastFinished &&
-            lastFinished.summary !== true &&
-            (yield* compaction.isOverflow({ tokens: lastFinished.tokens, model }))
-          ) {
-            yield* compaction.create({ sessionID, agent: lastUser.agent, model: lastUser.model, auto: true })
-            continue
+          const recorded = yield* compaction.checkOverflow({
+            tokens: lastFinished?.tokens ?? {
+              input: 0,
+              output: 0,
+              reasoning: 0,
+              cache: { read: 0, write: 0 },
+            },
+            model,
+          })
+          if (recorded.status === "impossible") {
+            const error = new SessionV1.ContextOverflowError({ message: recorded.budget.message }).toObject()
+            const failed = yield* sessions.updateMessage({
+              id: MessageID.ascending(),
+              parentID: lastUser.id,
+              role: "assistant",
+              mode: lastUser.agent,
+              agent: lastUser.agent,
+              variant: lastUser.model.variant,
+              path: { cwd: ctx.directory, root: ctx.worktree },
+              cost: 0,
+              tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+              modelID: model.id,
+              providerID: model.providerID,
+              time: { created: Date.now(), completed: Date.now() },
+              sessionID,
+              finish: "error",
+              error,
+            })
+            yield* events.publish(Session.Event.Error, { sessionID, error: failed.error! })
+            break
+          }
+          if (lastFinished && lastFinished.summary !== true && recorded.overflow) {
+            const manuallyCompacted = msgs.some((message) =>
+              message.parts.some((part) => compactionOf(part)?.native === false),
+            )
+            if (!manuallyCompacted) {
+              yield* compaction.create({ sessionID, agent: lastUser.agent, model: lastUser.model, auto: true })
+              continue
+            }
           }
 
           const agent = yield* agents.get(lastUser.agent)
@@ -1221,7 +1564,7 @@ const layer = Layer.effect(
           const outcome: "break" | "continue" = yield* Effect.gen(function* () {
             const lastUserMsg = msgs.findLast((m) => m.info.role === "user")
             const bypassAgentCheck = lastUserMsg?.parts.some((p) => p.type === "agent") ?? false
-            const promptOps = yield* ops()
+            const promptOps = yield* ops(sessionID)
 
             const tools = yield* SessionTools.resolve({
               agent,
@@ -1259,7 +1602,7 @@ const layer = Layer.effect(
               sys.environment(model),
               instruction.system().pipe(Effect.orDie),
               sys.mcp(agent, session.permission),
-              MessageV2.toModelMessagesEffect(msgs, model),
+              MessageV2.toModelMessagesEffect(msgs, model, { stampUser: true }),
             ])
             const system = [
               ...env,
@@ -1269,6 +1612,76 @@ const layer = Layer.effect(
             ]
             const format = lastUser.format ?? { type: "text" as const }
             if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
+            // The reminder text is volatile (percentage and reclaim target change
+            // as usage climbs) so it must NOT go in the cached `system` prefix —
+            // that would bust the whole prompt cache on the most expensive
+            // (high-context) turns. Deliver it as an ephemeral trailing user
+            // message instead, keeping system + history cacheable.
+            // Suppress on the last step: MAX_STEPS disables tools and demands a
+            // text-only reply, and compaction only takes effect next turn — so a
+            // "call compact_results now" nudge would be both contradictory and
+            // useless there.
+            // Measure the request we are about to send, not the one we sent last
+            // time. Anything the model reclaimed this turn is already reflected,
+            // and so is everything this turn's tool results just added.
+            const suppressed =
+              isLastStep ||
+              flags.disableContextCompaction ||
+              Permission.evaluate("compact_results", "*", agent.permission, session.permission ?? []).action === "deny"
+            // Measuring serialises the whole history, so only pay for it when the
+            // answer can actually be used. Leaving `lastEstimate` unset also keeps
+            // the next step from calibrating a fresh usage figure against a stale
+            // estimate from several steps ago.
+            const live = suppressed
+              ? undefined
+              : liveContextTokens({ system, messages: modelMsgs, tools, observed: contextCalibration })
+            const pressureConfig = live ? yield* config.get() : undefined
+            const pressureUsed = live ? live.used + REQUEST_REMINDER_HEADROOM : 0
+            const pressureBudget = pressureConfig ? usable({ cfg: pressureConfig, model }) : 0
+            const pressure =
+              live &&
+              pressureConfig &&
+              pressureConfig.compaction?.auto !== false &&
+              pressureBudget > 0 &&
+              pressureUsed / pressureBudget >= CONTEXT_PRESSURE_SOFT
+                ? contextPressureReminder({
+                    cfg: pressureConfig,
+                    model,
+                    used: pressureUsed,
+                    messages: msgs,
+                    durableMessages: yield* sessions.messages({ sessionID }).pipe(Effect.orDie),
+                    currentMessageID: msg.id,
+                    ignored: 0,
+                  })
+                : undefined
+            // Candidate identity, generation, and conservative savings are the
+            // reminder clock. Unchanged high-pressure context stays quiet across
+            // both provider steps and completed user-message runs.
+            const progressed = lastAssistant?.parentID === lastUser.id && successfulContextCompaction(lastAssistantMsg)
+            const pressureText =
+              pressure && !progressed && pressure.fingerprint !== remembered.reminder ? pressure.text : undefined
+            if (pressure && (pressureText || progressed)) remembered.reminder = pressure.fingerprint
+            const cachePrefixLimit = stableCachePrefixLimit({
+              messages: msgs,
+              modelMessages: modelMsgs,
+              ephemeralSuffix: isLastStep || pressureText !== undefined,
+            })
+            const requestMessages = [
+              ...modelMsgs,
+              ...(isLastStep ? [{ role: "assistant" as const, content: MAX_STEPS_PROMPT }] : []),
+              ...(pressureText ? [{ role: "user" as const, content: pressureText }] : []),
+            ]
+            lastEstimate = suppressed
+              ? undefined
+              : liveContextTokens({ system, messages: requestMessages, tools, observed: contextCalibration }).estimated
+            remembered.estimate = lastEstimate
+            lastRequestOverhead = estimateRequest({
+              system,
+              messages: [],
+              tools,
+              reminderHeadroom: REQUEST_REMINDER_HEADROOM,
+            })
+            remembered.requestOverhead = lastRequestOverhead
             const result = yield* handle.process({
               user: lastUser,
               agent,
@@ -1276,10 +1689,8 @@ const layer = Layer.effect(
               sessionID,
               parentSessionID: session.parentID,
               system,
-              messages: [
-                ...modelMsgs,
-                ...(isLastStep ? [{ role: "assistant" as const, content: MAX_STEPS_PROMPT }] : []),
-              ],
+              messages: requestMessages,
+              cachePrefixLimit,
               tools,
               model,
               toolChoice: format.type === "json_schema" ? "required" : undefined,
@@ -1293,6 +1704,7 @@ const layer = Layer.effect(
             }
 
             const finished = handle.message.finish && !["tool-calls", "unknown"].includes(handle.message.finish)
+            if (result !== "compact") autoCompactionAttempts = 0
             if (finished && !handle.message.error) {
               // Surface any content-filter finish (e.g. Anthropic stop_reason:
               // refusal) as an error. These turns may have produced no visible
@@ -1335,6 +1747,12 @@ const layer = Layer.effect(
           continue
         }
 
+        // Stale file snapshots are collapsed unconditionally rather than only
+        // under pressure: a read the model has since invalidated is wrong, not
+        // merely expensive, and leaving it in context invites edits against
+        // content that no longer matches disk.
+        if (!flags.disableContextCompaction && (yield* config.get()).compaction?.auto !== false)
+          yield* Superseded.collapse({ sessionID, sessions, directory: ctx.directory }).pipe(Effect.ignore)
         yield* compaction.prune({ sessionID }).pipe(Effect.ignore, Effect.forkIn(scope))
         return yield* lastAssistant(sessionID)
       },
@@ -1344,6 +1762,176 @@ const layer = Layer.effect(
       input: LoopInput,
     ) {
       return yield* state.ensureRunning(input.sessionID, lastAssistant(input.sessionID), runLoop(input.sessionID))
+    })
+
+    const runNotification = Effect.fn("SessionPrompt.runNotification")(function* (
+      message: SessionV1.WithParts,
+      checkpoint: number,
+    ) {
+      if (!(yield* state.isCurrent(message.info.sessionID, checkpoint))) return
+      // After a turn-only interrupt the result stays in history without a turn, and the next prompt answers it.
+      if (yield* state.notificationTurnsPaused(message.info.sessionID)) return
+      const result = yield* state.ensureRunning(
+        message.info.sessionID,
+        lastAssistant(message.info.sessionID),
+        Effect.gen(function* () {
+          if (!(yield* state.isCurrent(message.info.sessionID, checkpoint))) return message
+          // Do not answer while a revert is staged: the turn would run on reverted history. The notification
+          // continuation waits for the revert to be committed or cleared, and then delivers again.
+          if (yield* revertStaged(message.info.sessionID)) return message
+          // Check again, because a turn-only interrupt can land after the first check and before this turn is queued.
+          if (yield* state.notificationTurnsPaused(message.info.sessionID)) return message
+          return yield* runLoop(message.info.sessionID)
+        }),
+      )
+      if (!(yield* state.isCurrent(message.info.sessionID, checkpoint))) return
+      return result
+    })
+
+    const revertStaged = (sessionID: SessionID) =>
+      sessions.get(sessionID).pipe(
+        Effect.orDie,
+        Effect.map((session) => session.revert !== undefined),
+      )
+
+    const messageExists = (sessionID: SessionID, messageID: MessageID) =>
+      MessageV2.get({ sessionID, messageID }).pipe(
+        Effect.provideService(Database.Service, database),
+        Effect.as(true),
+        Effect.catchTag("NotFoundError", () => Effect.succeed(false)),
+      )
+
+    // Waits while a revert of the Session is in progress or staged and the checkpoint is current. Returns undefined when
+    // it did not wait, and otherwise the message where the last staged revert that it saw starts.
+    const awaitRevertEnd = Effect.fnUntraced(function* (
+      sessionID: SessionID,
+      checkpoint: number,
+      waited?: { readonly point?: MessageID },
+    ): Effect.fn.Return<{ readonly point?: MessageID } | undefined> {
+      const reverting = yield* state.awaitRevert(sessionID, revertStaged(sessionID))
+      if (Option.isNone(reverting)) return waited
+      // Read after the wait is registered, so a revert change or cancel after these reads ends the wait. A cancel or
+      // delete makes the checkpoint stale, and the caller then drops the result.
+      if (!(yield* state.isCurrent(sessionID, checkpoint))) return waited ?? {}
+      const point = (yield* sessions.get(sessionID).pipe(Effect.orDie)).revert?.messageID
+      yield* reverting.value
+      return yield* awaitRevertEnd(sessionID, checkpoint, { point: point ?? waited?.point })
+    })
+
+    const admitNotification: Interface["admitNotification"] = Effect.fn("SessionPrompt.admitNotification")(function* (
+      input: PromptInput,
+      checkpoint: number,
+      source?: NotificationSource,
+    ) {
+      if (!(yield* state.isCurrent(input.sessionID, checkpoint))) return Option.none()
+      return yield* admitPrepared(input, checkpoint, yield* prepareUserMessage(input), source)
+    })
+
+    const admitPrepared = Effect.fn("SessionPrompt.admitPrepared")(function* (
+      input: PromptInput,
+      checkpoint: number,
+      prepared: SessionV1.WithParts & { info: SessionV1.User },
+      source: NotificationSource | undefined,
+    ): Effect.fn.Return<Option.Option<NotificationContinuation>> {
+      const admitted = yield* state.admitIfCurrent(
+        input.sessionID,
+        checkpoint,
+        Effect.gen(function* () {
+          // A revert in progress or staged would remove this notification with the reverted messages.
+          const held = yield* state.awaitRevert(input.sessionID, revertStaged(input.sessionID))
+          if (Option.isSome(held)) return { held: held.value }
+          const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
+          // The prepared message can be older than messages admitted meanwhile, such as the prompt that committed
+          // a revert while it was held. Give it new IDs then, so it follows them.
+          const newest = (yield* sessions.messages({ sessionID: input.sessionID, limit: 1 }).pipe(Effect.orDie)).at(0)
+          const renewed = newest !== undefined && newest.info.id > prepared.info.id
+          const id = renewed ? MessageID.ascending() : prepared.info.id
+          // Task tools build the notification input when the task starts.
+          // persistPrompt switches the session to the message's agent and model,
+          // so use the session's current values. Read them inside the admission,
+          // so a prompt admitted while this notification was prepared is not reverted.
+          return yield* persistPrompt(
+            {
+              info: {
+                ...prepared.info,
+                id,
+                time: renewed ? { ...prepared.info.time, created: Date.now() } : prepared.info.time,
+                agent: session.agent ?? prepared.info.agent,
+                model: session.model
+                  ? {
+                      providerID: session.model.providerID,
+                      modelID: session.model.id,
+                      variant: session.model.variant === "default" ? undefined : session.model.variant,
+                    }
+                  : prepared.info.model,
+              },
+              parts: renewed
+                ? prepared.parts.map((part) => ({ ...part, id: PartID.ascending(), messageID: id }))
+                : prepared.parts,
+            },
+            input,
+          )
+        }),
+      )
+      if (Option.isNone(admitted)) return Option.none()
+      const message = admitted.value
+      // Hold the result until the revert is committed or cleared, then admit the same prepared message.
+      // The caller keeps its lease while this waits.
+      if ("held" in message)
+        return Option.some(message.held.pipe(Effect.andThen(admitAgain(input, checkpoint, prepared, source))))
+      if (input.noReply === true) return Option.some(Effect.succeed(undefined))
+      return Option.some(deliverNotification(input, checkpoint, prepared, source, message))
+    })
+
+    // Admits a result again after a revert changed. Drops it when the revert removed the message that started the Task.
+    const admitAgain = Effect.fnUntraced(function* (
+      input: PromptInput,
+      checkpoint: number,
+      prepared: SessionV1.WithParts & { info: SessionV1.User },
+      source: NotificationSource | undefined,
+    ): Effect.fn.Return<SessionV1.WithParts | undefined, Image.Error> {
+      if (source && !(yield* messageExists(source.sessionID, source.messageID))) return
+      const continuation = yield* admitPrepared(input, checkpoint, prepared, source)
+      if (Option.isNone(continuation)) return
+      return yield* continuation.value
+    })
+
+    // Runs the turn of an admitted notification. When a revert stops the turn or covers the notification, wait until
+    // the revert changes. Admit the prepared message again when the revert removed the notification, and run the turn
+    // again when the notification still exists. The caller keeps its lease until this returns.
+    const deliverNotification = Effect.fn("SessionPrompt.deliverNotification")(function* (
+      input: PromptInput,
+      checkpoint: number,
+      prepared: SessionV1.WithParts & { info: SessionV1.User },
+      source: NotificationSource | undefined,
+      message: SessionV1.WithParts,
+    ): Effect.fn.Return<SessionV1.WithParts | undefined, Image.Error> {
+      const result = yield* runNotification(message, checkpoint)
+      if (!result) return
+      const waited = yield* awaitRevertEnd(input.sessionID, checkpoint)
+      if (waited) {
+        if (yield* messageExists(message.info.sessionID, message.info.id))
+          return yield* deliverNotification(input, checkpoint, prepared, source, message)
+        // A revert that starts at the notification itself, such as undo of its turn, drops the result, as it does
+        // after the turn finished.
+        if (waited.point === message.info.id) return
+        return yield* admitAgain(input, checkpoint, prepared, source)
+      }
+      if (result.info.role === "assistant" && result.info.parentID === message.info.id) return result
+      const latest = MessageV2.latest(
+        yield* MessageV2.filterCompactedEffect(input.sessionID).pipe(Effect.provideService(Database.Service, database)),
+      )
+      if (latest.user?.id !== message.info.id) return
+      return yield* runNotification(message, checkpoint)
+    })
+
+    const notify: Interface["notify"] = Effect.fn("SessionPrompt.notify")(function* (
+      input: PromptInput,
+      checkpoint: number,
+    ) {
+      const continuation = yield* admitNotification(input, checkpoint)
+      if (Option.isNone(continuation)) return
+      return yield* continuation.value
     })
 
     const shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError> = Effect.fn(
@@ -1446,6 +2034,7 @@ const layer = Layer.effect(
               command: input.command,
               model: { providerID: taskModel.providerID, modelID: taskModel.modelID },
               prompt: templateParts.find((y) => y.type === "text")?.text ?? "",
+              background: true,
             },
           ]
         : [...uniqueTemplateParts, ...(input.parts ?? [])]
@@ -1482,7 +2071,11 @@ const layer = Layer.effect(
 
     return Service.of({
       cancel,
+      checkpoint: state.checkpoint,
+      ask: asks.ask,
       prompt,
+      admitNotification,
+      notify,
       loop,
       shell,
       command,
@@ -1495,6 +2088,12 @@ const ModelRef = Schema.Struct({
   providerID: ProviderV2.ID,
   modelID: ModelV2.ID,
 })
+
+export const AskInput = SessionAsk.AskInput
+export type AskInput = SessionAsk.AskInput
+
+export const AskOutput = SessionAsk.AskOutput
+export type AskOutput = SessionAsk.AskOutput
 
 export const PromptInput = Schema.Struct({
   sessionID: SessionID,
@@ -1625,6 +2224,7 @@ export const node = LayerNode.make({
     EventV2Bridge.node,
     RuntimeFlags.node,
     Database.node,
+    SessionAsk.node,
   ],
 })
 

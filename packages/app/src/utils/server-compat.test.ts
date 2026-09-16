@@ -1,10 +1,14 @@
 import { describe, expect, test } from "bun:test"
+import type { PermissionRequest, Session } from "@opencode-ai/sdk/v2/client"
+import { autoRespondsPermission } from "@/context/permission-auto-respond"
+import { sessionPermissionRequest } from "@/pages/session/composer/session-request-tree"
 import { createApiForServer, createSdkForServer } from "./server"
 import { createCompatibleApi } from "./server-compat"
+import { normalizeSessionInfo } from "./session"
 
 function setup(
   protocol: "v1" | "v2" | Promise<"v1" | "v2">,
-  responses?: { vcs?: { branch: string; default_branch: string } },
+  responses?: { vcs?: { branch: string; default_branch: string }; sessions?: Session[] },
 ) {
   const requests: Request[] = []
   const fetcher = Object.assign(
@@ -24,6 +28,8 @@ function setup(
       }
       if (request.method === "POST" && request.url.endsWith("/prompt_async"))
         return new Response(undefined, { status: 204 })
+      if (request.method === "POST" && request.url.endsWith("/revert/stage"))
+        return Response.json({ data: { messageID: "msg_1" } })
       if (request.method === "POST" && request.url.endsWith("/prompt")) {
         return Response.json({
           admittedSeq: 1,
@@ -37,6 +43,8 @@ function setup(
       }
       if (request.method === "GET" && new URL(request.url).pathname === "/vcs")
         return Response.json(responses?.vcs ?? {})
+      const session = responses?.sessions?.find((item) => new URL(request.url).pathname === `/session/${item.id}`)
+      if (request.method === "GET" && session) return Response.json(session)
       if (request.method === "GET") return Response.json([])
       return new Response(undefined, { status: 204 })
     },
@@ -129,6 +137,39 @@ describe("createCompatibleApi", () => {
     ])
   })
 
+  test("reverts V1 sessions without aborting background tasks", async () => {
+    const { api, requests } = setup("v1")
+    await api.session.revert.stage({ sessionID: "ses_1", messageID: "msg_1" })
+    await api.session.revert.clear({ sessionID: "ses_1" })
+
+    expect(requests.map((request) => new URL(request.url).pathname)).toEqual([
+      "/session/ses_1/revert",
+      "/session/ses_1/unrevert",
+    ])
+  })
+
+  test("passes the V1 abort scope, so a turn interrupt keeps background tasks", async () => {
+    const { api, requests } = setup("v1")
+    await api.session.interrupt({ sessionID: "ses_1", scope: "turn" })
+
+    const url = new URL(requests[0]!.url)
+    expect(url.pathname).toBe("/session/ses_1/abort")
+    expect(url.searchParams.get("scope")).toBe("turn")
+  })
+
+  test("interrupts V2 sessions before a revert changes their history", async () => {
+    const { api, requests } = setup("v2")
+    await api.session.revert.stage({ sessionID: "ses_1", messageID: "msg_1" })
+    await api.session.revert.clear({ sessionID: "ses_1" })
+
+    expect(requests.map((request) => new URL(request.url).pathname)).toEqual([
+      "/api/session/ses_1/interrupt",
+      "/api/session/ses_1/revert/stage",
+      "/api/session/ses_1/interrupt",
+      "/api/session/ses_1/revert/clear",
+    ])
+  })
+
   test("resolves protocol detection once across implementation methods", async () => {
     let detections = 0
     const resolved = Promise.resolve<"v1" | "v2">("v2")
@@ -162,6 +203,23 @@ describe("createCompatibleApi", () => {
     await api.session.list({ parentID: null, search: "session", limit: 50 })
 
     expect(new URL(requests[0]!.url).pathname).toBe("/experimental/session")
+  })
+
+  test("keeps V1 Task ownership so fetched child requests still route", async () => {
+    const base = { projectID: "project", directory: "/repo", version: "1", time: { created: 1, updated: 1 } }
+    const { api } = setup("v1", {
+      sessions: [
+        { ...base, id: "ses_root", slug: "ses_root", title: "Root" },
+        { ...base, id: "ses_child", slug: "ses_child", title: "Child", parentID: "ses_root", taskParentID: "ses_root" },
+      ],
+    })
+    const sessions = await Promise.all(
+      ["ses_root", "ses_child"].map((sessionID) => api.session.get({ sessionID }).then(normalizeSessionInfo)),
+    )
+    const request = { id: "per_child", sessionID: "ses_child" } as PermissionRequest
+
+    expect(sessionPermissionRequest(sessions, { ses_child: [request] }, "ses_root")).toBe(request)
+    expect(autoRespondsPermission({ ses_root: true }, sessions, request, "/repo")).toBe(true)
   })
 
   /*

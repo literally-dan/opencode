@@ -71,17 +71,24 @@ const layer = Layer.effect(
 
       for (const pattern of request.patterns) {
         const rule = evaluate(request.permission, pattern, ruleset, approved)
-        yield* Effect.logInfo("evaluated", { permission: request.permission, pattern, action: rule })
         if (rule.action === "deny") {
+          yield* Effect.logInfo("denied", { permission: request.permission, pattern, rule })
           return yield* new PermissionV1.DeniedError({
             ruleset: ruleset.filter((rule) => Wildcard.match(request.permission, rule.permission)),
           })
         }
+        yield* Effect.logDebug("evaluated", { permission: request.permission, pattern, rule })
         if (rule.action === "allow") continue
         needsAsk = true
       }
 
-      if (!needsAsk) return
+      // Per-pattern evaluations are Debug because arity expansion emits several
+      // per command, but the outcome stays at Info: "why was this allowed to
+      // run" has to be answerable from a default log bundle.
+      if (!needsAsk) {
+        yield* Effect.logInfo("allowed", { permission: request.permission, patterns: request.patterns })
+        return
+      }
 
       const id = request.id ?? PermissionV1.ID.ascending()
       const info: PermissionV1.Request = {
@@ -96,13 +103,22 @@ const layer = Layer.effect(
       yield* Effect.logInfo("asking", { id, permission: info.permission, patterns: info.patterns })
 
       const deferred = yield* Deferred.make<void, PermissionV1.RejectedError | PermissionV1.CorrectedError>()
-      pending.set(id, { info, deferred })
-      yield* events.publish(Event.Asked, info)
-      return yield* Effect.ensuring(
-        Deferred.await(deferred),
-        Effect.sync(() => {
-          pending.delete(id)
-        }),
+      const entry = { info, deferred }
+      return yield* Effect.acquireUseRelease(
+        Effect.sync(() => pending.set(id, entry)),
+        () => events.publish(Event.Asked, info).pipe(Effect.andThen(Deferred.await(deferred))),
+        () =>
+          Effect.gen(function* () {
+            if (pending.get(id) !== entry) return
+            pending.delete(id)
+            yield* events
+              .publish(Event.Replied, {
+                sessionID: info.sessionID,
+                requestID: id,
+                reply: "reject",
+              })
+              .pipe(Effect.catchCause(() => Effect.void))
+          }),
       )
     })
 
@@ -119,6 +135,7 @@ const layer = Layer.effect(
       })
 
       if (input.reply === "reject") {
+        const rejectedAskRequestID = askRequestID(existing.info)
         yield* Deferred.fail(
           existing.deferred,
           input.message
@@ -128,6 +145,7 @@ const layer = Layer.effect(
 
         for (const [id, item] of pending.entries()) {
           if (item.info.sessionID !== existing.info.sessionID) continue
+          if (askRequestID(item.info) !== rejectedAskRequestID) continue
           pending.delete(id)
           yield* events.publish(Event.Replied, {
             sessionID: item.info.sessionID,
@@ -174,6 +192,12 @@ const layer = Layer.effect(
     return Service.of({ ask, reply, list })
   }),
 )
+
+function askRequestID(request: PermissionV1.Request): string | undefined {
+  const ask = request.metadata.ask
+  if (typeof ask !== "object" || ask === null || !("requestID" in ask)) return undefined
+  return typeof ask.requestID === "string" ? ask.requestID : undefined
+}
 
 function expand(pattern: string): string {
   if (pattern.startsWith("~/")) return os.homedir() + pattern.slice(1)

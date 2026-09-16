@@ -46,6 +46,7 @@ import { playSoundById } from "@/utils/sound"
 import { createAim } from "@/utils/aim"
 import { Worktree as WorktreeState } from "@/utils/worktree"
 import { setSessionHandoff } from "@/pages/session/handoff"
+import { sessionRequestTree } from "@/pages/session/composer/session-request-tree"
 import { SessionRouteKey, SessionStateKey } from "@/utils/server-scope"
 import { listAllSessions } from "@/utils/session"
 
@@ -457,8 +458,12 @@ export default function LegacyLayout(props: ParentProps) {
         }
 
         const currentSession = params.id
-        if (pathKey(directory) === pathKey(currentDir()) && props.sessionID === currentSession) return
-        if (pathKey(directory) === pathKey(currentDir()) && session?.parentID === currentSession) return
+        if (
+          currentSession &&
+          pathKey(directory) === pathKey(currentDir()) &&
+          sessionRequestTree(store.session, currentSession).includes(props.sessionID)
+        )
+          return
 
         dismissSessionAlert(sessionKey)
 
@@ -485,12 +490,9 @@ export default function LegacyLayout(props: ParentProps) {
       createEffect(() => {
         const currentSession = params.id
         if (!currentDir() || !currentSession) return
-        const sessionKey = `${currentDir()}:${currentSession}`
-        dismissSessionAlert(sessionKey)
         const [store] = serverSync().child(currentDir(), { bootstrap: false })
-        const childSessions = store.session.filter((s) => s.parentID === currentSession)
-        for (const child of childSessions) {
-          dismissSessionAlert(`${currentDir()}:${child.id}`)
+        for (const sessionID of sessionRequestTree(store.session, currentSession)) {
+          dismissSessionAlert(`${currentDir()}:${sessionID}`)
         }
       })
     })

@@ -146,6 +146,30 @@ export default {
         );
       `)
       yield* tx.run(`
+        CREATE TABLE \`session_ask_thread\` (
+          \`id\` text PRIMARY KEY,
+          \`session_id\` text NOT NULL,
+          \`title\` text NOT NULL,
+          \`created_at\` integer NOT NULL,
+          \`updated_at\` integer NOT NULL,
+          CONSTRAINT \`fk_session_ask_thread_session_id_session_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session\`(\`id\`) ON DELETE CASCADE,
+          CONSTRAINT "session_ask_thread_title_length_check" CHECK(length("title") <= 256)
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`session_ask_turn\` (
+          \`id\` text PRIMARY KEY,
+          \`thread_id\` text NOT NULL,
+          \`question\` text NOT NULL,
+          \`answer\` text NOT NULL,
+          \`tool_activity\` text NOT NULL,
+          \`created_at\` integer NOT NULL,
+          CONSTRAINT \`fk_session_ask_turn_thread_id_session_ask_thread_id_fk\` FOREIGN KEY (\`thread_id\`) REFERENCES \`session_ask_thread\`(\`id\`) ON DELETE CASCADE,
+          CONSTRAINT "session_ask_turn_tool_activity_json_check" CHECK(json_valid("tool_activity") AND json_type("tool_activity") = 'array'),
+          CONSTRAINT "session_ask_turn_tool_activity_size_check" CHECK(length(cast("tool_activity" as blob)) <= 1048576)
+        );
+      `)
+      yield* tx.run(`
         CREATE TABLE \`session_context_epoch\` (
           \`session_id\` text PRIMARY KEY,
           \`baseline\` text NOT NULL,
@@ -184,6 +208,7 @@ export default {
           \`project_id\` text NOT NULL,
           \`workspace_id\` text,
           \`parent_id\` text,
+          \`task_parent_id\` text,
           \`slug\` text NOT NULL,
           \`directory\` text NOT NULL,
           \`path\` text,
@@ -247,6 +272,12 @@ export default {
       yield* tx.run(`CREATE INDEX \`part_message_id_id_idx\` ON \`part\` (\`message_id\`,\`id\`);`)
       yield* tx.run(`CREATE INDEX \`part_session_idx\` ON \`part\` (\`session_id\`);`)
       yield* tx.run(
+        `CREATE INDEX \`session_ask_thread_session_updated_id_idx\` ON \`session_ask_thread\` (\`session_id\`,\`updated_at\`,\`id\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`session_ask_turn_thread_id_id_idx\` ON \`session_ask_turn\` (\`thread_id\`,\`id\`);`,
+      )
+      yield* tx.run(
         `CREATE INDEX \`session_input_session_pending_delivery_seq_idx\` ON \`session_input\` (\`session_id\`,\`promoted_seq\`,\`delivery\`,\`admitted_seq\`);`,
       )
       yield* tx.run(
@@ -265,9 +296,11 @@ export default {
         `CREATE INDEX \`session_message_session_time_created_id_idx\` ON \`session_message\` (\`session_id\`,\`time_created\`,\`id\`);`,
       )
       yield* tx.run(`CREATE INDEX \`session_message_time_created_idx\` ON \`session_message\` (\`time_created\`);`)
-      yield* tx.run(`CREATE INDEX \`session_project_idx\` ON \`session\` (\`project_id\`);`)
+      yield* tx.run(`CREATE INDEX \`session_project_idx\` ON \`session\` (\`project_id\`,\`time_updated\`);`)
       yield* tx.run(`CREATE INDEX \`session_workspace_idx\` ON \`session\` (\`workspace_id\`);`)
-      yield* tx.run(`CREATE INDEX \`session_parent_idx\` ON \`session\` (\`parent_id\`);`)
+      yield* tx.run(`CREATE INDEX \`session_parent_idx\` ON \`session\` (\`parent_id\`,\`time_updated\`,\`id\`);`)
+      yield* tx.run(`CREATE INDEX \`session_task_parent_idx\` ON \`session\` (\`task_parent_id\`);`)
+      yield* tx.run(`CREATE INDEX \`session_time_updated_idx\` ON \`session\` (\`time_updated\`,\`id\`);`)
       yield* tx.run(`CREATE INDEX \`todo_session_idx\` ON \`todo\` (\`session_id\`);`)
     })
   },
