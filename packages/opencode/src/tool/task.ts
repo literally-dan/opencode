@@ -24,6 +24,7 @@ export interface TaskPromptOps {
   admitNotification(
     input: SessionPrompt.PromptInput,
     checkpoint: number,
+    source?: SessionPrompt.NotificationSource,
   ): Effect.Effect<Option.Option<SessionPrompt.NotificationContinuation>>
   notify(input: SessionPrompt.PromptInput, checkpoint: number): Effect.Effect<SessionV1.WithParts | void>
 }
@@ -258,6 +259,7 @@ export const TaskTool = Tool.define(
         parentSessionId: ctx.sessionID,
         sessionId: nextSession.id,
         ancestorSessionIds: ancestors.map((item) => item.id),
+        messageId: ctx.messageID,
         model,
         background: true,
       }
@@ -267,6 +269,8 @@ export const TaskTool = Tool.define(
         metadata,
       })
 
+      // A result held during a revert is dropped when the revert removes this message.
+      const source = { sessionID: ctx.sessionID, messageID: ctx.messageID }
       const notificationTargets: Array<{
         session: (typeof ancestors)[number]
         checkpoint: number
@@ -372,7 +376,11 @@ export const TaskTool = Tool.define(
         admitted: Deferred.Deferred<void>,
       ) {
         if (!(yield* validRoute())) return text
-        const continuation = yield* ops.admitNotification(notificationInput(target, state, text), target.checkpoint)
+        const continuation = yield* ops.admitNotification(
+          notificationInput(target, state, text),
+          target.checkpoint,
+          source,
+        )
         if (Option.isNone(continuation)) return text
         yield* Deferred.succeed(admitted, undefined)
         const result = yield* continuation.value
@@ -408,7 +416,7 @@ export const TaskTool = Tool.define(
           return
         }
         if (!(yield* validRoute())) return yield* releaseTargets
-        const continuation = yield* ops.admitNotification(notificationInput(root, state, text), root.checkpoint)
+        const continuation = yield* ops.admitNotification(notificationInput(root, state, text), root.checkpoint, source)
         // The root keeps a lease until its continuation settles, so it stays busy and its checkpoint stays current.
         if (Option.isSome(continuation))
           yield* ops.retain(root.session.id, root.checkpoint).pipe(

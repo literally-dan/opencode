@@ -346,10 +346,6 @@ export const useSessionCommands = (actions: SessionCommandContext) => {
     if (!message) return
     const parts = sync().data.part[message.id]
 
-    if (sync().data.session_working(sessionID)) {
-      await session.interrupt({ sessionID }).catch(() => {})
-    }
-
     await runCommand({
       owner,
       prompt: promptSession,

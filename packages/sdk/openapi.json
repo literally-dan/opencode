@@ -6390,6 +6390,16 @@
               "type": "string"
             },
             "required": false
+          },
+          {
+            "name": "scope",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": ["turn", "all"],
+              "description": "turn stops only the running turn, and background tasks keep running. all (the default) also cancels background tasks."
+            },
+            "required": false
           }
         ],
         "responses": {
@@ -7958,7 +7968,7 @@
             }
           }
         },
-        "description": "Revert a specific message in a session, undoing its effects and restoring the previous state.",
+        "description": "Revert a specific message in a session, undoing its effects and restoring the previous state. Revert stops a running turn of the session itself, so clients do not need to abort first. Background tasks that the reverted messages started or resumed are cancelled, and other background tasks keep running. Returns 409 while another revert or unrevert of the session is in progress.",
         "summary": "Revert message",
         "requestBody": {
           "content": {
@@ -8062,7 +8072,7 @@
             }
           }
         },
-        "description": "Restore all previously reverted messages in a session.",
+        "description": "Restore all previously reverted messages in a session. Unrevert stops a running turn of the session itself, and background tasks keep running. Returns 409 while another revert or unrevert of the session is in progress.",
         "summary": "Restore reverted messages",
         "x-codeSamples": [
           {

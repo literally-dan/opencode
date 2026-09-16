@@ -17,6 +17,11 @@ type Checkpoint = {
 
 type Lifecycle = {
   removing: Set<SessionID>
+  // Sessions whose turn a revert stopped. No turn starts for them until the revert finishes.
+  stopped: Set<SessionID>
+  // Sessions whose turn a turn-only interrupt stopped. Background Task results do not start turns for them until the
+  // next prompt, a cancel, or a revert stop.
+  paused: Set<SessionID>
 }
 
 type State = {
@@ -25,6 +30,8 @@ type State = {
   checkpoints: SynchronizedRef.SynchronizedRef<Map<SessionID, Checkpoint>>
   lifecycle: SynchronizedRef.SynchronizedRef<Lifecycle>
   generation: number
+  // Waits of Sessions with a revert in progress or staged. A revert change completes and removes the wait.
+  revertChanges: Map<SessionID, Deferred.Deferred<void>>
 }
 
 export type Admission = {
@@ -35,6 +42,48 @@ export type Admission = {
 export interface Interface {
   readonly assertNotBusy: (sessionID: SessionID) => Effect.Effect<void, Session.BusyError>
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
+  /**
+   * Stops the running turn of a Session and the turns queued behind it, like `cancel`. Unlike `cancel`, background
+   * Tasks keep running, and the checkpoint and leases they deliver with stay current. Prompts sent while the turn
+   * stops are queued and run after it.
+   * Background Task results of the Session then do not start turns until `resumeNotificationTurns`, `cancel`, or
+   * `stopTurn`, so the model does not answer them right after the user stopped it.
+   */
+  readonly interruptTurn: (sessionID: SessionID) => Effect.Effect<void>
+  /** Returns whether a turn-only interrupt keeps background Task results of the Session from starting turns. */
+  readonly notificationTurnsPaused: (sessionID: SessionID) => Effect.Effect<boolean>
+  /** Lets background Task results start turns of the Session again. Call it before a prompt starts its turn. */
+  readonly resumeNotificationTurns: (sessionID: SessionID) => Effect.Effect<void>
+  /**
+   * Stops the running turn of a Session, and keeps other turns of the Session from starting until the scope closes.
+   * Unlike `cancel`, background Tasks keep running, and the checkpoint and leases they deliver with stay current.
+   * Fails with BusyError while another stop of the Session is open, because two reverts cannot restore one snapshot.
+   * Only revert and unrevert use it. Other turn stops use `interruptTurn`, so later prompts are not blocked.
+   */
+  readonly stopTurn: (sessionID: SessionID) => Effect.Effect<void, Session.BusyError, Scope.Scope>
+  /**
+   * Returns a wait that ends at the next revert change of the Session when a revert of the Session is in progress
+   * or `staged` reports a staged revert, and none otherwise. Both are read again after the wait is registered, so a
+   * revert that finishes meanwhile cannot leave the wait open. A cancel or removal of the Session ends its waits, and
+   * instance disposal ends every wait.
+   */
+  readonly awaitRevert: <E, R>(
+    sessionID: SessionID,
+    staged: Effect.Effect<boolean, E, R>,
+  ) => Effect.Effect<Option.Option<Effect.Effect<void>>, E, R>
+  /** Ends the revert waits of a Session. Call it after a staged revert is committed or cleared. */
+  readonly revertChanged: (sessionID: SessionID) => Effect.Effect<void>
+  /**
+   * Cancels the background Tasks that the given messages of a Session started or resumed, and their descendants.
+   * `taskIDs` names the Tasks that task calls in the messages started or resumed, because a job records only the
+   * message that started it.
+   * Their results are discarded, not delivered.
+   */
+  readonly cancelTasks: (
+    sessionID: SessionID,
+    messageIDs: ReadonlySet<string>,
+    taskIDs?: ReadonlySet<string>,
+  ) => Effect.Effect<void>
   readonly checkpoint: (sessionID: SessionID) => Effect.Effect<number>
   readonly isCurrent: (sessionID: SessionID, checkpoint: number) => Effect.Effect<boolean>
   readonly retain: (sessionID: SessionID, checkpoint: number) => Effect.Effect<Option.Option<Effect.Effect<void>>>
@@ -74,9 +123,19 @@ const layer = Layer.effect(
         const scope = yield* Scope.Scope
         const runners = new Map<SessionID, Runner.Runner<SessionV1.WithParts>>()
         const checkpoints = yield* SynchronizedRef.make(new Map<SessionID, Checkpoint>())
-        const lifecycle = yield* SynchronizedRef.make<Lifecycle>({ removing: new Set() })
+        const lifecycle = yield* SynchronizedRef.make<Lifecycle>({
+          removing: new Set(),
+          stopped: new Set(),
+          paused: new Set(),
+        })
+        const revertChanges = new Map<SessionID, Deferred.Deferred<void>>()
         yield* Effect.addFinalizer(
           Effect.fnUntraced(function* () {
+            // End revert waits first, so work that waits on this instance ends even when a runner does not stop.
+            yield* Effect.forEach(revertChanges.values(), (change) => Deferred.succeed(change, undefined), {
+              discard: true,
+            })
+            revertChanges.clear()
             yield* Effect.forEach(runners.values(), (runner) => runner.cancel, {
               concurrency: "unbounded",
               discard: true,
@@ -84,7 +143,7 @@ const layer = Layer.effect(
             runners.clear()
           }),
         )
-        return { runners, scope, checkpoints, lifecycle, generation: 0 }
+        return { runners, scope, checkpoints, lifecycle, generation: 0, revertChanges }
       }),
     )
 
@@ -171,9 +230,11 @@ const layer = Layer.effect(
                 next.delete(sessionID)
                 return next
               })
-              return [undefined, admission] as const
+              return [undefined, resume(admission, sessionID)] as const
             }),
           )
+          // Task results held for a revert see the stale checkpoint when they wake, and drop.
+          yield* publishRevertChange(data, sessionID)
           yield* cancelBackgroundJobs(background, sessionID)
           const cancellation = yield* SynchronizedRef.modifyEffect(
             data.lifecycle,
@@ -187,6 +248,107 @@ const layer = Layer.effect(
           if (Option.isSome(cancellation)) yield* cancellation.value
         }),
       )
+    })
+
+    const interruptTurn = Effect.fn("SessionRunState.interruptTurn")(function* (sessionID: SessionID) {
+      return yield* InstanceState.useEffect(
+        state,
+        Effect.fnUntraced(function* (data) {
+          const cancellation = yield* SynchronizedRef.modifyEffect(
+            data.lifecycle,
+            Effect.fnUntraced(function* (admission) {
+              const paused = { ...admission, paused: new Set(admission.paused).add(sessionID) }
+              const existing = data.runners.get(sessionID)
+              if (existing) return [Option.some(yield* existing.enqueueCancel), paused] as const
+              return [Option.none(), paused] as const
+            }),
+          )
+          // Only the enqueued cancellation moves the runner out of Cancelling, so it must finish when the caller
+          // is interrupted.
+          if (Option.isSome(cancellation)) yield* Effect.uninterruptible(cancellation.value)
+        }),
+      )
+    })
+
+    const notificationTurnsPaused = Effect.fn("SessionRunState.notificationTurnsPaused")(function* (
+      sessionID: SessionID,
+    ) {
+      return yield* InstanceState.useEffect(state, (data) =>
+        SynchronizedRef.get(data.lifecycle).pipe(Effect.map((admission) => admission.paused.has(sessionID))),
+      )
+    })
+
+    const resumeNotificationTurns = Effect.fn("SessionRunState.resumeNotificationTurns")(function* (
+      sessionID: SessionID,
+    ) {
+      return yield* InstanceState.useEffect(state, (data) =>
+        SynchronizedRef.update(data.lifecycle, (admission) => resume(admission, sessionID)),
+      )
+    })
+
+    const stopTurn = Effect.fn("SessionRunState.stopTurn")(function* (sessionID: SessionID) {
+      return yield* InstanceState.useEffect(
+        state,
+        Effect.fnUntraced(function* (data) {
+          const cancellation = yield* Effect.acquireRelease(
+            SynchronizedRef.modifyEffect(
+              data.lifecycle,
+              Effect.fnUntraced(function* (admission) {
+                if (admission.stopped.has(sessionID)) return [Option.none(), admission] as const
+                const existing = data.runners.get(sessionID)
+                const stopped = new Set(admission.stopped).add(sessionID)
+                return [
+                  Option.some(existing ? yield* existing.enqueueCancel : Effect.void),
+                  { ...resume(admission, sessionID), stopped },
+                ] as const
+              }),
+            ).pipe(
+              // Start the runner cancellation in the acquire step and run it in its own fiber, so a revert that
+              // is interrupted while a turn does not stop closes its stop without leaving the runner half cancelled.
+              Effect.flatMap((cancel) =>
+                Option.isNone(cancel)
+                  ? Effect.succeed(Option.none())
+                  : cancel.value.pipe(
+                      Effect.uninterruptible,
+                      Effect.forkIn(data.scope, { startImmediately: true }),
+                      Effect.map(Option.some),
+                    ),
+              ),
+            ),
+            (cancellation) =>
+              Option.isNone(cancellation)
+                ? Effect.void
+                : SynchronizedRef.update(data.lifecycle, (admission) => {
+                    const stopped = new Set(admission.stopped)
+                    stopped.delete(sessionID)
+                    return { ...admission, stopped }
+                  }).pipe(Effect.andThen(publishRevertChange(data, sessionID))),
+          )
+          if (Option.isNone(cancellation)) return yield* busyError(sessionID)
+          // The runner publishes idle when it stops and no background Task lease is held.
+          yield* Fiber.join(cancellation.value)
+        }),
+      )
+    })
+
+    const awaitRevert: Interface["awaitRevert"] = (sessionID, staged) =>
+      InstanceState.useEffect(
+        state,
+        Effect.fnUntraced(function* (data) {
+          const reverting = staged.pipe(
+            Effect.map((value) => value || SynchronizedRef.getUnsafe(data.lifecycle).stopped.has(sessionID)),
+          )
+          if (!(yield* reverting)) return Option.none()
+          const change = data.revertChanges.get(sessionID) ?? Deferred.makeUnsafe<void>()
+          data.revertChanges.set(sessionID, change)
+          // A revert that finished before the registration did not complete this wait, so read again.
+          if (!(yield* reverting)) return Option.none()
+          return Option.some(Deferred.await(change))
+        }),
+      )
+
+    const revertChanged = Effect.fn("SessionRunState.revertChanged")(function* (sessionID: SessionID) {
+      return yield* InstanceState.useEffect(state, (data) => publishRevertChange(data, sessionID))
     })
 
     const markRemoving = Effect.fn("SessionRunState.markRemoving")(function* (sessionID: SessionID) {
@@ -203,7 +365,7 @@ const layer = Layer.effect(
             })
             const removing = new Set(admission.removing)
             removing.add(sessionID)
-            return [undefined, { removing }] as const
+            return [undefined, { ...admission, removing }] as const
           }),
         ),
       )
@@ -212,6 +374,14 @@ const layer = Layer.effect(
     const remove = Effect.fn("SessionRunState.remove")(function* (sessionID: SessionID) {
       yield* markRemoving(sessionID)
       yield* cancel(sessionID)
+    })
+
+    const cancelTasks = Effect.fn("SessionRunState.cancelTasks")(function* (
+      sessionID: SessionID,
+      messageIDs: ReadonlySet<string>,
+      taskIDs?: ReadonlySet<string>,
+    ) {
+      yield* cancelBackgroundJobs(background, sessionID, messageIDs, taskIDs)
     })
 
     const checkpoint = Effect.fn("SessionRunState.checkpoint")(function* (sessionID: SessionID) {
@@ -315,11 +485,17 @@ const layer = Layer.effect(
       onInterrupt: Effect.Effect<SessionV1.WithParts>,
       work: Effect.Effect<SessionV1.WithParts>,
     ) {
-      const admitted = yield* admit(
-        [{ sessionID }],
-        Effect.gen(function* () {
-          return yield* (yield* runner(sessionID, onInterrupt)).enqueueWake(work)
-        }),
+      const admitted = yield* InstanceState.useEffect(state, (data) =>
+        SynchronizedRef.modifyEffect(
+          data.lifecycle,
+          Effect.fnUntraced(function* (admission) {
+            if (admission.removing.has(sessionID)) return [Option.none(), admission] as const
+            // A stopped turn does not restart, for example from a queued task notification, until the revert finishes.
+            if (admission.stopped.has(sessionID)) return [Option.some(onInterrupt), admission] as const
+            const existing = yield* runner(sessionID, onInterrupt)
+            return [Option.some(yield* existing.enqueueWake(work)), admission] as const
+          }),
+        ),
       )
       if (Option.isNone(admitted)) return yield* removingError(sessionID)
       return yield* admitted.value
@@ -331,11 +507,17 @@ const layer = Layer.effect(
       work: Effect.Effect<SessionV1.WithParts>,
       ready?: Latch.Latch,
     ) {
-      const admitted = yield* admit(
-        [{ sessionID }],
-        Effect.gen(function* () {
-          return yield* (yield* runner(sessionID, onInterrupt)).enqueueShell(work, ready)
-        }),
+      const admitted = yield* InstanceState.useEffect(state, (data) =>
+        SynchronizedRef.modifyEffect(
+          data.lifecycle,
+          Effect.fnUntraced(function* (admission) {
+            if (admission.removing.has(sessionID)) return [Option.none(), admission] as const
+            if (admission.stopped.has(sessionID))
+              return [Option.some(Effect.fail(new Runner.Busy())), admission] as const
+            const existing = yield* runner(sessionID, onInterrupt)
+            return [Option.some(yield* existing.enqueueShell(work, ready)), admission] as const
+          }),
+        ),
       )
       if (Option.isNone(admitted)) return yield* removingError(sessionID)
       return yield* admitted.value.pipe(Effect.catchTag("RunnerBusy", () => Effect.fail(busyError(sessionID))))
@@ -351,6 +533,13 @@ const layer = Layer.effect(
     return Service.of({
       assertNotBusy,
       cancel,
+      interruptTurn,
+      notificationTurnsPaused,
+      resumeNotificationTurns,
+      stopTurn,
+      awaitRevert,
+      revertChanged,
+      cancelTasks,
       checkpoint,
       isCurrent,
       retain,
@@ -365,19 +554,27 @@ const layer = Layer.effect(
 const cancelBackgroundJobs = Effect.fn("SessionRunState.cancelBackgroundJobs")(function* (
   background: BackgroundJob.Interface,
   sessionID: SessionID,
+  messageIDs?: ReadonlySet<string>,
+  taskIDs?: ReadonlySet<string>,
 ) {
   const jobs = yield* background.list()
-  const owned = new Set<string>([sessionID])
+  // Without message IDs the Session owns every job under it. With message IDs it owns
+  // only the jobs those messages started or resumed, and every job under them.
+  const owned = new Set<string>(messageIDs ? [] : [sessionID])
   const pending = jobs.slice()
 
   while (pending.length) {
     const index = pending.findIndex((job) => {
       const ancestors = job.metadata?.ancestorSessionIds
+      const messageID = job.metadata?.messageId
       return (
+        (messageIDs !== undefined &&
+          job.metadata?.parentSessionId === sessionID &&
+          ((typeof messageID === "string" && messageIDs.has(messageID)) || taskIDs?.has(job.id) === true)) ||
         owned.has(job.id) ||
         (typeof job.metadata?.sessionId === "string" && owned.has(job.metadata.sessionId)) ||
         (typeof job.metadata?.parentSessionId === "string" && owned.has(job.metadata.parentSessionId)) ||
-        (Array.isArray(ancestors) && ancestors.some((item) => typeof item === "string" && item === sessionID))
+        (Array.isArray(ancestors) && ancestors.some((item) => typeof item === "string" && owned.has(item)))
       )
     })
     if (index === -1) break
@@ -386,12 +583,33 @@ const cancelBackgroundJobs = Effect.fn("SessionRunState.cancelBackgroundJobs")(f
     if (typeof job.metadata?.sessionId === "string") owned.add(job.metadata.sessionId)
   }
 
-  yield* Effect.forEach(
-    jobs.filter((job) => job.status === "running" && owned.has(job.id)),
-    (job) => background.cancel(job.id),
-    { concurrency: "unbounded", discard: true },
-  )
+  const running = jobs.filter((job) => job.status === "running" && owned.has(job.id))
+  // A revert holds the results of the Tasks it keeps, so it must discard the results of the Tasks it cancels.
+  // Claim every completion delivery before any cancel, so a cancelled descendant cannot deliver either.
+  if (messageIDs)
+    yield* Effect.forEach(
+      running,
+      (job) => background.extend({ id: job.id, claimCompletion: true, run: Effect.interrupt }),
+      { discard: true },
+    )
+  yield* Effect.forEach(running, (job) => background.cancel(job.id), { concurrency: "unbounded", discard: true })
 })
+
+function resume(admission: Lifecycle, sessionID: SessionID): Lifecycle {
+  if (!admission.paused.has(sessionID)) return admission
+  const paused = new Set(admission.paused)
+  paused.delete(sessionID)
+  return { ...admission, paused }
+}
+
+function publishRevertChange(data: State, sessionID: SessionID) {
+  return Effect.suspend(() => {
+    const change = data.revertChanges.get(sessionID)
+    if (!change) return Effect.void
+    data.revertChanges.delete(sessionID)
+    return Deferred.succeed(change, undefined).pipe(Effect.asVoid)
+  })
+}
 
 function busyError(sessionID: SessionID) {
   return new Session.BusyError({ sessionID })

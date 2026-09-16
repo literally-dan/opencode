@@ -20,6 +20,15 @@ export function compareMessages(a: Pick<Message, "id" | "time">, b: Pick<Message
 
 export const messageKey = (message: Pick<Message, "id" | "time">) => message.time.created + message.id
 
+// A busy session runs a turn only while its latest message waits for or streams a reply. Otherwise only background
+// tasks keep it busy.
+export function turnRunning(messages: readonly Message[] | undefined) {
+  const last = messages?.at(-1)
+  if (!last) return false
+  if (last.role === "user") return true
+  return !last.time.completed
+}
+
 function record(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value)
 }

@@ -25,6 +25,7 @@ import { HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
 import { HttpApiBuilder, HttpApiError, HttpApiSchema } from "effect/unstable/httpapi"
 import { InstanceHttpApi } from "../api"
 import {
+  AbortQuery,
   AskPayload,
   AskThreadQuery,
   AskThreadsQuery,
@@ -255,7 +256,14 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       return yield* fork({ params: ctx.params, payload })
     })
 
-    const abort = Effect.fn("SessionHttpApi.abort")(function* (ctx: { params: { sessionID: SessionID } }) {
+    const abort = Effect.fn("SessionHttpApi.abort")(function* (ctx: {
+      params: { sessionID: SessionID }
+      query: typeof AbortQuery.Type
+    }) {
+      if (ctx.query.scope === "turn") {
+        yield* runState.interruptTurn(ctx.params.sessionID)
+        return true
+      }
       yield* promptSvc.cancel(ctx.params.sessionID)
       return true
     })

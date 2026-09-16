@@ -1,7 +1,15 @@
 /** @jsxImportSource @opentui/solid */
 import { createDefaultOpenTuiKeymap } from "@opentui/keymap/opentui"
 import { testRender, useRenderer, type JSX } from "@opentui/solid"
-import type { AssistantMessage, Event, GlobalEvent, Session as SessionInfo, ToolPart } from "@opencode-ai/sdk/v2"
+import type {
+  AssistantMessage,
+  Event,
+  GlobalEvent,
+  Session as SessionInfo,
+  TextPart,
+  ToolPart,
+  UserMessage,
+} from "@opencode-ai/sdk/v2"
 import { expect, test } from "bun:test"
 import { mkdir } from "node:fs/promises"
 import path from "node:path"
@@ -93,6 +101,7 @@ async function mountRoute(dir: string, view: () => JSX.Element, handler: Handler
     return fallback.fetch(input, init)
   }) as typeof globalThis.fetch
   let sync!: ReturnType<typeof useSync>
+  let keymap!: ReturnType<typeof createDefaultOpenTuiKeymap>
 
   function Probe() {
     sync = useSync()
@@ -102,7 +111,7 @@ async function mountRoute(dir: string, view: () => JSX.Element, handler: Handler
   // Keep the provider order from app.tsx so dialogs and prompts see the same contexts as production.
   function Harness() {
     const renderer = useRenderer()
-    const keymap = createDefaultOpenTuiKeymap(renderer)
+    keymap = createDefaultOpenTuiKeymap(renderer)
     const config = createTuiResolvedConfig()
     const off = registerOpencodeKeymap(keymap, renderer, config)
     onCleanup(off)
@@ -163,6 +172,8 @@ async function mountRoute(dir: string, view: () => JSX.Element, handler: Handler
   await wait(() => sync?.status === "complete")
   return {
     app,
+    sync,
+    dispatch: (command: string) => keymap.dispatchCommand(command),
     emit: (payload: Event) => events.emit({ directory, project: "proj_test", payload } satisfies GlobalEvent),
   }
 }
@@ -270,7 +281,7 @@ test("shows the interrupt hint while subagents run under an idle root", async ()
   }
 })
 
-test("aborts busy Task children in another location on the second escape", async () => {
+test("stops only the turn on the second escape and everything on the third", async () => {
   await using tmp = await tmpdir()
   const moved = { ...root, directory: path.join(directory, "moved") }
   const aborted: string[] = []
@@ -284,7 +295,7 @@ test("aborts busy Task children in another location on the second escape", async
       if (url.pathname === "/session/status") return json({ [child.id]: { type: "busy" } })
       const abort = url.pathname.match(/^\/session\/([^/]+)\/abort$/)
       if (!abort) return
-      aborted.push(abort[1])
+      aborted.push(`${abort[1]} ${url.searchParams.get("scope") ?? "all"}`)
       return json(true)
     },
   )
@@ -292,9 +303,85 @@ test("aborts busy Task children in another location on the second escape", async
   try {
     await waitForText(mounted.app, "esc interrupt")
     mounted.app.mockInput.pressEscape()
+    await waitForText(mounted.app, "esc again to interrupt")
+    expect(aborted).toEqual([])
+
+    // The second press leaves background Tasks running.
     mounted.app.mockInput.pressEscape()
-    await wait(() => aborted.length === 2)
-    expect(aborted.toSorted()).toEqual([child.id, root.id].toSorted())
+    await wait(() => aborted.length === 1)
+    expect(aborted).toEqual([`${root.id} turn`])
+    await waitForText(mounted.app, "esc again to stop all tasks")
+
+    // A further press also aborts busy Task children, including one in another location.
+    mounted.app.mockInput.pressEscape()
+    await wait(() => aborted.length === 3)
+    expect(aborted.slice(1).toSorted()).toEqual([`${child.id} all`, `${root.id} all`].toSorted())
+    await waitForText(mounted.app, "esc interrupt")
+  } finally {
+    mounted.app.renderer.destroy()
+  }
+})
+
+test("undo reverts a busy session without aborting it", async () => {
+  await using tmp = await tmpdir()
+  const requests: string[] = []
+  const user = {
+    id: "msg_user",
+    sessionID: root.id,
+    role: "user",
+    agent: "build",
+    model: { providerID: "test", modelID: "model" },
+    time: { created: 1 },
+  } satisfies UserMessage
+  const text = {
+    id: "prt_user",
+    sessionID: root.id,
+    messageID: user.id,
+    type: "text",
+    text: "change the file",
+  } satisfies TextPart
+  const assistant = {
+    id: "msg_assistant",
+    sessionID: root.id,
+    role: "assistant",
+    agent: "build",
+    modelID: "model",
+    providerID: "test",
+    mode: "build",
+    parentID: user.id,
+    path: { cwd: directory, root: directory },
+    cost: 0,
+    tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+    time: { created: 2 },
+  } satisfies AssistantMessage
+  const mounted = await mountRoute(
+    tmp.path,
+    () => <Session />,
+    (request) => {
+      const url = new URL(request.url)
+      if (url.pathname === "/session/status") return json({ [root.id]: { type: "busy" } })
+      if (url.pathname === `/session/${root.id}/message`)
+        return json([
+          { info: user, parts: [text] },
+          { info: assistant, parts: [] },
+        ])
+      if (url.pathname === `/session/${root.id}/abort`) {
+        requests.push("abort")
+        return json(true)
+      }
+      if (url.pathname !== `/session/${root.id}/revert`) return
+      requests.push("revert")
+      return json(root)
+    },
+  )
+
+  try {
+    await wait(() => mounted.sync.data.message[root.id]?.length === 2)
+    expect(mounted.sync.data.session_status[root.id]).toEqual({ type: "busy" })
+    mounted.dispatch("session.undo")
+    await wait(() => requests.includes("revert"))
+    // Revert stops the running turn on the server. Abort would also cancel every background Task.
+    expect(requests).toEqual(["revert"])
   } finally {
     mounted.app.renderer.destroy()
   }

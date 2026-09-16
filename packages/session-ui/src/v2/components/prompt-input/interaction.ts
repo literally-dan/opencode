@@ -36,9 +36,12 @@ export type PromptInputV2ViewConfig = {
   variant?: PromptInputV2SelectControl
   submit: {
     stopping: Accessor<boolean>
+    /** Escape and ctrl-g interrupt while this is true. */
     working?: Accessor<boolean>
     onSubmit: () => void
     onStop: () => void
+    /** Called by Escape and ctrl-g instead of `onStop`, when set. */
+    onInterrupt?: () => void
   }
   shell?: {
     onOpen: () => void
@@ -219,7 +222,7 @@ export function createPromptInputV2Controller(input: {
         event.key === "Escape")
     if (stop) {
       event.preventDefault()
-      input.view.submit.onStop()
+      ;(input.view.submit.onInterrupt ?? input.view.submit.onStop)()
       return true
     }
     if (
@@ -358,6 +361,8 @@ export function createPromptInputV2Controller(input: {
       dispatch({ type: "mode.normal" })
     },
     submit() {
+      // While the submit button is a stop button, only the button stops. Enter on an empty prompt does nothing.
+      if (input.view.submit.stopping()) return
       input.view.submit.onSubmit()
       dispatch({ type: "popover.close" })
     },

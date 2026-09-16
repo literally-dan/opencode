@@ -9418,6 +9418,10 @@ export type SessionAbortData = {
   query?: {
     directory?: string
     workspace?: string
+    /**
+     * turn stops only the running turn, and background tasks keep running. all (the default) also cancels background tasks.
+     */
+    scope?: "turn" | "all"
   }
   url: "/session/{sessionID}/abort"
 }

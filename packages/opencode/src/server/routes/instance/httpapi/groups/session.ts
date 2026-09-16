@@ -66,6 +66,15 @@ export const UpdatePayload = Schema.Struct({
   ),
 })
 export const ForkPayload = Schema.Struct(Struct.omit(Session.ForkInput.fields, ["sessionID"]))
+export const AbortQuery = Schema.Struct({
+  ...WorkspaceRoutingQueryFields,
+  scope: Schema.optional(
+    Schema.Literals(["turn", "all"]).annotate({
+      description:
+        "turn stops only the running turn, and background tasks keep running. all (the default) also cancels background tasks.",
+    }),
+  ),
+})
 export const InitPayload = Schema.Struct({
   modelID: ModelV2.ID,
   providerID: ProviderV2.ID,
@@ -278,7 +287,7 @@ export const SessionApi = HttpApi.make("session")
         ),
         HttpApiEndpoint.post("abort", SessionPaths.abort, {
           params: { sessionID: SessionID },
-          query: WorkspaceRoutingQuery,
+          query: AbortQuery,
           success: described(Schema.Boolean, "Aborted session"),
           error: HttpApiError.BadRequest,
         }).annotateMerge(
@@ -460,7 +469,7 @@ export const SessionApi = HttpApi.make("session")
             identifier: "session.revert",
             summary: "Revert message",
             description:
-              "Revert a specific message in a session, undoing its effects and restoring the previous state.",
+              "Revert a specific message in a session, undoing its effects and restoring the previous state. Revert stops a running turn of the session itself, so clients do not need to abort first. Background tasks that the reverted messages started or resumed are cancelled, and other background tasks keep running. Returns 409 while another revert or unrevert of the session is in progress.",
           }),
         ),
         HttpApiEndpoint.post("unrevert", SessionPaths.unrevert, {
@@ -472,7 +481,8 @@ export const SessionApi = HttpApi.make("session")
           OpenApi.annotations({
             identifier: "session.unrevert",
             summary: "Restore reverted messages",
-            description: "Restore all previously reverted messages in a session.",
+            description:
+              "Restore all previously reverted messages in a session. Unrevert stops a running turn of the session itself, and background tasks keep running. Returns 409 while another revert or unrevert of the session is in progress.",
           }),
         ),
         HttpApiEndpoint.post("permissionRespond", SessionPaths.permissions, {

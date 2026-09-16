@@ -1752,6 +1752,52 @@ describe("tool.task", () => {
     }),
   )
 
+  background.instance("cancelling message tasks cancels their descendants and keeps other tasks", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const runState = yield* SessionRunState.Service
+      const parent = SessionID.make("ses_parent")
+      const kept = SessionID.make("ses_kept")
+      const reverted = SessionID.make("ses_reverted")
+      const grandchild = SessionID.make("ses_grandchild")
+      yield* jobs.start({
+        id: kept,
+        type: "task",
+        metadata: { parentSessionId: parent, sessionId: kept, ancestorSessionIds: [parent], messageId: "msg_kept" },
+        run: Effect.never,
+      })
+      yield* jobs.start({
+        id: reverted,
+        type: "task",
+        metadata: {
+          parentSessionId: parent,
+          sessionId: reverted,
+          ancestorSessionIds: [parent],
+          messageId: "msg_reverted",
+        },
+        run: Effect.never,
+      })
+      yield* jobs.start({
+        id: grandchild,
+        type: "task",
+        metadata: {
+          parentSessionId: reverted,
+          sessionId: grandchild,
+          ancestorSessionIds: [reverted, parent],
+          messageId: "msg_reverted_child",
+        },
+        run: Effect.never,
+      })
+
+      yield* runState.cancelTasks(parent, new Set(["msg_reverted"]))
+
+      expect((yield* jobs.get(reverted))?.status).toBe("cancelled")
+      expect((yield* jobs.get(grandchild))?.status).toBe("cancelled")
+      expect((yield* jobs.get(kept))?.status).toBe("running")
+      yield* jobs.cancel(kept)
+    }),
+  )
+
   background.instance("does not admit a task job after its parent checkpoint is cancelled", () =>
     Effect.gen(function* () {
       const jobs = yield* BackgroundJob.Service

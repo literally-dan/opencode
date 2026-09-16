@@ -3886,6 +3886,7 @@ export class Session2 extends HeyApiClient {
       sessionID: string
       directory?: string
       workspace?: string
+      scope?: "turn" | "all"
     },
     options?: Options<never, ThrowOnError>,
   ) {
@@ -3897,6 +3898,7 @@ export class Session2 extends HeyApiClient {
             { in: "path", key: "sessionID" },
             { in: "query", key: "directory" },
             { in: "query", key: "workspace" },
+            { in: "query", key: "scope" },
           ],
         },
       ],
@@ -4387,7 +4389,7 @@ export class Session2 extends HeyApiClient {
   /**
    * Revert message
    *
-   * Revert a specific message in a session, undoing its effects and restoring the previous state.
+   * Revert a specific message in a session, undoing its effects and restoring the previous state. Revert stops a running turn of the session itself, so clients do not need to abort first. Background tasks that the reverted messages started or resumed are cancelled, and other background tasks keep running. Returns 409 while another revert or unrevert of the session is in progress.
    */
   public revert<ThrowOnError extends boolean = false>(
     parameters: {
@@ -4428,7 +4430,7 @@ export class Session2 extends HeyApiClient {
   /**
    * Restore reverted messages
    *
-   * Restore all previously reverted messages in a session.
+   * Restore all previously reverted messages in a session. Unrevert stops a running turn of the session itself, and background tasks keep running. Returns 409 while another revert or unrevert of the session is in progress.
    */
   public unrevert<ThrowOnError extends boolean = false>(
     parameters: {

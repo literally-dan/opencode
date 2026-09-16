@@ -28,6 +28,8 @@ function setup(
       }
       if (request.method === "POST" && request.url.endsWith("/prompt_async"))
         return new Response(undefined, { status: 204 })
+      if (request.method === "POST" && request.url.endsWith("/revert/stage"))
+        return Response.json({ data: { messageID: "msg_1" } })
       if (request.method === "POST" && request.url.endsWith("/prompt")) {
         return Response.json({
           admittedSeq: 1,
@@ -132,6 +134,39 @@ describe("createCompatibleApi", () => {
     expect((await requests[0]!.json()).parts).toEqual([
       { id: "prt_text", type: "text", text: "look" },
       { id: "prt_image", type: "file", mime: "image/png", url: "data:image/png;base64,AAAA", filename: "image.png" },
+    ])
+  })
+
+  test("reverts V1 sessions without aborting background tasks", async () => {
+    const { api, requests } = setup("v1")
+    await api.session.revert.stage({ sessionID: "ses_1", messageID: "msg_1" })
+    await api.session.revert.clear({ sessionID: "ses_1" })
+
+    expect(requests.map((request) => new URL(request.url).pathname)).toEqual([
+      "/session/ses_1/revert",
+      "/session/ses_1/unrevert",
+    ])
+  })
+
+  test("passes the V1 abort scope, so a turn interrupt keeps background tasks", async () => {
+    const { api, requests } = setup("v1")
+    await api.session.interrupt({ sessionID: "ses_1", scope: "turn" })
+
+    const url = new URL(requests[0]!.url)
+    expect(url.pathname).toBe("/session/ses_1/abort")
+    expect(url.searchParams.get("scope")).toBe("turn")
+  })
+
+  test("interrupts V2 sessions before a revert changes their history", async () => {
+    const { api, requests } = setup("v2")
+    await api.session.revert.stage({ sessionID: "ses_1", messageID: "msg_1" })
+    await api.session.revert.clear({ sessionID: "ses_1" })
+
+    expect(requests.map((request) => new URL(request.url).pathname)).toEqual([
+      "/api/session/ses_1/interrupt",
+      "/api/session/ses_1/revert/stage",
+      "/api/session/ses_1/interrupt",
+      "/api/session/ses_1/revert/clear",
     ])
   })
 

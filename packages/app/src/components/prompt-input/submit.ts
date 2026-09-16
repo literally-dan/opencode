@@ -256,7 +256,7 @@ export function createPromptSubmit(input: PromptSubmitInput) {
     return language.t("common.requestFailed")
   }
 
-  const abort = async () => {
+  const abort = async (scope?: "turn") => {
     const sessionID = params.id
     if (!sessionID) return Promise.resolve()
 
@@ -273,7 +273,7 @@ export function createPromptSubmit(input: PromptSubmitInput) {
       return Promise.resolve()
     }
     return sdk()
-      .api.session.interrupt({ sessionID })
+      .api.session.interrupt({ sessionID, scope })
       .catch(() => {})
   }
 

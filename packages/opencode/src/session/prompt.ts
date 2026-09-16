@@ -307,6 +307,9 @@ function compactionCandidates(
 
 export type NotificationContinuation = Effect.Effect<SessionV1.WithParts | undefined, Image.Error>
 
+/** The message that started a background Task. A result held during a revert is dropped when this message is removed. */
+export type NotificationSource = { readonly sessionID: SessionID; readonly messageID: MessageID }
+
 export interface Interface {
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
   readonly checkpoint: (sessionID: SessionID) => Effect.Effect<number>
@@ -315,6 +318,7 @@ export interface Interface {
   readonly admitNotification: (
     input: PromptInput,
     checkpoint: number,
+    source?: NotificationSource,
   ) => Effect.Effect<Option.Option<NotificationContinuation>, Image.Error>
   readonly notify: (
     input: PromptInput,
@@ -387,8 +391,8 @@ const layer = Layer.effect(
           state.admit([{ sessionID, checkpoint }, { sessionID: childID }], effect),
         resolvePromptParts: (template: string) => resolvePromptParts(template),
         prompt: (input: PromptInput) => prompt(input).pipe(Effect.catch(Effect.die)),
-        admitNotification: (input: PromptInput, checkpoint: number) =>
-          admitNotification(input, checkpoint).pipe(Effect.catch(Effect.die)),
+        admitNotification: (input: PromptInput, checkpoint: number, source?: NotificationSource) =>
+          admitNotification(input, checkpoint, source).pipe(Effect.catch(Effect.die)),
         notify: (input: PromptInput, checkpoint: number) => notify(input, checkpoint).pipe(Effect.catch(Effect.die)),
       } satisfies TaskPromptOps
     })
@@ -1320,15 +1324,26 @@ const layer = Layer.effect(
 
     const savePrompt = Effect.fn("SessionPrompt.savePrompt")(function* (input: PromptInput) {
       const prepared = yield* prepareUserMessage(input)
-      const admitted = yield* state.admit(
-        [{ sessionID: input.sessionID }],
-        Effect.gen(function* () {
-          yield* revert.cleanup(yield* sessions.get(input.sessionID).pipe(Effect.orDie))
-          return yield* persistPrompt(prepared, input)
-        }),
+      const save: Effect.Effect<SessionV1.WithParts & { info: SessionV1.User }, Session.RemovingError> = Effect.gen(
+        function* () {
+          const admitted = yield* state.admit(
+            [{ sessionID: input.sessionID }],
+            Effect.gen(function* () {
+              // No turn starts while a revert is in progress, and the revert can stage over this prompt.
+              // Wait until it finishes, then save the prompt, which commits a staged revert.
+              const reverting = yield* state.awaitRevert(input.sessionID, Effect.succeed(false))
+              if (Option.isSome(reverting)) return { held: reverting.value }
+              yield* revert.cleanup(yield* sessions.get(input.sessionID).pipe(Effect.orDie))
+              return yield* persistPrompt(prepared, input)
+            }),
+          )
+          if (Option.isNone(admitted)) return yield* new Session.RemovingError({ sessionID: input.sessionID })
+          if (!("held" in admitted.value)) return admitted.value
+          yield* admitted.value.held
+          return yield* save
+        },
       )
-      if (Option.isNone(admitted)) return yield* new Session.RemovingError({ sessionID: input.sessionID })
-      return admitted.value
+      return yield* save
     })
 
     const prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error | Session.RemovingError> =
@@ -1336,6 +1351,8 @@ const layer = Layer.effect(
         const message = yield* savePrompt(input)
 
         if (input.noReply === true) return message
+        // This turn also answers the task results admitted while a turn-only interrupt paused their turns.
+        yield* state.resumeNotificationTurns(input.sessionID)
         return yield* loop({ sessionID: input.sessionID })
       })
 
@@ -1752,11 +1769,18 @@ const layer = Layer.effect(
       checkpoint: number,
     ) {
       if (!(yield* state.isCurrent(message.info.sessionID, checkpoint))) return
+      // After a turn-only interrupt the result stays in history without a turn, and the next prompt answers it.
+      if (yield* state.notificationTurnsPaused(message.info.sessionID)) return
       const result = yield* state.ensureRunning(
         message.info.sessionID,
         lastAssistant(message.info.sessionID),
         Effect.gen(function* () {
           if (!(yield* state.isCurrent(message.info.sessionID, checkpoint))) return message
+          // Do not answer while a revert is staged: the turn would run on reverted history. The notification
+          // continuation waits for the revert to be committed or cleared, and then delivers again.
+          if (yield* revertStaged(message.info.sessionID)) return message
+          // Check again, because a turn-only interrupt can land after the first check and before this turn is queued.
+          if (yield* state.notificationTurnsPaused(message.info.sessionID)) return message
           return yield* runLoop(message.info.sessionID)
         }),
       )
@@ -1764,27 +1788,74 @@ const layer = Layer.effect(
       return result
     })
 
+    const revertStaged = (sessionID: SessionID) =>
+      sessions.get(sessionID).pipe(
+        Effect.orDie,
+        Effect.map((session) => session.revert !== undefined),
+      )
+
+    const messageExists = (sessionID: SessionID, messageID: MessageID) =>
+      MessageV2.get({ sessionID, messageID }).pipe(
+        Effect.provideService(Database.Service, database),
+        Effect.as(true),
+        Effect.catchTag("NotFoundError", () => Effect.succeed(false)),
+      )
+
+    // Waits while a revert of the Session is in progress or staged and the checkpoint is current. Returns undefined when
+    // it did not wait, and otherwise the message where the last staged revert that it saw starts.
+    const awaitRevertEnd = Effect.fnUntraced(function* (
+      sessionID: SessionID,
+      checkpoint: number,
+      waited?: { readonly point?: MessageID },
+    ): Effect.fn.Return<{ readonly point?: MessageID } | undefined> {
+      const reverting = yield* state.awaitRevert(sessionID, revertStaged(sessionID))
+      if (Option.isNone(reverting)) return waited
+      // Read after the wait is registered, so a revert change or cancel after these reads ends the wait. A cancel or
+      // delete makes the checkpoint stale, and the caller then drops the result.
+      if (!(yield* state.isCurrent(sessionID, checkpoint))) return waited ?? {}
+      const point = (yield* sessions.get(sessionID).pipe(Effect.orDie)).revert?.messageID
+      yield* reverting.value
+      return yield* awaitRevertEnd(sessionID, checkpoint, { point: point ?? waited?.point })
+    })
+
     const admitNotification: Interface["admitNotification"] = Effect.fn("SessionPrompt.admitNotification")(function* (
       input: PromptInput,
       checkpoint: number,
+      source?: NotificationSource,
     ) {
       if (!(yield* state.isCurrent(input.sessionID, checkpoint))) return Option.none()
-      const prepared = yield* prepareUserMessage(input)
+      return yield* admitPrepared(input, checkpoint, yield* prepareUserMessage(input), source)
+    })
+
+    const admitPrepared = Effect.fn("SessionPrompt.admitPrepared")(function* (
+      input: PromptInput,
+      checkpoint: number,
+      prepared: SessionV1.WithParts & { info: SessionV1.User },
+      source: NotificationSource | undefined,
+    ): Effect.fn.Return<Option.Option<NotificationContinuation>> {
       const admitted = yield* state.admitIfCurrent(
         input.sessionID,
         checkpoint,
         Effect.gen(function* () {
+          // A revert in progress or staged would remove this notification with the reverted messages.
+          const held = yield* state.awaitRevert(input.sessionID, revertStaged(input.sessionID))
+          if (Option.isSome(held)) return { held: held.value }
           const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
-          if (session.revert) return false as const
+          // The prepared message can be older than messages admitted meanwhile, such as the prompt that committed
+          // a revert while it was held. Give it new IDs then, so it follows them.
+          const newest = (yield* sessions.messages({ sessionID: input.sessionID, limit: 1 }).pipe(Effect.orDie)).at(0)
+          const renewed = newest !== undefined && newest.info.id > prepared.info.id
+          const id = renewed ? MessageID.ascending() : prepared.info.id
           // Task tools build the notification input when the task starts.
           // persistPrompt switches the session to the message's agent and model,
           // so use the session's current values. Read them inside the admission,
           // so a prompt admitted while this notification was prepared is not reverted.
           return yield* persistPrompt(
             {
-              ...prepared,
               info: {
                 ...prepared.info,
+                id,
+                time: renewed ? { ...prepared.info.time, created: Date.now() } : prepared.info.time,
                 agent: session.agent ?? prepared.info.agent,
                 model: session.model
                   ? {
@@ -1794,6 +1865,9 @@ const layer = Layer.effect(
                     }
                   : prepared.info.model,
               },
+              parts: renewed
+                ? prepared.parts.map((part) => ({ ...part, id: PartID.ascending(), messageID: id }))
+                : prepared.parts,
             },
             input,
           )
@@ -1801,22 +1875,54 @@ const layer = Layer.effect(
       )
       if (Option.isNone(admitted)) return Option.none()
       const message = admitted.value
-      if (message === false) return Option.none()
+      // Hold the result until the revert is committed or cleared, then admit the same prepared message.
+      // The caller keeps its lease while this waits.
+      if ("held" in message)
+        return Option.some(message.held.pipe(Effect.andThen(admitAgain(input, checkpoint, prepared, source))))
       if (input.noReply === true) return Option.some(Effect.succeed(undefined))
-      return Option.some(
-        Effect.gen(function* () {
-          const result = yield* runNotification(message, checkpoint)
-          if (!result) return
-          if (result.info.role === "assistant" && result.info.parentID === message.info.id) return result
-          const latest = MessageV2.latest(
-            yield* MessageV2.filterCompactedEffect(input.sessionID).pipe(
-              Effect.provideService(Database.Service, database),
-            ),
-          )
-          if (latest.user?.id !== message.info.id) return
-          return yield* runNotification(message, checkpoint)
-        }),
+      return Option.some(deliverNotification(input, checkpoint, prepared, source, message))
+    })
+
+    // Admits a result again after a revert changed. Drops it when the revert removed the message that started the Task.
+    const admitAgain = Effect.fnUntraced(function* (
+      input: PromptInput,
+      checkpoint: number,
+      prepared: SessionV1.WithParts & { info: SessionV1.User },
+      source: NotificationSource | undefined,
+    ): Effect.fn.Return<SessionV1.WithParts | undefined, Image.Error> {
+      if (source && !(yield* messageExists(source.sessionID, source.messageID))) return
+      const continuation = yield* admitPrepared(input, checkpoint, prepared, source)
+      if (Option.isNone(continuation)) return
+      return yield* continuation.value
+    })
+
+    // Runs the turn of an admitted notification. When a revert stops the turn or covers the notification, wait until
+    // the revert changes. Admit the prepared message again when the revert removed the notification, and run the turn
+    // again when the notification still exists. The caller keeps its lease until this returns.
+    const deliverNotification = Effect.fn("SessionPrompt.deliverNotification")(function* (
+      input: PromptInput,
+      checkpoint: number,
+      prepared: SessionV1.WithParts & { info: SessionV1.User },
+      source: NotificationSource | undefined,
+      message: SessionV1.WithParts,
+    ): Effect.fn.Return<SessionV1.WithParts | undefined, Image.Error> {
+      const result = yield* runNotification(message, checkpoint)
+      if (!result) return
+      const waited = yield* awaitRevertEnd(input.sessionID, checkpoint)
+      if (waited) {
+        if (yield* messageExists(message.info.sessionID, message.info.id))
+          return yield* deliverNotification(input, checkpoint, prepared, source, message)
+        // A revert that starts at the notification itself, such as undo of its turn, drops the result, as it does
+        // after the turn finished.
+        if (waited.point === message.info.id) return
+        return yield* admitAgain(input, checkpoint, prepared, source)
+      }
+      if (result.info.role === "assistant" && result.info.parentID === message.info.id) return result
+      const latest = MessageV2.latest(
+        yield* MessageV2.filterCompactedEffect(input.sessionID).pipe(Effect.provideService(Database.Service, database)),
       )
+      if (latest.user?.id !== message.info.id) return
+      return yield* runNotification(message, checkpoint)
     })
 
     const notify: Interface["notify"] = Effect.fn("SessionPrompt.notify")(function* (

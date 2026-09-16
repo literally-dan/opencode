@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import type { SessionMessageInfo } from "@opencode-ai/client/promise"
-import { normalizeSessionMessages } from "./session-message"
+import type { AssistantMessage, UserMessage } from "@opencode-ai/sdk/v2"
+import { normalizeSessionMessages, turnRunning } from "./session-message"
 
 describe("normalizeSessionMessages", () => {
   test("projects current turns into stable legacy rendering records", () => {
@@ -210,5 +211,21 @@ describe("normalizeSessionMessages", () => {
         }),
       }),
     ])
+  })
+})
+
+describe("turnRunning", () => {
+  const user = { id: "msg_1", sessionID: "ses_1", role: "user", time: { created: 1 } } as UserMessage
+  const assistant = { id: "msg_2", sessionID: "ses_1", role: "assistant", time: { created: 2 } } as AssistantMessage
+
+  test("reports a turn while the latest message waits for or streams a reply", () => {
+    expect(turnRunning([user])).toBe(true)
+    expect(turnRunning([user, assistant])).toBe(true)
+  })
+
+  test("reports no turn when the latest reply is complete, so only background tasks can keep the session busy", () => {
+    expect(turnRunning(undefined)).toBe(false)
+    expect(turnRunning([])).toBe(false)
+    expect(turnRunning([user, { ...assistant, time: { created: 2, completed: 3 } }])).toBe(false)
   })
 })

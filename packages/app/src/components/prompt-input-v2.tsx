@@ -25,6 +25,7 @@ import { usePlatform } from "@/context/platform"
 import { useSDK } from "@/context/sdk"
 import { useSync } from "@/context/sync"
 import { createSessionTabs } from "@/pages/session/helpers"
+import { turnRunning } from "@/utils/session-message"
 import { showToast } from "@/utils/toast"
 import { PromptInputV2, type PromptInputV2Suggestion } from "@opencode-ai/session-ui/v2/prompt-input"
 import {
@@ -113,6 +114,7 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
   })
   const info = createMemo(() => (props.controls.session.id ? sync().session.get(props.controls.session.id) : undefined))
   const working = createMemo(() => sync().data.session_working(props.controls.session.id ?? ""))
+  const running = createMemo(() => working() && turnRunning(sync().data.message[props.controls.session.id ?? ""]))
   const attachments = createMemo(() =>
     prompt.current().filter((part): part is ImageAttachmentPart => part.type === "image"),
   )
@@ -402,9 +404,11 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
       },
       submit: {
         stopping,
-        working,
+        // Keyboard interrupts stop only the running turn. Background tasks keep running.
+        working: running,
         onSubmit: () => void submission.handleSubmit(new Event("submit")),
         onStop: () => void submission.abort(),
+        onInterrupt: () => void submission.abort("turn"),
       },
     },
   })

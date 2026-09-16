@@ -300,6 +300,7 @@ export function Prompt(props: PromptProps) {
     extmarkToPartIndex: new Map(),
     interrupt: 0,
   })
+  let interruptReset: ReturnType<typeof setTimeout> | undefined
 
   createEffect(
     on(
@@ -410,11 +411,21 @@ export function Prompt(props: PromptProps) {
 
           setStore("interrupt", store.interrupt + 1)
 
-          setTimeout(() => {
+          // One window for the whole sequence: an earlier press must not end it early.
+          clearTimeout(interruptReset)
+          interruptReset = setTimeout(() => {
             setStore("interrupt", 0)
           }, 5000)
 
-          if (store.interrupt >= 2) {
+          // The second press stops only the running turn. Background tasks keep running, and their results wait for
+          // the next prompt. A further press in the same window stops everything.
+          if (store.interrupt === 2) {
+            void sdk.client.session.abort({
+              sessionID: props.sessionID,
+              scope: "turn",
+            })
+          }
+          if (store.interrupt >= 3) {
             void sdk.client.session.abort({
               sessionID: props.sessionID,
             })
@@ -422,6 +433,7 @@ export function Prompt(props: PromptProps) {
             busyTaskChildrenElsewhere(sync.data.session, sync.data.session_status, props.sessionID).forEach(
               (child) => void sdk.client.session.abort({ sessionID: child.id }),
             )
+            clearTimeout(interruptReset)
             setStore("interrupt", 0)
           }
           dialog.clear()
@@ -1651,7 +1663,7 @@ export function Prompt(props: PromptProps) {
                 <text fg={store.interrupt > 0 ? theme.primary : theme.text}>
                   esc{" "}
                   <span style={{ fg: store.interrupt > 0 ? theme.primary : theme.textMuted }}>
-                    {store.interrupt > 0 ? "again to interrupt" : "interrupt"}
+                    {["interrupt", "again to interrupt", "again to stop all tasks"][Math.min(store.interrupt, 2)]}
                   </span>
                 </text>
               </box>

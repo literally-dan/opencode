@@ -12,6 +12,8 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Flag } from "@opencode-ai/core/flag/flag"
 import { Ripgrep } from "@opencode-ai/core/ripgrep"
+import { Shell } from "@opencode-ai/core/shell"
+import { BackgroundJob } from "../../src/background/job"
 import { registerAdapter } from "../../src/control-plane/adapters"
 import type { WorkspaceAdapter } from "../../src/control-plane/types"
 import { Workspace } from "../../src/control-plane/workspace"
@@ -74,7 +76,15 @@ const blockingPromptPreparation = Layer.succeed(
   }),
 )
 const appLayer = AppNodeBuilder.build(
-  LayerNode.group([InstanceStore.node, Project.node, Session.node, Workspace.node, Database.node, Ripgrep.node]),
+  LayerNode.group([
+    InstanceStore.node,
+    Project.node,
+    Session.node,
+    Workspace.node,
+    Database.node,
+    Ripgrep.node,
+    BackgroundJob.node,
+  ]),
   [
     [InstanceStore.bootstrapNode, noopBootstrapLayer],
     [Plugin.node, blockingPromptPreparation],
@@ -266,6 +276,59 @@ afterEach(async () => {
   promptPreparationGates.length = 0
   await disposeAllInstances()
   await resetDatabase()
+})
+
+const previousShell = process.env.SHELL
+const restoreShell = Effect.sync(() => {
+  if (previousShell === undefined) delete process.env.SHELL
+  else process.env.SHELL = previousShell
+  Shell.preferred.reset()
+})
+
+// Starts a background job and a shell turn that ignores SIGTERM, and aborts the turn with scope turn. The shell is
+// killed about 3 seconds after the abort, so the turn still stops when this returns.
+const abortSlowStoppingTurn = Effect.fn("test.abortSlowStoppingTurn")(function* () {
+  process.env.SHELL = "/bin/sh"
+  Shell.preferred.reset()
+  const llm = yield* TestLLMServer
+  const directory = yield* tmpdirScoped({ git: true, config: testProviderConfig(llm.url) })
+  const session = yield* createSession({ title: "turn stop window" }).pipe(provideInstanceEffect(directory))
+  const query = `directory=${encodeURIComponent(directory)}`
+  const job = yield* BackgroundJob.Service.use((jobs) =>
+    jobs.start({ type: "task", title: "kept task", metadata: { parentSessionId: session.id }, run: Effect.never }),
+  ).pipe(provideInstanceEffect(directory))
+  const ready = path.join(directory, ".trap-ready")
+  const shell = yield* request(`${pathFor(SessionPaths.shell, { sessionID: session.id })}?${query}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      agent: "build",
+      model: { providerID: "test", modelID: "test-model" },
+      command: `trap '' TERM; touch "${ready}"; sleep 30`,
+    }),
+  }).pipe(Effect.forkChild)
+  yield* pollWithTimeout(
+    Effect.promise(() => Bun.file(ready).exists()).pipe(Effect.map((exists) => (exists ? (true as const) : undefined))),
+    "the shell turn never started",
+    "10 seconds",
+  )
+  const abort = yield* request(`${pathFor(SessionPaths.abort, { sessionID: session.id })}?${query}&scope=turn`, {
+    method: "POST",
+  }).pipe(Effect.forkChild)
+  // Wait until the abort is inside the stop window, which lasts until the shell is killed.
+  yield* Effect.sleep("300 millis")
+  return {
+    llm,
+    shell,
+    abort,
+    promptPath: `${pathFor(SessionPaths.prompt, { sessionID: session.id })}?${query}`,
+    messagesPath: `${pathFor(SessionPaths.messages, { sessionID: session.id })}?${query}`,
+    revertPath: `${pathFor(SessionPaths.revert, { sessionID: session.id })}?${query}`,
+    jobStatus: BackgroundJob.Service.use((jobs) => jobs.get(job.id)).pipe(
+      provideInstanceEffect(directory),
+      Effect.map((info) => info?.status),
+    ),
+  }
 })
 
 describe("session HttpApi", () => {
@@ -700,6 +763,124 @@ describe("session HttpApi", () => {
         expect(threads.items).toEqual([])
       }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
     90_000,
+  )
+
+  it.live(
+    "abort with scope turn stops the running turn and keeps background jobs running",
+    () =>
+      Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        const directory = yield* tmpdirScoped({ git: true, config: testProviderConfig(llm.url) })
+        const session = yield* createSession({ title: "abort scope" }).pipe(provideInstanceEffect(directory))
+        const directoryQuery = `directory=${encodeURIComponent(directory)}`
+        const abortPath = `${pathFor(SessionPaths.abort, { sessionID: session.id })}?${directoryQuery}`
+        const job = yield* BackgroundJob.Service.use((jobs) =>
+          jobs.start({
+            type: "task",
+            title: "kept task",
+            metadata: { parentSessionId: session.id },
+            run: Effect.never,
+          }),
+        ).pipe(provideInstanceEffect(directory))
+        const jobStatus = BackgroundJob.Service.use((jobs) => jobs.get(job.id)).pipe(
+          provideInstanceEffect(directory),
+          Effect.map((info) => info?.status),
+        )
+
+        yield* llm.hang
+        const turn = yield* request(`${pathFor(SessionPaths.prompt, { sessionID: session.id })}?${directoryQuery}`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            agent: "build",
+            model: { providerID: "test", modelID: "test-model" },
+            parts: [{ type: "text", text: "hang until stopped" }],
+          }),
+        }).pipe(Effect.forkChild)
+        yield* llm.wait(1).pipe(Effect.timeout("10 seconds"))
+
+        const stopped = yield* request(`${abortPath}&scope=turn`, { method: "POST" })
+        expect(stopped.status).toBe(200)
+        expect((yield* Fiber.join(turn).pipe(Effect.timeout("10 seconds"))).status).toBe(200)
+        expect(yield* jobStatus).toBe("running")
+
+        const aborted = yield* request(abortPath, { method: "POST" })
+        expect(aborted.status).toBe(200)
+        expect(yield* jobStatus).toBe("cancelled")
+      }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+    30_000,
+  )
+
+  it.live(
+    "abort with scope turn queues a prompt sent while the turn stops and keeps background jobs running",
+    () =>
+      Effect.gen(function* () {
+        const stopping = yield* abortSlowStoppingTurn()
+        yield* stopping.llm.text("after stop")
+        const reply = yield* request(stopping.promptPath, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            agent: "build",
+            model: { providerID: "test", modelID: "test-model" },
+            parts: [{ type: "text", text: "follow up" }],
+          }),
+        }).pipe(Effect.forkChild)
+
+        // Like after abort with scope all, the prompt is saved while the turn still stops, and runs after it.
+        yield* pollWithTimeout(
+          requestJson<SessionV1.WithParts[]>(stopping.messagesPath).pipe(
+            Effect.map((messages) =>
+              messages.some((message) =>
+                message.parts.some((part) => part.type === "text" && part.text === "follow up"),
+              )
+                ? (true as const)
+                : undefined,
+            ),
+          ),
+          "the prompt was not saved while the turn stopped",
+          "2 seconds",
+        )
+        expect(stopping.abort.pollUnsafe()).toBeUndefined()
+        const answer = yield* Fiber.join(reply).pipe(
+          Effect.timeout("20 seconds"),
+          Effect.flatMap(json<SessionV1.WithParts>),
+        )
+        expect(answer.parts.some((part) => part.type === "text" && part.text === "after stop")).toBe(true)
+        expect((yield* Fiber.join(stopping.abort).pipe(Effect.timeout("20 seconds"))).status).toBe(200)
+        yield* Fiber.join(stopping.shell).pipe(Effect.timeout("20 seconds"))
+        expect(yield* stopping.jobStatus).toBe("running")
+      }).pipe(
+        Effect.ensuring(restoreShell),
+        Effect.provide(TestLLMServer.layer),
+        Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node)),
+      ),
+    30_000,
+  )
+
+  it.live(
+    "abort with scope turn does not make a revert sent while the turn stops busy",
+    () =>
+      Effect.gen(function* () {
+        const stopping = yield* abortSlowStoppingTurn()
+        const messages = yield* requestJson<SessionV1.WithParts[]>(stopping.messagesPath)
+        const user = messages.find((message) => message.info.role === "user")
+        if (!user) return yield* Effect.die(new Error("the shell turn has no user message"))
+
+        const reverted = yield* request(stopping.revertPath, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ messageID: user.info.id }),
+        }).pipe(Effect.timeout("20 seconds"))
+        expect(reverted.status).toBe(200)
+        expect((yield* Fiber.join(stopping.abort).pipe(Effect.timeout("20 seconds"))).status).toBe(200)
+        yield* Fiber.join(stopping.shell).pipe(Effect.timeout("20 seconds"))
+      }).pipe(
+        Effect.ensuring(restoreShell),
+        Effect.provide(TestLLMServer.layer),
+        Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node)),
+      ),
+    30_000,
   )
 
   it.live(

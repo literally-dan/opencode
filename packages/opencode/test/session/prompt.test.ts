@@ -4044,6 +4044,90 @@ it.instance(
 )
 
 it.instance(
+  "background command subtask added during a running turn does not start another model turn",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
+      const firstRelease = defer<void>()
+      const childRelease = defer<void>()
+      // Only the child prompt names the parent session, in its subagent-context marker.
+      yield* llm.pushMatch(
+        (hit) => JSON.stringify(hit.body).includes(chat.id),
+        reply().wait(childRelease.promise).text("review done").stop(),
+      )
+      yield* llm.pushMatch(
+        (hit) => JSON.stringify(hit.body).includes("first prompt"),
+        reply().wait(firstRelease.promise).text("first answer").stop(),
+      )
+      yield* llm.textMatch((hit) => JSON.stringify(hit.body).includes("Background task completed"), "review summary")
+      const parentRequests = llm.hits.pipe(
+        Effect.map((hits) =>
+          hits.filter((hit) => {
+            const body = JSON.stringify(hit.body)
+            return !body.includes("Generate a title for this conversation") && !body.includes(chat.id)
+          }),
+        ),
+      )
+      const endsWithTaskCall = (body: Record<string, unknown>) => {
+        const messages = Array.isArray(body.messages)
+          ? (body.messages as { role?: unknown; tool_calls?: unknown }[])
+          : []
+        return messages.at(-1)?.role === "tool" && strings(messages.at(-2)?.tool_calls).includes("task")
+      }
+
+      const first = yield* prompt
+        .prompt({ sessionID: chat.id, agent: "build", model: ref, parts: [{ type: "text", text: "first prompt" }] })
+        .pipe(Effect.forkChild)
+      yield* pollWithTimeout(
+        parentRequests.pipe(Effect.map((hits) => (hits.length > 0 ? true : undefined))),
+        "first model request did not arrive",
+        "20 seconds",
+      )
+      const msg = yield* user(chat.id, "run review")
+      yield* addSubtask(chat.id, msg.id, ref, { command: "review" })
+      const queued = yield* prompt.loop({ sessionID: chat.id }).pipe(Effect.forkChild)
+      firstRelease.resolve()
+      yield* Fiber.join(first)
+      const result = yield* Fiber.join(queued)
+
+      expect((yield* llm.hits).some((hit) => endsWithTaskCall(hit.body))).toBe(false)
+      expect(yield* parentRequests).toHaveLength(1)
+      const launched = yield* MessageV2.filterCompactedEffect(chat.id)
+      expect(launched.map((message) => message.info.role)).toEqual(["user", "assistant", "user", "assistant"])
+      expect(result.info.id).toBe(launched[3]?.info.id)
+      expect(completedTool(result.parts)?.state.metadata?.background).toBe(true)
+
+      childRelease.resolve()
+      const messages = yield* pollWithTimeout(
+        MessageV2.filterCompactedEffect(chat.id).pipe(
+          Effect.map((messages) =>
+            messages.some((message) =>
+              message.parts.some((part) => part.type === "text" && part.text === "review summary"),
+            )
+              ? messages
+              : undefined,
+          ),
+        ),
+        "background command subtask notification turn did not run",
+        "20 seconds",
+      )
+      expect(messages.map((message) => message.info.role)).toEqual([
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+      ])
+      expect(yield* parentRequests).toHaveLength(2)
+    }),
+  30_000,
+)
+
+it.instance(
   "background task tool preserves metadata after tool-call transition",
   () =>
     Effect.gen(function* () {
@@ -5133,6 +5217,1037 @@ it.instance(
       const messages = yield* MessageV2.filterCompactedEffect(chat.id)
       expect(messages.at(-1)?.parts.some((part) => part.type === "text" && part.text === "noted failure")).toBe(true)
       expect(statuses.filter((type) => type === "idle")).toHaveLength(1)
+    }),
+  30_000,
+)
+
+it.instance(
+  "revert cancels only background tasks started in the reverted range",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const revert = yield* SessionRevert.Service
+      const sessions = yield* Session.Service
+      const jobs = yield* BackgroundJob.Service
+      const chat = yield* sessions.create({
+        title: "Pinned",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      const firstRelease = defer<void>()
+      const body = (hit: { body: unknown }) => JSON.stringify(hit.body)
+      yield* llm.toolMatch((hit) => body(hit).includes("start first task"), "task", {
+        description: "first task",
+        prompt: "inspect the first path",
+        subagent_type: "general",
+      })
+      // Only child prompts name the parent session, in their subagent-context marker.
+      yield* llm.pushMatch(
+        (hit) => body(hit).includes(chat.id) && body(hit).includes("inspect the first path"),
+        reply().wait(firstRelease.promise).text("first done").stop(),
+      )
+      yield* llm.textMatch((hit) => body(hit).includes("Background task started"), "launched first")
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        parts: [{ type: "text", text: "start first task" }],
+      })
+
+      yield* llm.toolMatch((hit) => body(hit).includes("start second task"), "task", {
+        description: "second task",
+        prompt: "inspect the second path",
+        subagent_type: "general",
+      })
+      yield* llm.pushMatch(
+        (hit) => body(hit).includes(chat.id) && body(hit).includes("inspect the second path"),
+        reply().hang(),
+      )
+      yield* llm.textMatch((hit) => body(hit).includes("Background task started"), "launched second")
+      const second = yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        parts: [{ type: "text", text: "start second task" }],
+      })
+      const job = (title: string) =>
+        jobs.list().pipe(Effect.map((items) => items.find((item) => item.title === title)?.status))
+      expect(yield* job("first task")).toBe("running")
+      expect(yield* job("second task")).toBe("running")
+
+      if (second.info.role !== "assistant") return yield* Effect.die(new Error("second prompt did not answer"))
+      yield* revert.revert({ sessionID: chat.id, messageID: second.info.parentID })
+      expect(yield* job("second task")).toBe("cancelled")
+      expect(yield* job("first task")).toBe("running")
+      yield* revert.unrevert({ sessionID: chat.id })
+      expect(yield* job("first task")).toBe("running")
+
+      yield* revert.revert({ sessionID: chat.id, messageID: second.info.parentID })
+      yield* llm.textMatch((hit) => body(hit).includes("Background task completed"), "noted first")
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        noReply: true,
+        parts: [{ type: "text", text: "after revert" }],
+      })
+      firstRelease.resolve()
+
+      const messages = yield* pollWithTimeout(
+        MessageV2.filterCompactedEffect(chat.id).pipe(
+          Effect.map((messages) =>
+            messages.some((message) =>
+              message.parts.some((part) => part.type === "text" && part.text === "noted first"),
+            )
+              ? messages
+              : undefined,
+          ),
+        ),
+        "the first background task result was never delivered after the revert",
+        "20 seconds",
+      )
+      const texts = messages.flatMap((message) =>
+        message.parts.flatMap((part) => (part.type === "text" ? [part.text] : [])),
+      )
+      expect(texts.some((text) => text.includes("first done"))).toBe(true)
+      expect(texts.some((text) => text.includes("start second task") || text.includes("Task cancelled"))).toBe(false)
+      expect(yield* job("first task")).toBe("completed")
+    }),
+  30_000,
+)
+
+const requestText = (hit: { body: unknown }) => JSON.stringify(hit.body)
+const textParts = (messages: SessionV1.WithParts[]) =>
+  messages.flatMap((message) => message.parts.flatMap((part) => (part.type === "text" ? [part.text] : [])))
+
+it.instance(
+  "revert during a running turn stops only that turn and keeps earlier background tasks",
+  () =>
+    Effect.gen(function* () {
+      const revert = yield* SessionRevert.Service
+      const sessions = yield* Session.Service
+      const run = yield* SessionRunState.Service
+      const status = yield* SessionStatus.Service
+      const jobs = yield* BackgroundJob.Service
+      const release = defer<void>()
+      const {
+        llm,
+        prompt,
+        chat,
+        job: kept,
+      } = yield* launchBackgroundTask(reply().wait(release.promise).text("kept done").stop())
+      // The root request after the task call holds its arguments. Only child requests name the root session.
+      const continued = (hit: { body: unknown }) =>
+        requestText(hit).includes("inspect the reverted path") && !requestText(hit).includes(chat.id)
+      yield* llm.toolMatch((hit) => requestText(hit).includes("start reverted task"), "task", {
+        description: "reverted task",
+        prompt: "inspect the reverted path",
+        subagent_type: "general",
+      })
+      yield* llm.pushMatch(
+        (hit) => requestText(hit).includes(chat.id) && requestText(hit).includes("inspect the reverted path"),
+        reply().hang(),
+      )
+      yield* llm.pushMatch(continued, reply().hang())
+      const turnID = MessageID.ascending()
+      const turn = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          messageID: turnID,
+          agent: "build",
+          model: ref,
+          parts: [{ type: "text", text: "start reverted task" }],
+        })
+        .pipe(Effect.forkChild)
+      yield* pollWithTimeout(
+        llm.hits.pipe(Effect.map((hits) => (hits.some(continued) ? (true as const) : undefined))),
+        "the turn never continued after it started its task",
+        "20 seconds",
+      )
+      const reverted = (yield* jobs.list()).find((item) => item.title === "reverted task")
+      if (!reverted) return yield* Effect.die(new Error("the reverted task was not started"))
+
+      yield* revert.revert({ sessionID: chat.id, messageID: turnID })
+
+      yield* Fiber.join(turn)
+      expect(Exit.isSuccess(yield* run.assertNotBusy(chat.id).pipe(Effect.exit))).toBe(true)
+      expect((yield* sessions.get(chat.id)).revert?.messageID).toBe(turnID)
+      expect((yield* jobs.get(reverted.id))?.status).toBe("cancelled")
+      expect((yield* jobs.get(kept.id))?.status).toBe("running")
+      expect((yield* status.get(chat.id)).type).toBe("busy")
+
+      yield* llm.textMatch((hit) => requestText(hit).includes("Background task completed"), "noted kept")
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        noReply: true,
+        parts: [{ type: "text", text: "after revert" }],
+      })
+      release.resolve()
+      yield* idleStatus(chat.id, "session never became idle after the kept task result was delivered")
+
+      const texts = textParts(yield* MessageV2.filterCompactedEffect(chat.id))
+      expect(texts).toContain("noted kept")
+      expect(texts.some((text) => text.includes("start reverted task"))).toBe(false)
+      expect((yield* jobs.get(kept.id))?.status).toBe("completed")
+    }),
+  30_000,
+)
+
+// Starts a kept background task and a turn that hangs. The task finishes during the turn, so its result is admitted
+// and queued behind the turn. Then a revert of that turn stops it and the queued notification turn.
+const revertTurnWithAdmittedTaskResult = Effect.fn("test.revertTurnWithAdmittedTaskResult")(function* () {
+  const revert = yield* SessionRevert.Service
+  const run = yield* SessionRunState.Service
+  const status = yield* SessionStatus.Service
+  const release = defer<void>()
+  const { llm, prompt, chat } = yield* launchBackgroundTask(reply().wait(release.promise).text("kept done").stop())
+  yield* llm.pushMatch((hit) => requestText(hit).includes("reverted question"), reply().hang())
+  const turnID = MessageID.ascending()
+  const turn = yield* prompt
+    .prompt({
+      sessionID: chat.id,
+      messageID: turnID,
+      agent: "build",
+      model: ref,
+      parts: [{ type: "text", text: "reverted question" }],
+    })
+    .pipe(Effect.forkChild)
+  yield* pollWithTimeout(
+    llm.hits.pipe(
+      Effect.map((hits) =>
+        hits.some((hit) => requestText(hit).includes("reverted question")) ? (true as const) : undefined,
+      ),
+    ),
+    "the turn never started",
+    "20 seconds",
+  )
+  release.resolve()
+  yield* pollWithTimeout(
+    MessageV2.filterCompactedEffect(chat.id).pipe(
+      Effect.map((messages) =>
+        textParts(messages).some((text) => text.includes("Background task completed")) ? (true as const) : undefined,
+      ),
+    ),
+    "the task result was never admitted while the turn ran",
+    "20 seconds",
+  )
+
+  yield* revert.revert({ sessionID: chat.id, messageID: turnID })
+
+  yield* Fiber.join(turn)
+  expect(Exit.isSuccess(yield* run.assertNotBusy(chat.id).pipe(Effect.exit))).toBe(true)
+  // The kept result is not delivered yet, so the session stays busy.
+  expect((yield* status.get(chat.id)).type).toBe("busy")
+  return { llm, prompt, chat }
+})
+
+it.instance(
+  "a task result admitted during a turn that revert stops is delivered after the revert is committed",
+  () =>
+    Effect.gen(function* () {
+      const { llm, prompt, chat } = yield* revertTurnWithAdmittedTaskResult()
+      yield* llm.textMatch((hit) => requestText(hit).includes("Background task completed"), "noted kept")
+
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        noReply: true,
+        parts: [{ type: "text", text: "after revert" }],
+      })
+      yield* idleStatus(chat.id, "the task result was never delivered after the revert was committed")
+
+      const texts = textParts(yield* MessageV2.filterCompactedEffect(chat.id))
+      expect(texts.some((text) => text.includes("kept done"))).toBe(true)
+      expect(texts).toContain("noted kept")
+      expect(texts.some((text) => text.includes("reverted question"))).toBe(false)
+      // No notification turn ran while the revert was staged.
+      const notified = (yield* llm.hits).filter((hit) => requestText(hit).includes("Background task completed"))
+      expect(notified.length).toBeGreaterThan(0)
+      expect(notified.every((hit) => requestText(hit).includes("after revert"))).toBe(true)
+    }),
+  30_000,
+)
+
+it.instance(
+  "a task result admitted during a turn that revert stops runs its turn after unrevert",
+  () =>
+    Effect.gen(function* () {
+      const revert = yield* SessionRevert.Service
+      const { llm, chat } = yield* revertTurnWithAdmittedTaskResult()
+      yield* llm.textMatch((hit) => requestText(hit).includes("Background task completed"), "noted kept")
+
+      yield* revert.unrevert({ sessionID: chat.id })
+      yield* idleStatus(chat.id, "the task result turn never ran after unrevert")
+
+      const texts = textParts(yield* MessageV2.filterCompactedEffect(chat.id))
+      expect(texts).toContain("reverted question")
+      expect(texts).toContain("noted kept")
+      // The restored notification is answered once. It is not admitted again.
+      expect(texts.filter((text) => text.includes("Background task completed"))).toHaveLength(1)
+      expect((yield* llm.hits).filter((hit) => requestText(hit).includes("Background task completed"))).toHaveLength(1)
+    }),
+  30_000,
+)
+
+// Starts a kept background task and a later finished turn. Then the task finishes, and the turn of its result hangs.
+const runNotificationTurnOfKeptTask = Effect.fn("test.runNotificationTurnOfKeptTask")(function* () {
+  const release = defer<void>()
+  const { llm, prompt, chat } = yield* launchBackgroundTask(reply().wait(release.promise).text("kept done").stop())
+  yield* llm.textMatch((hit) => requestText(hit).includes("second question"), "second answer")
+  const second = MessageID.ascending()
+  yield* prompt.prompt({
+    sessionID: chat.id,
+    messageID: second,
+    agent: "build",
+    model: ref,
+    parts: [{ type: "text", text: "second question" }],
+  })
+  yield* llm.pushMatch((hit) => requestText(hit).includes("Background task completed"), reply().hang())
+  release.resolve()
+  yield* pollWithTimeout(
+    llm.hits.pipe(
+      Effect.map((hits) =>
+        hits.some((hit) => requestText(hit).includes("Background task completed")) ? (true as const) : undefined,
+      ),
+    ),
+    "the turn of the task result never started",
+    "20 seconds",
+  )
+  const notification = (yield* MessageV2.filterCompactedEffect(chat.id)).findLast(
+    (message) => message.info.role === "user",
+  )
+  if (!notification || !textParts([notification]).some((text) => text.includes("Background task completed")))
+    return yield* Effect.die(new Error("the task result was not the last user message"))
+  return { llm, prompt, chat, second, notification: notification.info.id }
+})
+
+it.instance(
+  "undo of a running notification turn drops the task result after the revert is committed",
+  () =>
+    Effect.gen(function* () {
+      const revert = yield* SessionRevert.Service
+      const { llm, prompt, chat, notification } = yield* runNotificationTurnOfKeptTask()
+      // TUI and app undo revert at the last user message, which is the notification here.
+      yield* revert.revert({ sessionID: chat.id, messageID: notification })
+
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        noReply: true,
+        parts: [{ type: "text", text: "after undo" }],
+      })
+      yield* idleStatus(chat.id, "the session never became idle after the undone task result was dropped")
+
+      const texts = textParts(yield* MessageV2.filterCompactedEffect(chat.id))
+      expect(texts).toContain("second answer")
+      expect(texts).toContain("after undo")
+      expect(texts.some((text) => text.includes("Background task completed"))).toBe(false)
+      expect((yield* llm.hits).filter((hit) => requestText(hit).includes("Background task completed"))).toHaveLength(1)
+    }),
+  30_000,
+)
+
+it.instance(
+  "a revert that starts before a running notification turn admits the task result again after it is committed",
+  () =>
+    Effect.gen(function* () {
+      const revert = yield* SessionRevert.Service
+      const { llm, prompt, chat, second } = yield* runNotificationTurnOfKeptTask()
+      yield* llm.textMatch((hit) => requestText(hit).includes("Background task completed"), "noted kept")
+      yield* revert.revert({ sessionID: chat.id, messageID: second })
+
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        noReply: true,
+        parts: [{ type: "text", text: "after revert" }],
+      })
+      yield* idleStatus(chat.id, "the task result was never admitted again after the revert was committed")
+
+      const texts = textParts(yield* MessageV2.filterCompactedEffect(chat.id))
+      expect(texts.some((text) => text.includes("second question"))).toBe(false)
+      expect(texts.filter((text) => text.includes("Background task completed"))).toHaveLength(1)
+      expect(texts).toContain("noted kept")
+    }),
+  30_000,
+)
+
+// Starts a kept background task, then a turn that starts a second task, and stages a revert of that turn.
+// The kept task finishes while the revert is staged.
+const finishKeptTaskWhileRevertStaged = Effect.fn("test.finishKeptTaskWhileRevertStaged")(function* () {
+  const revert = yield* SessionRevert.Service
+  const status = yield* SessionStatus.Service
+  const jobs = yield* BackgroundJob.Service
+  const release = defer<void>()
+  const {
+    llm,
+    prompt,
+    chat,
+    job: kept,
+  } = yield* launchBackgroundTask(reply().wait(release.promise).text("kept done").stop())
+  yield* llm.toolMatch((hit) => requestText(hit).includes("start reverted task"), "task", {
+    description: "reverted task",
+    prompt: "inspect the reverted path",
+    subagent_type: "general",
+  })
+  yield* llm.pushMatch(
+    (hit) => requestText(hit).includes(chat.id) && requestText(hit).includes("inspect the reverted path"),
+    reply().hang(),
+  )
+  yield* llm.textMatch((hit) => requestText(hit).includes("inspect the reverted path"), "launched reverted")
+  const turnID = MessageID.ascending()
+  yield* prompt.prompt({
+    sessionID: chat.id,
+    messageID: turnID,
+    agent: "build",
+    model: ref,
+    parts: [{ type: "text", text: "start reverted task" }],
+  })
+  const reverted = (yield* jobs.list()).find((item) => item.title === "reverted task")
+  if (!reverted) return yield* Effect.die(new Error("the reverted task was not started"))
+  yield* revert.revert({ sessionID: chat.id, messageID: turnID })
+  expect((yield* jobs.get(reverted.id))?.status).toBe("cancelled")
+
+  release.resolve()
+  yield* pollWithTimeout(
+    jobs.get(kept.id).pipe(Effect.map((info) => (info?.status === "completed" ? (true as const) : undefined))),
+    "the kept task never finished",
+    "20 seconds",
+  )
+  // The held result keeps the session busy and is not admitted into the reverted history.
+  expect((yield* status.get(chat.id)).type).toBe("busy")
+  expect(
+    textParts(yield* MessageV2.filterCompactedEffect(chat.id)).some((text) => text.includes("Background task")),
+  ).toBe(false)
+  return { llm, prompt, chat }
+})
+
+it.instance(
+  "a background task result held while a revert is staged is delivered after the revert is committed",
+  () =>
+    Effect.gen(function* () {
+      const { llm, prompt, chat } = yield* finishKeptTaskWhileRevertStaged()
+      yield* llm.textMatch((hit) => requestText(hit).includes("Background task completed"), "noted kept")
+
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        noReply: true,
+        parts: [{ type: "text", text: "after revert" }],
+      })
+      yield* idleStatus(chat.id, "the held task result was never delivered after the revert was committed")
+
+      const texts = textParts(yield* MessageV2.filterCompactedEffect(chat.id))
+      expect(texts.some((text) => text.includes("kept done"))).toBe(true)
+      expect(texts).toContain("noted kept")
+      expect(texts.some((text) => text.includes("start reverted task") || text.includes("Task cancelled"))).toBe(false)
+    }),
+  30_000,
+)
+
+it.instance(
+  "a background task result held while a revert is staged is delivered after unrevert",
+  () =>
+    Effect.gen(function* () {
+      const revert = yield* SessionRevert.Service
+      const { llm, chat } = yield* finishKeptTaskWhileRevertStaged()
+      yield* llm.textMatch((hit) => requestText(hit).includes("Background task completed"), "noted kept")
+
+      yield* revert.unrevert({ sessionID: chat.id })
+      yield* idleStatus(chat.id, "the held task result was never delivered after unrevert")
+
+      const texts = textParts(yield* MessageV2.filterCompactedEffect(chat.id))
+      expect(texts).toContain("start reverted task")
+      expect(texts.some((text) => text.includes("kept done"))).toBe(true)
+      expect(texts).toContain("noted kept")
+      expect(texts.some((text) => text.includes("Task cancelled"))).toBe(false)
+    }),
+  30_000,
+)
+
+it.instance(
+  "a held background task result is dropped when a later revert removes the message that started the task",
+  () =>
+    Effect.gen(function* () {
+      const revert = yield* SessionRevert.Service
+      const sessions = yield* Session.Service
+      const status = yield* SessionStatus.Service
+      const jobs = yield* BackgroundJob.Service
+      const release = defer<void>()
+      const { llm, prompt, chat, job } = yield* launchBackgroundTask(
+        reply().wait(release.promise).text("kept done").stop(),
+      )
+      const first = (yield* MessageV2.filterCompactedEffect(chat.id)).find((message) => message.info.role === "user")
+      if (!first) return yield* Effect.die(new Error("the task was not started by a user message"))
+      yield* llm.textMatch((hit) => requestText(hit).includes("second question"), "second answer")
+      const secondID = MessageID.ascending()
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        messageID: secondID,
+        agent: "build",
+        model: ref,
+        parts: [{ type: "text", text: "second question" }],
+      })
+      yield* revert.revert({ sessionID: chat.id, messageID: secondID })
+      release.resolve()
+      yield* pollWithTimeout(
+        jobs.get(job.id).pipe(Effect.map((info) => (info?.status === "completed" ? (true as const) : undefined))),
+        "the task never finished",
+        "20 seconds",
+      )
+      expect((yield* status.get(chat.id)).type).toBe("busy")
+
+      // The second undo moves the revert before the message that started the task.
+      yield* revert.revert({ sessionID: chat.id, messageID: first.info.id })
+      expect((yield* sessions.get(chat.id)).revert?.messageID).toBe(first.info.id)
+      yield* llm.textMatch((hit) => requestText(hit).includes("Background task completed"), "noted removed task")
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        noReply: true,
+        parts: [{ type: "text", text: "after second revert" }],
+      })
+      yield* idleStatus(chat.id, "the session never became idle after the held result was dropped")
+
+      const texts = textParts(yield* MessageV2.filterCompactedEffect(chat.id))
+      expect(texts.some((text) => text.includes("start background task"))).toBe(false)
+      expect(texts.some((text) => text.includes("Background task completed"))).toBe(false)
+    }),
+  30_000,
+)
+
+it.instance(
+  "abort while a background task result is held publishes idle",
+  () =>
+    Effect.gen(function* () {
+      const { prompt, chat } = yield* finishKeptTaskWhileRevertStaged()
+      yield* prompt.cancel(chat.id)
+      yield* idleStatus(chat.id, "the session never became idle after abort while a task result was held")
+    }),
+  30_000,
+)
+
+// Stages a revert and admits a background task result, which is held until the revert changes. Like the Task tool,
+// the continuation keeps a lease of the session until it ends.
+const holdTaskResult = Effect.fn("test.holdTaskResult")(function* () {
+  yield* useServerConfig(providerCfg)
+  const prompt = yield* SessionPrompt.Service
+  const revert = yield* SessionRevert.Service
+  const sessions = yield* Session.Service
+  const run = yield* SessionRunState.Service
+  const chat = yield* sessions.create({ title: "Pinned" })
+  yield* prompt.prompt({
+    sessionID: chat.id,
+    agent: "build",
+    model: ref,
+    noReply: true,
+    parts: [{ type: "text", text: "first" }],
+  })
+  const second = MessageID.ascending()
+  yield* prompt.prompt({
+    sessionID: chat.id,
+    messageID: second,
+    agent: "build",
+    model: ref,
+    noReply: true,
+    parts: [{ type: "text", text: "second" }],
+  })
+  yield* revert.revert({ sessionID: chat.id, messageID: second })
+  const checkpoint = yield* prompt.checkpoint(chat.id)
+  const lease = yield* run.retain(chat.id, checkpoint)
+  const continuation = yield* prompt.admitNotification(
+    { sessionID: chat.id, agent: "build", parts: [{ type: "text", text: "held result", synthetic: true }] },
+    checkpoint,
+  )
+  if (Option.isNone(lease) || Option.isNone(continuation))
+    return yield* Effect.die(new Error("the task result was not held"))
+  const held = yield* continuation.value.pipe(Effect.ensuring(lease.value), Effect.forkChild)
+  return { prompt, sessions, chat, held }
+})
+
+it.instance(
+  "abort ends the continuation of a held background task result",
+  () =>
+    Effect.gen(function* () {
+      const { prompt, chat, held } = yield* holdTaskResult()
+      yield* prompt.cancel(chat.id)
+
+      expect(Option.isSome(yield* Fiber.join(held).pipe(Effect.timeoutOption("5 seconds")))).toBe(true)
+      yield* idleStatus(chat.id, "the session never became idle after abort ended the held task result")
+      expect(textParts(yield* MessageV2.filterCompactedEffect(chat.id))).not.toContain("held result")
+    }),
+  30_000,
+)
+
+it.instance(
+  "deleting a session ends the continuation of a held background task result",
+  () =>
+    Effect.gen(function* () {
+      const { sessions, chat, held } = yield* holdTaskResult()
+      yield* sessions.remove(chat.id)
+
+      expect(Option.isSome(yield* Fiber.join(held).pipe(Effect.timeoutOption("5 seconds")))).toBe(true)
+    }),
+  30_000,
+)
+
+it.instance(
+  "abort ends the continuation of a task result whose turn a revert stopped",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const revert = yield* SessionRevert.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({ title: "Pinned" })
+      yield* llm.pushMatch((hit) => requestText(hit).includes("running question"), reply().hang())
+      const turnID = MessageID.ascending()
+      const turn = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          messageID: turnID,
+          agent: "build",
+          model: ref,
+          parts: [{ type: "text", text: "running question" }],
+        })
+        .pipe(Effect.forkChild)
+      yield* llm.wait(1).pipe(Effect.timeout("20 seconds"))
+      const continuation = yield* prompt.admitNotification(
+        { sessionID: chat.id, agent: "build", parts: [{ type: "text", text: "late result", synthetic: true }] },
+        yield* prompt.checkpoint(chat.id),
+      )
+      const delivery = yield* Option.getOrThrow(continuation).pipe(Effect.forkChild)
+      // Let the result's turn queue behind the running turn.
+      yield* Effect.sleep("100 millis")
+      yield* revert.revert({ sessionID: chat.id, messageID: turnID })
+      yield* Fiber.join(turn)
+      // Let the continuation wait for the staged revert.
+      yield* Effect.sleep("100 millis")
+
+      yield* prompt.cancel(chat.id)
+      expect(Option.isSome(yield* Fiber.join(delivery).pipe(Effect.timeoutOption("5 seconds")))).toBe(true)
+      yield* idleStatus(chat.id, "the session never became idle after abort ended the task result")
+      expect(yield* llm.calls).toBe(1)
+    }),
+  30_000,
+)
+
+// Starts a kept background task and a turn that hangs. The caller stops the turn with a turn-only interrupt, like
+// app Esc, and releases the task with `release`.
+const startTurnWithKeptTask = Effect.fn("test.startTurnWithKeptTask")(function* () {
+  const release = defer<void>()
+  const { llm, prompt, chat } = yield* launchBackgroundTask(reply().wait(release.promise).text("kept done").stop())
+  yield* llm.pushMatch((hit) => requestText(hit).includes("running question"), reply().hang())
+  const turn = yield* prompt
+    .prompt({
+      sessionID: chat.id,
+      agent: "build",
+      model: ref,
+      parts: [{ type: "text", text: "running question" }],
+    })
+    .pipe(Effect.forkChild)
+  yield* pollWithTimeout(
+    llm.hits.pipe(
+      Effect.map((hits) =>
+        hits.some((hit) => requestText(hit).includes("running question")) ? (true as const) : undefined,
+      ),
+    ),
+    "the turn never started",
+    "20 seconds",
+  )
+  return { llm, prompt, chat, turn, release: () => release.resolve() }
+})
+
+const taskResultAdmitted = (sessionID: SessionID) =>
+  pollWithTimeout(
+    MessageV2.filterCompactedEffect(sessionID).pipe(
+      Effect.map((messages) =>
+        textParts(messages).some((text) => text.includes("Background task completed")) ? (true as const) : undefined,
+      ),
+    ),
+    "the task result was never admitted",
+    "20 seconds",
+  )
+
+const requestsWith = (hits: { body: unknown }[], text: string) =>
+  hits.filter((hit) => requestText(hit).includes(text)).length
+
+it.instance(
+  "a background task result admitted during a turn that a turn-only interrupt stops waits for the next prompt",
+  () =>
+    Effect.gen(function* () {
+      const run = yield* SessionRunState.Service
+      const { llm, prompt, chat, turn, release } = yield* startTurnWithKeptTask()
+      release()
+      yield* taskResultAdmitted(chat.id)
+      // Let the result's turn queue behind the running turn.
+      yield* Effect.sleep("100 millis")
+
+      yield* run.interruptTurn(chat.id)
+      yield* Fiber.join(turn)
+      yield* idleStatus(chat.id, "the session never became idle after the turn-only interrupt")
+      expect(requestsWith(yield* llm.hits, "Background task completed")).toBe(0)
+
+      yield* llm.textMatch((hit) => requestText(hit).includes("next question"), "answered both")
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        parts: [{ type: "text", text: "next question" }],
+      })
+      const answered = (yield* llm.hits).filter((hit) => requestText(hit).includes("Background task completed"))
+      expect(answered.length).toBe(1)
+      expect(answered.every((hit) => requestText(hit).includes("next question"))).toBe(true)
+      expect(answered.every((hit) => requestText(hit).includes("kept done"))).toBe(true)
+      expect(textParts(yield* MessageV2.filterCompactedEffect(chat.id))).toContain("answered both")
+    }),
+  30_000,
+)
+
+it.instance(
+  "a background task result that arrives after a turn-only interrupt does not start a turn",
+  () =>
+    Effect.gen(function* () {
+      const run = yield* SessionRunState.Service
+      const { llm, chat, turn, release } = yield* startTurnWithKeptTask()
+      yield* run.interruptTurn(chat.id)
+      yield* Fiber.join(turn)
+
+      release()
+      yield* taskResultAdmitted(chat.id)
+      yield* idleStatus(chat.id, "the session never became idle after the task result was admitted")
+      expect(requestsWith(yield* llm.hits, "Background task completed")).toBe(0)
+    }),
+  30_000,
+)
+
+it.instance(
+  "a background task result after the next prompt starts a turn again after a turn-only interrupt",
+  () =>
+    Effect.gen(function* () {
+      const run = yield* SessionRunState.Service
+      const { llm, prompt, chat, turn, release } = yield* startTurnWithKeptTask()
+      yield* run.interruptTurn(chat.id)
+      yield* Fiber.join(turn)
+      yield* prompt.notify(
+        { sessionID: chat.id, agent: "build", parts: [{ type: "text", text: "early result", synthetic: true }] },
+        yield* prompt.checkpoint(chat.id),
+      )
+      expect(requestsWith(yield* llm.hits, "early result")).toBe(0)
+
+      yield* llm.textMatch((hit) => requestText(hit).includes("next question"), "answered early")
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        parts: [{ type: "text", text: "next question" }],
+      })
+      expect(requestsWith(yield* llm.hits, "early result")).toBe(1)
+
+      yield* llm.textMatch((hit) => requestText(hit).includes("Background task completed"), "noted kept")
+      release()
+      yield* idleStatus(chat.id, "the task result turn never ran after the next prompt")
+      expect(textParts(yield* MessageV2.filterCompactedEffect(chat.id))).toContain("noted kept")
+    }),
+  30_000,
+)
+
+// Stops a hanging turn with a turn-only interrupt and checks that a notification does not start a turn.
+const pauseNotificationTurns = Effect.fn("test.pauseNotificationTurns")(function* () {
+  const { llm } = yield* useServerConfig(providerCfg)
+  const prompt = yield* SessionPrompt.Service
+  const sessions = yield* Session.Service
+  const run = yield* SessionRunState.Service
+  const chat = yield* sessions.create({ title: "Pinned" })
+  yield* llm.pushMatch((hit) => requestText(hit).includes("running question"), reply().hang())
+  const turn = yield* prompt
+    .prompt({
+      sessionID: chat.id,
+      agent: "build",
+      model: ref,
+      parts: [{ type: "text", text: "running question" }],
+    })
+    .pipe(Effect.forkChild)
+  yield* llm.wait(1).pipe(Effect.timeout("20 seconds"))
+  yield* run.interruptTurn(chat.id)
+  yield* Fiber.join(turn)
+  yield* prompt.notify(
+    { sessionID: chat.id, agent: "build", parts: [{ type: "text", text: "early result", synthetic: true }] },
+    yield* prompt.checkpoint(chat.id),
+  )
+  expect(requestsWith(yield* llm.hits, "early result")).toBe(0)
+  return { llm, prompt, run, chat }
+})
+
+it.instance(
+  "abort ends the notification pause of a turn-only interrupt",
+  () =>
+    Effect.gen(function* () {
+      const { llm, prompt, chat } = yield* pauseNotificationTurns()
+      yield* prompt.cancel(chat.id)
+
+      yield* llm.textMatch((hit) => requestText(hit).includes("later result"), "noted later")
+      yield* prompt.notify(
+        { sessionID: chat.id, agent: "build", parts: [{ type: "text", text: "later result", synthetic: true }] },
+        yield* prompt.checkpoint(chat.id),
+      )
+      expect(requestsWith(yield* llm.hits, "later result")).toBe(1)
+      expect(textParts(yield* MessageV2.filterCompactedEffect(chat.id))).toContain("noted later")
+    }),
+  30_000,
+)
+
+it.instance(
+  "a revert stop ends the notification pause of a turn-only interrupt",
+  () =>
+    Effect.gen(function* () {
+      const { llm, prompt, run, chat } = yield* pauseNotificationTurns()
+      // Revert and unrevert both stop the turn this way.
+      yield* Effect.scoped(run.stopTurn(chat.id))
+
+      yield* llm.textMatch((hit) => requestText(hit).includes("later result"), "noted later")
+      yield* prompt.notify(
+        { sessionID: chat.id, agent: "build", parts: [{ type: "text", text: "later result", synthetic: true }] },
+        yield* prompt.checkpoint(chat.id),
+      )
+      expect(requestsWith(yield* llm.hits, "later result")).toBe(1)
+      expect(textParts(yield* MessageV2.filterCompactedEffect(chat.id))).toContain("noted later")
+    }),
+  30_000,
+)
+
+const notificationPreparations = { value: 0 }
+const countNotificationPreparations = testEffect(
+  makeHttp({
+    plugin: Layer.succeed(
+      Plugin.Service,
+      Plugin.Service.of({
+        trigger: (name, _input, output) =>
+          Effect.sync(() => {
+            if (name === "chat.message" && JSON.stringify(output).includes("Background task completed"))
+              notificationPreparations.value++
+            return output
+          }),
+        list: () => Effect.succeed([]),
+        init: () => Effect.void,
+      }),
+    ),
+  }),
+)
+
+countNotificationPreparations.instance(
+  "a held background task result is prepared once across revert changes",
+  () =>
+    Effect.gen(function* () {
+      const revert = yield* SessionRevert.Service
+      const sessions = yield* Session.Service
+      notificationPreparations.value = 0
+      const { llm, prompt, chat } = yield* finishKeptTaskWhileRevertStaged()
+      expect(notificationPreparations.value).toBe(1)
+
+      // Revert changes of another Session do not wake the held result.
+      const other = yield* sessions.create({})
+      const message = yield* prompt.prompt({
+        sessionID: other.id,
+        agent: "build",
+        model: ref,
+        noReply: true,
+        parts: [{ type: "text", text: "other question" }],
+      })
+      yield* revert.revert({ sessionID: other.id, messageID: message.info.id })
+      yield* revert.unrevert({ sessionID: other.id })
+
+      yield* llm.textMatch((hit) => requestText(hit).includes("Background task completed"), "noted kept")
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        noReply: true,
+        parts: [{ type: "text", text: "after revert" }],
+      })
+      yield* idleStatus(chat.id, "the held task result was never delivered after the revert was committed")
+      expect(textParts(yield* MessageV2.filterCompactedEffect(chat.id))).toContain("noted kept")
+      expect(notificationPreparations.value).toBe(1)
+      // The held result gets new IDs, so it follows the prompt that committed the revert.
+      const messages = yield* sessions.messages({ sessionID: chat.id })
+      const position = (text: string) =>
+        messages.findIndex((item) => item.parts.some((part) => part.type === "text" && part.text.includes(text)))
+      expect(position("Background task completed")).toBeGreaterThan(position("after revert"))
+    }),
+  30_000,
+)
+
+it.instance(
+  "revert cancels a background task that a reverted message resumed",
+  () =>
+    Effect.gen(function* () {
+      const revert = yield* SessionRevert.Service
+      const jobs = yield* BackgroundJob.Service
+      const { llm, prompt, chat, job } = yield* launchBackgroundTask(reply().hang())
+      yield* llm.toolMatch((hit) => requestText(hit).includes("resume the task"), "task", {
+        description: "inspect bug",
+        prompt: "look at the cache key again",
+        subagent_type: "general",
+        task_id: job.id,
+      })
+      yield* llm.textMatch(
+        (hit) => requestText(hit).includes("look at the cache key again") && !requestText(hit).includes(chat.id),
+        "resumed",
+      )
+      const turnID = MessageID.ascending()
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        messageID: turnID,
+        agent: "build",
+        model: ref,
+        parts: [{ type: "text", text: "resume the task" }],
+      })
+      const parts = (yield* MessageV2.filterCompactedEffect(chat.id)).flatMap((message) => message.parts)
+      expect(
+        parts.some(
+          (part) =>
+            part.type === "tool" &&
+            part.state.status === "completed" &&
+            part.state.output.includes("Background task updated"),
+        ),
+      ).toBe(true)
+      expect((yield* jobs.get(job.id))?.status).toBe("running")
+
+      yield* revert.revert({ sessionID: chat.id, messageID: turnID })
+
+      expect((yield* jobs.get(job.id))?.status).toBe("cancelled")
+      yield* idleStatus(chat.id, "session never became idle after the resumed task was cancelled")
+    }),
+  30_000,
+)
+
+it.instance(
+  "an interrupted revert stop ends even when the running turn does not stop",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const run = yield* SessionRunState.Service
+      const chat = yield* sessions.create({})
+      const message = yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        noReply: true,
+        parts: [{ type: "text", text: "hello" }],
+      })
+      const release = yield* Deferred.make<void>()
+      const started = yield* Deferred.make<void>()
+      yield* Effect.gen(function* () {
+        // This turn cannot be interrupted until it is released.
+        yield* run
+          .ensureRunning(
+            chat.id,
+            Effect.succeed(message),
+            Deferred.succeed(started, undefined).pipe(
+              Effect.andThen(Deferred.await(release)),
+              Effect.uninterruptible,
+              Effect.as(message),
+            ),
+          )
+          .pipe(Effect.forkChild)
+        yield* Deferred.await(started)
+        // Starts immediately, so the stop is open before the busy check below.
+        const stop = yield* Effect.scoped(run.stopTurn(chat.id)).pipe(Effect.forkChild({ startImmediately: true }))
+        expect(Exit.isFailure(yield* Effect.scoped(run.stopTurn(chat.id)).pipe(Effect.exit))).toBe(true)
+
+        expect(Option.isSome(yield* Fiber.interrupt(stop).pipe(Effect.timeoutOption("2 seconds")))).toBe(true)
+
+        // The interrupted stop is closed, so the next revert is not busy.
+        const next = yield* Effect.scoped(run.stopTurn(chat.id)).pipe(Effect.exit, Effect.forkChild)
+        yield* Deferred.succeed(release, undefined)
+        expect(Exit.isSuccess(yield* Fiber.join(next))).toBe(true)
+      }).pipe(Effect.ensuring(Deferred.succeed(release, undefined)))
+    }),
+  30_000,
+)
+
+it.instance(
+  "a prompt sent while a revert is in progress runs after the revert finishes",
+  () =>
+    Effect.gen(function* () {
+      const { llm } = yield* useServerConfig(providerCfg)
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const run = yield* SessionRunState.Service
+      const chat = yield* sessions.create({
+        title: "Pinned",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      yield* llm.textMatch((hit) => requestText(hit).includes("first question"), "first answer")
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        parts: [{ type: "text", text: "first question" }],
+      })
+      yield* llm.textMatch((hit) => requestText(hit).includes("prompt during revert"), "answered after revert")
+      const scope = yield* Scope.make()
+      yield* run.stopTurn(chat.id).pipe(Scope.provide(scope))
+      const answer = yield* prompt
+        .prompt({
+          sessionID: chat.id,
+          agent: "build",
+          model: ref,
+          parts: [{ type: "text", text: "prompt during revert" }],
+        })
+        .pipe(Effect.forkChild)
+
+      // The prompt waits for the revert instead of saving a message that no turn answers.
+      expect(Option.isNone(yield* Fiber.join(answer).pipe(Effect.timeoutOption("1 second")))).toBe(true)
+      expect(textParts(yield* sessions.messages({ sessionID: chat.id }))).not.toContain("prompt during revert")
+
+      yield* Scope.close(scope, Exit.void)
+      expect(textParts([yield* Fiber.join(answer)])).toContain("answered after revert")
+    }),
+  30_000,
+)
+
+it.instance(
+  "no turn starts while a revert stop is open",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const run = yield* SessionRunState.Service
+      const chat = yield* sessions.create({})
+      const message = yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        model: ref,
+        noReply: true,
+        parts: [{ type: "text", text: "hello" }],
+      })
+      const started = { value: false }
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          yield* run.stopTurn(chat.id)
+          // A queued task notification asks for a turn in the same way.
+          const result = yield* run.ensureRunning(
+            chat.id,
+            Effect.succeed(message),
+            Effect.sync(() => {
+              started.value = true
+              return message
+            }),
+          )
+          expect(result.info.id).toBe(message.info.id)
+          expect(started.value).toBe(false)
+          expect(Exit.isSuccess(yield* run.assertNotBusy(chat.id).pipe(Effect.exit))).toBe(true)
+        }),
+      )
     }),
   30_000,
 )
