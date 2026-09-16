@@ -76,7 +76,7 @@ type RunLocalInput = {
 
 type StreamTransportModule = Pick<
   Awaited<typeof import("./stream.transport")>,
-  "createSessionTransport" | "formatUnknownError"
+  "createSessionTransport" | "formatUnknownError" | "ShownTurnError"
 >
 
 export type RunRuntimeDeps = {
@@ -663,9 +663,13 @@ async function runInteractiveRuntime(input: RunRuntimeInput, deps: RunRuntimeDep
             return
           }
 
-          const text =
-            (await state.stream?.then((item) => item.mod).catch(() => undefined))?.formatUnknownError(error) ??
-            (error instanceof Error ? error.message : String(error))
+          const mod = await state.stream?.then((item) => item.mod).catch(() => undefined)
+          // The server already showed this failure as a session error row.
+          if (mod && error instanceof mod.ShownTurnError) {
+            return
+          }
+
+          const text = mod?.formatUnknownError(error) ?? (error instanceof Error ? error.message : String(error))
           const commit = {
             kind: "error",
             text,

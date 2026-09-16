@@ -59,6 +59,7 @@ type FilePart = {
 }
 
 const ATTACH_FILE_MAX_BYTES = 10 * 1024 * 1024
+const RECONNECT_ATTEMPTS = 5
 
 type Inline = {
   icon: string
@@ -692,12 +693,11 @@ export const RunCommand = effectCmd({
           return false
         }
 
-        let finishAttachRecovery = async () => {}
-
         // Consume one subscribed event stream for the active session and mirror it
-        // to stdout/UI. `client` is passed explicitly because attach mode may
-        // rebind the SDK to the session's directory after the subscription is
-        // created, and replies issued from inside the loop must use that client.
+        // to stdout/UI until the session is idle. `client` is passed explicitly
+        // because attach mode may rebind the SDK to the session's directory after
+        // the subscription is created, and replies issued from inside the loop
+        // must use that client.
         async function loop(
           client: OpencodeClient,
           events: Awaited<ReturnType<typeof sdk.event.subscribe>>,
@@ -706,6 +706,7 @@ export const RunCommand = effectCmd({
           const toggles = new Map<string, boolean>()
           let error: string | undefined
           let idle = false
+          let disposed = false
           // Keep only the run root. Every descendant permission revalidates its
           // current immutable Task edges against this root.
           const ancestryAbort = new AbortController()
@@ -778,37 +779,50 @@ export const RunCommand = effectCmd({
             return pending
           }
 
-          // The event stream has no replay. Recover requests that predate the
-          // subscription and deduplicate them against events arriving while the
-          // list call is in flight. Requests that were already pending when this
-          // run started wait for a human, so recovery leaves them alone. If that
-          // list is unknown, recovery answers nothing.
+          // Tell the user once why the run waits for a request that recovery leaves for a human.
+          const noticed = new Set<string>()
+          async function noticeEarlierPermission(permission: PermissionRequest) {
+            if (noticed.has(permission.id)) return
+            noticed.add(permission.id)
+            const ownership = await resolveSessionTreeOwnership(client, tree, permission.sessionID, {
+              signal: ancestryAbort.signal,
+            })
+            if (ownership.type !== "owned") return
+            UI.println(
+              UI.Style.TEXT_WARNING_BOLD + "!",
+              UI.Style.TEXT_NORMAL +
+                `waiting for a human to answer permission ${permission.permission} (${permission.patterns.join(", ")}), which was pending before this run started`,
+            )
+          }
+
+          // The event stream has no replay. Once it is connected, recover requests
+          // raised before that and deduplicate them against events arriving while
+          // the list call is in flight. Requests that were already pending when
+          // this run started wait for a human, so recovery leaves them alone. If
+          // that list is unknown, recovery answers nothing.
           const recoverPermissions = async () => {
             if (!earlierPermissions) return
             const response = await client.permission.list(undefined, {
               signal: ancestryAbort.signal,
               throwOnError: true,
             })
-            await Promise.all(
-              (response.data ?? []).filter((permission) => !earlierPermissions.has(permission.id)).map(routePermission),
-            )
+            const pending = response.data ?? []
+            await Promise.all([
+              ...pending.filter((permission) => !earlierPermissions.has(permission.id)).map(routePermission),
+              ...pending.filter((permission) => earlierPermissions.has(permission.id)).map(noticeEarlierPermission),
+            ])
           }
-          const recoveredPermissions = args.attach
-            ? recoverPermissions().catch((failure) =>
-                UI.error(`failed to recover pending permissions (${String(failure)})`),
-              )
-            : Promise.resolve()
-          finishAttachRecovery = async () => {
-            await recoveredPermissions
-            await recoverPermissions().catch((failure) =>
-              UI.error(`failed to finish pending permission recovery (${String(failure)})`),
-            )
-            ancestryAbort.abort()
-            await Promise.allSettled(pendingPermissions.values())
-          }
+          let recoveredPermissions = Promise.resolve()
 
           try {
             for await (const event of events.stream) {
+              if (event.type === "server.connected" && args.attach) {
+                recoveredPermissions = recoverPermissions().catch((failure) => {
+                  if (!ancestryAbort.signal.aborted)
+                    UI.error(`failed to recover pending permissions (${String(failure)})`)
+                })
+              }
+
               if (
                 event.type === "message.updated" &&
                 event.properties.sessionID === sessionID &&
@@ -909,9 +923,23 @@ export const RunCommand = effectCmd({
                 // are ignored after the bounded ancestry check.
                 routePermission(event.properties)
               }
+
+              // Disposal stops the session's work. A reconnect would only reach a new instance.
+              if (event.type === "server.instance.disposed" && args.attach) {
+                disposed = true
+                const message = "the server disposed the instance before the session became idle"
+                error = error ? error + EOL + message : message
+                UI.error(message)
+                break
+              }
+            }
+            if (!idle && !disposed && args.attach) {
+              const message = "lost the server event stream before the session became idle"
+              error = error ? error + EOL + message : message
+              UI.error(message)
             }
           } finally {
-            if (!idle || !args.attach) ancestryAbort.abort()
+            ancestryAbort.abort()
             await recoveredPermissions
             await Promise.allSettled(pendingPermissions.values())
           }
@@ -936,16 +964,96 @@ export const RunCommand = effectCmd({
                   return undefined
                 })
             : new Set<string>()
-          const events = await client.event.subscribe()
-          const completed = loop(client, events, earlierPermissions).catch((e) => {
-            console.error(e)
-            process.exitCode = 1
-          })
-          async function finish() {
-            if (args.attach) {
-              await finishAttachRecovery()
-              return
+          // The run waits for idle, so a remote stream must not retry a server that is gone forever.
+          // Each stream ends on its first failure, or after a minute without the 10 second heartbeat.
+          let disconnect = new AbortController()
+          let silentIntervals = 0
+          const watchdog = args.attach
+            ? setInterval(() => {
+                silentIntervals += 1
+                if (silentIntervals >= 6) disconnect.abort()
+              }, 10_000)
+            : undefined
+          const subscribe = () => {
+            disconnect.abort()
+            disconnect = new AbortController()
+            silentIntervals = 0
+            return client.event.subscribe(
+              undefined,
+              args.attach
+                ? {
+                    signal: disconnect.signal,
+                    sseMaxRetryAttempts: 1,
+                    onSseEvent: () => {
+                      silentIntervals = 0
+                    },
+                  }
+                : undefined,
+            )
+          }
+          const first = await subscribe()
+          // An attached run opens a new stream a few times when one ends before the session is idle.
+          // The stream has no replay, so after each reconnect the run checks whether the session
+          // became idle while it was disconnected. Output and errors from that time are lost, so the
+          // run reports an error before the idle event and fails.
+          async function* events() {
+            yield* first.stream
+            let reconnects = 0
+            while (args.attach && reconnects < RECONNECT_ATTEMPTS) {
+              reconnects += 1
+              UI.println(
+                UI.Style.TEXT_WARNING_BOLD + "!",
+                UI.Style.TEXT_NORMAL + `event stream disconnected; reconnecting (${reconnects}/${RECONNECT_ATTEMPTS})`,
+              )
+              await Bun.sleep(Math.min(500 * 2 ** (reconnects - 1), 4_000))
+              for await (const event of (await subscribe()).stream) {
+                yield event
+                if (event.type !== "server.connected") continue
+                const signal = disconnect.signal
+                const status = await client.session
+                  .status(undefined, { signal, throwOnError: true })
+                  .catch((failure) => {
+                    if (!signal.aborted) UI.error(`failed to check the session status (${String(failure)})`)
+                    return undefined
+                  })
+                // Without a status, drop this stream so the next one checks again.
+                if (!status) {
+                  disconnect.abort()
+                  continue
+                }
+                // The new stream works, so a later drop starts a new reconnect budget.
+                reconnects = 0
+                if (status.data?.[sessionID]) continue
+                yield {
+                  id: "reconnected-error",
+                  type: "session.error" as const,
+                  properties: {
+                    sessionID,
+                    error: {
+                      name: "UnknownError" as const,
+                      data: {
+                        message:
+                          "session became idle while the event stream was disconnected; output from that time is missing",
+                      },
+                    },
+                  },
+                }
+                yield {
+                  id: "reconnected-idle",
+                  type: "session.status" as const,
+                  properties: { sessionID, status: { type: "idle" as const } },
+                }
+              }
             }
+          }
+          const completed = loop(client, { stream: events() }, earlierPermissions)
+            .catch((e) => {
+              console.error(e)
+              process.exitCode = 1
+            })
+            .finally(() => clearInterval(watchdog))
+          // Background Task results arrive after the prompt returns. Wait until the session is idle.
+          async function finish() {
             const error = await completed
             if (error) process.exitCode = 1
           }
