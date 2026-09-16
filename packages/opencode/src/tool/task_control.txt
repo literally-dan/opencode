@@ -1,5 +1,7 @@
-List or stop running subagent tasks owned by the current session.
+Inspect or stop subagent tasks owned by the current session.
 
-Use action="list" to see running tasks and their task_id values. Use action="stop" with a task_id to cancel that task and its running descendants. You cannot view or stop tasks owned by unrelated sessions.
+Use action="list" to see the live descendant tree, including execution phase, current tool, last activity, result-delivery state, and detached work. Use action="stop" with a task_id to cancel that task and its active descendants. You cannot view or stop siblings or unrelated sessions.
 
-Do not repeatedly list tasks to poll for completion. Task results are delivered automatically.
+Use scope="ancestors" only when this task was spawned with read-only ancestor status access. Ancestor access never grants stop permission.
+
+Do not poll repeatedly. Query when you need to reconcile missing completion, investigate quiet work, or inspect the current task tree. Task results are still delivered automatically.

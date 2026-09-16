@@ -6,6 +6,7 @@ import { Effect, Layer } from "effect"
 export {
   Service,
   type ExtendInput,
+  type HoldInput,
   type Info,
   type Interface,
   type StartInput,
@@ -24,6 +25,7 @@ const layer = Layer.effect(
       get: (id) => InstanceState.useEffect(state, (jobs) => jobs.get(id)),
       start: (input) => InstanceState.useEffect(state, (jobs) => jobs.start(input)),
       extend: (input) => InstanceState.useEffect(state, (jobs) => jobs.extend(input)),
+      hold: (input) => InstanceState.useEffect(state, (jobs) => jobs.hold(input)),
       wait: (input) => InstanceState.useEffect(state, (jobs) => jobs.wait(input)),
       cancel: (id) => InstanceState.useEffect(state, (jobs) => jobs.cancel(id)),
     })

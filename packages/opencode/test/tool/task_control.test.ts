@@ -1,17 +1,14 @@
 import { describe, expect } from "bun:test"
-import { BackgroundJob } from "@opencode-ai/core/background-job"
-import { Deferred, Effect, Layer } from "effect"
+import { Effect, Layer } from "effect"
 import { MessageID, SessionID } from "@/session/schema"
+import { SessionTaskState } from "@/session/task-state"
 import { make } from "@/tool/task_control"
 import { testEffect } from "../lib/effect"
 
 const it = testEffect(Layer.empty)
-
-const root = SessionID.make("ses_root")
-const child = SessionID.make("ses_child")
-const grandchild = SessionID.make("ses_grandchild")
-const sibling = SessionID.make("ses_sibling")
-const unrelated = SessionID.make("ses_unrelated")
+const root = sessionID(1)
+const child = sessionID(2)
+const grandchild = sessionID(3)
 
 const context = {
   sessionID: root,
@@ -24,188 +21,174 @@ const context = {
 }
 
 describe("tool.task_control", () => {
-  it.instance("lists only running Task descendants", () =>
+  it.effect("renders the canonical nested task tree", () =>
     Effect.gen(function* () {
-      const jobs = yield* BackgroundJob.make
-      yield* jobs.start({
-        id: child,
-        type: "task",
-        title: "Child task",
-        metadata: { parentSessionId: root, sessionId: child },
-        run: Effect.never,
-      })
-      yield* jobs.start({
-        id: grandchild,
-        type: "task",
-        title: "Grandchild task",
-        metadata: { parentSessionId: child, sessionId: grandchild },
-        run: Effect.never,
-      })
-      yield* jobs.start({
-        id: unrelated,
-        type: "task",
-        title: "Unrelated task",
-        metadata: { parentSessionId: SessionID.make("ses_other"), sessionId: unrelated },
-        run: Effect.never,
-      })
-      yield* jobs.start({
-        id: "job_other",
-        type: "other",
-        title: "Other job",
-        metadata: { parentSessionId: root, sessionId: "job_other" },
-        run: Effect.never,
-      })
-      const def = make(jobs)
+      const def = make(
+        state({
+          allowed: true,
+          scope: "descendants",
+          nodes: [
+            node(child, {
+              title: "Child task",
+              phase: "model",
+              children: [
+                node(grandchild, {
+                  title: "Grandchild task",
+                  phase: "tool",
+                  currentTool: { name: "bash", title: "Run checks", startedAt: 1 },
+                }),
+              ],
+            }),
+          ],
+        }),
+      )
 
       const result = yield* def.execute({ action: "list" }, context)
 
       expect(result.metadata.count).toBe(2)
-      expect(result.output).toContain(`${child}: Child task`)
-      expect(result.output).toContain(`${grandchild}: Grandchild task`)
-      expect(result.output).not.toContain("Unrelated task")
-      expect(result.output).not.toContain("Other job")
+      expect(result.metadata.tasks[0]?.children[0]?.taskID).toBe(grandchild)
+      expect(result.output).toContain(`${child} [running/model`)
+      expect(result.output).toContain(`${grandchild} [running/tool`)
+      expect(result.output).toContain("current tool: bash (Run checks)")
     }),
   )
 
-  it.instance("stops one Task and its descendants without cancelling unrelated work", () =>
+  it.effect("renders shortened errors for failed and cancelled tasks", () =>
     Effect.gen(function* () {
-      const jobs = yield* BackgroundJob.make
-      const childStarted = yield* Deferred.make<void>()
-      const grandchildStarted = yield* Deferred.make<void>()
-      yield* jobs.start({
-        id: child,
-        type: "task",
-        metadata: { parentSessionId: root, sessionId: child },
-        run: Deferred.succeed(childStarted, undefined).pipe(Effect.andThen(Effect.never)),
-      })
-      yield* jobs.start({
-        id: grandchild,
-        type: "task",
-        metadata: { parentSessionId: child, sessionId: grandchild },
-        run: Deferred.succeed(grandchildStarted, undefined).pipe(Effect.andThen(Effect.never)),
-      })
-      yield* jobs.start({
-        id: unrelated,
-        type: "task",
-        metadata: { parentSessionId: SessionID.make("ses_other"), sessionId: unrelated },
-        run: Effect.never,
-      })
-      yield* Deferred.await(childStarted)
-      yield* Deferred.await(grandchildStarted)
-      const def = make(jobs)
+      const def = make(
+        state({
+          allowed: true,
+          scope: "descendants",
+          nodes: [
+            node(child, {
+              title: "Failed task",
+              execution: "error",
+              phase: "idle",
+              error: `Subagent failed (task_id: ${child}): The subagent stopped.\n\nPartial output before the failure:\n${"x".repeat(300)}`,
+            }),
+            node(grandchild, {
+              title: "Cancelled task",
+              execution: "cancelled",
+              phase: "idle",
+              error: "Task cancelled",
+            }),
+            node(sessionID(4), { title: "Completed task", execution: "completed", phase: "idle", error: "stale" }),
+          ],
+        }),
+      )
+
+      const result = yield* def.execute({ action: "list" }, context)
+      const lines = result.output.split("\n")
+
+      expect(lines[2]).toBe(
+        `  error: Subagent failed (task_id: ${child}): The subagent stopped. Partial output before the failure: ${"x".repeat(83)}…`,
+      )
+      expect(lines[3]).toContain(`${grandchild} [cancelled/idle`)
+      expect(lines[4]).toBe("  error: Task cancelled")
+      expect(lines[5]).toContain(`${sessionID(4)} [completed/idle`)
+      expect(lines).toHaveLength(6)
+    }),
+  )
+
+  it.effect("reports denied ancestor visibility", () =>
+    Effect.gen(function* () {
+      const def = make(state({ allowed: false, scope: "ancestors", nodes: [] }))
+
+      const result = yield* def.execute({ action: "list", scope: "ancestors" }, context)
+
+      expect(result.metadata).toMatchObject({ count: 0, scope: "ancestors" })
+      expect(result.output).toContain("not granted")
+    }),
+  )
+
+  it.effect("delegates descendant cancellation", () =>
+    Effect.gen(function* () {
+      let stopped: { sessionID: SessionID; taskID: SessionID } | undefined
+      const def = make(
+        state({ allowed: true, scope: "descendants", nodes: [node(child)] }, (input) => {
+          stopped = input
+          return Effect.succeed({ stopped: [child, grandchild], unavailable: [] })
+        }),
+      )
 
       const result = yield* def.execute({ action: "stop", task_id: child }, context)
 
+      expect(stopped).toEqual({ sessionID: root, taskID: child })
       expect(result.metadata).toMatchObject({ taskId: child, stopped: true, count: 2 })
-      expect((yield* jobs.get(child))?.status).toBe("cancelled")
-      expect((yield* jobs.get(grandchild))?.status).toBe("cancelled")
-      expect((yield* jobs.get(unrelated))?.status).toBe("running")
+      expect(result.output).toContain("and 1 active descendant")
     }),
   )
 
-  it.instance("stops a running descendant after its parent Task completes", () =>
+  it.effect("reports tasks it cannot stop from another location", () =>
     Effect.gen(function* () {
-      const jobs = yield* BackgroundJob.make
-      yield* jobs.start({
-        id: child,
-        type: "task",
-        metadata: { parentSessionId: root, sessionId: child, ancestorSessionIds: [root] },
-        run: Effect.succeed("done"),
-      })
-      yield* jobs.wait({ id: child })
-      yield* jobs.start({
-        id: grandchild,
-        type: "task",
-        title: "Orphaned grandchild",
-        metadata: { parentSessionId: child, sessionId: grandchild, ancestorSessionIds: [child, root] },
-        run: Effect.never,
-      })
-      const def = make(jobs)
+      const def = make(
+        state({ allowed: true, scope: "descendants", nodes: [node(child, { execution: "unknown" })] }, () =>
+          Effect.succeed({ stopped: [], unavailable: [child] }),
+        ),
+      )
 
-      const listed = yield* def.execute({ action: "list" }, context)
-      expect(listed.metadata.count).toBe(1)
-      expect(listed.output).toContain(`${grandchild}: Orphaned grandchild`)
+      const result = yield* def.execute({ action: "stop", task_id: child }, context)
 
-      const stopped = yield* def.execute({ action: "stop", task_id: grandchild }, context)
-      expect(stopped.metadata).toMatchObject({ taskId: grandchild, stopped: true, count: 1 })
-      expect((yield* jobs.get(grandchild))?.status).toBe("cancelled")
+      expect(result.title).toBe("Task in another location")
+      expect(result.metadata.stopped).toBe(false)
+      expect(result.output).toBe(
+        `Task ${child} was not stopped. 1 unfinished task in another location could not be observed or stopped from here: ${child}.`,
+      )
     }),
   )
 
-  it.instance("uses legacy metadata through a completed intermediate Task", () =>
+  it.effect("never delegates an ancestor stop", () =>
     Effect.gen(function* () {
-      const jobs = yield* BackgroundJob.make
-      yield* jobs.start({
-        id: child,
-        type: "task",
-        metadata: { parentSessionId: root, sessionId: child },
-        run: Effect.succeed("done"),
-      })
-      yield* jobs.wait({ id: child })
-      yield* jobs.start({
-        id: grandchild,
-        type: "task",
-        title: "Legacy grandchild",
-        metadata: { parentSessionId: child, sessionId: grandchild },
-        run: Effect.never,
-      })
-      const def = make(jobs)
+      let called = false
+      const def = make(
+        state({ allowed: true, scope: "ancestors", nodes: [node(child)] }, () => {
+          called = true
+          return Effect.succeed({ stopped: [child], unavailable: [] })
+        }),
+      )
 
-      const listed = yield* def.execute({ action: "list" }, context)
-      expect(listed.output).toContain(`${grandchild}: Legacy grandchild`)
+      const result = yield* def.execute({ action: "stop", task_id: child, scope: "ancestors" }, context)
 
-      const stopped = yield* def.execute({ action: "stop", task_id: grandchild }, context)
-      expect(stopped.metadata).toMatchObject({ taskId: grandchild, stopped: true, count: 1 })
-      expect((yield* jobs.get(grandchild))?.status).toBe("cancelled")
-    }),
-  )
-
-  it.instance("does not expose a sibling Task to a child session", () =>
-    Effect.gen(function* () {
-      const jobs = yield* BackgroundJob.make
-      yield* jobs.start({
-        id: grandchild,
-        type: "task",
-        title: "Owned grandchild",
-        metadata: { parentSessionId: child, sessionId: grandchild, ancestorSessionIds: [child, root] },
-        run: Effect.never,
-      })
-      yield* jobs.start({
-        id: sibling,
-        type: "task",
-        title: "Sibling task",
-        metadata: { parentSessionId: root, sessionId: sibling, ancestorSessionIds: [root] },
-        run: Effect.never,
-      })
-      const def = make(jobs)
-      const childContext = { ...context, sessionID: child }
-
-      const listed = yield* def.execute({ action: "list" }, childContext)
-      expect(listed.metadata.count).toBe(1)
-      expect(listed.output).toContain(`${grandchild}: Owned grandchild`)
-      expect(listed.output).not.toContain("Sibling task")
-
-      const stopped = yield* def.execute({ action: "stop", task_id: sibling }, childContext)
-      expect(stopped.metadata).toMatchObject({ taskId: sibling, stopped: false })
-      expect((yield* jobs.get(sibling))?.status).toBe("running")
-    }),
-  )
-
-  it.instance("refuses to stop an unrelated Task", () =>
-    Effect.gen(function* () {
-      const jobs = yield* BackgroundJob.make
-      yield* jobs.start({
-        id: unrelated,
-        type: "task",
-        metadata: { parentSessionId: SessionID.make("ses_other"), sessionId: unrelated },
-        run: Effect.never,
-      })
-      const def = make(jobs)
-
-      const result = yield* def.execute({ action: "stop", task_id: unrelated }, context)
-
-      expect(result.metadata).toMatchObject({ taskId: unrelated, stopped: false })
-      expect((yield* jobs.get(unrelated))?.status).toBe("running")
+      expect(called).toBe(false)
+      expect(result.metadata.stopped).toBe(false)
+      expect(result.output).toContain("read-only")
     }),
   )
 })
+
+function state(
+  inspection: SessionTaskState.Inspection,
+  stop: SessionTaskState.Interface["stop"] = () => Effect.succeed({ stopped: [], unavailable: [] }),
+): SessionTaskState.Interface {
+  return {
+    withLock: () => (effect) => effect,
+    begin: () => Effect.succeed(1),
+    ensure: () => Effect.succeed(1),
+    settle: () => Effect.succeed(true),
+    deliver: () => Effect.succeed(true),
+    grant: (input) => Effect.succeed(input.requested),
+    get: () => Effect.succeed(undefined),
+    inspect: () => Effect.succeed(inspection),
+    stop,
+    canReadHistory: () => Effect.succeed(false),
+  }
+}
+
+function node(taskID: SessionID, overrides: Partial<SessionTaskState.Node> = {}): SessionTaskState.Node {
+  return {
+    taskID,
+    title: "Task",
+    execution: "running",
+    phase: "starting",
+    startedAt: 1,
+    lastActivityAt: 2,
+    quietForMs: 3,
+    delivery: { status: "pending" },
+    children: [],
+    ...overrides,
+  }
+}
+
+function sessionID(index: number) {
+  return SessionID.make(`ses_${index.toString(16).padStart(12, "0")}${index.toString().padStart(14, "0")}`)
+}

@@ -235,7 +235,7 @@ const layer = Layer.effect(
           )
           // Task results held for a revert see the stale checkpoint when they wake, and drop.
           yield* publishRevertChange(data, sessionID)
-          yield* cancelBackgroundJobs(background, sessionID)
+          const cancelled = yield* cancelBackgroundJobs(background, sessionID)
           const cancellation = yield* SynchronizedRef.modifyEffect(
             data.lifecycle,
             Effect.fnUntraced(function* (admission) {
@@ -246,6 +246,7 @@ const layer = Layer.effect(
             }),
           )
           if (Option.isSome(cancellation)) yield* cancellation.value
+          yield* stopTaskRunners(data, cancelled)
         }),
       )
     })
@@ -381,7 +382,8 @@ const layer = Layer.effect(
       messageIDs: ReadonlySet<string>,
       taskIDs?: ReadonlySet<string>,
     ) {
-      yield* cancelBackgroundJobs(background, sessionID, messageIDs, taskIDs)
+      const cancelled = yield* cancelBackgroundJobs(background, sessionID, messageIDs, taskIDs)
+      yield* InstanceState.useEffect(state, (data) => stopTaskRunners(data, cancelled))
     })
 
     const checkpoint = Effect.fn("SessionRunState.checkpoint")(function* (sessionID: SessionID) {
@@ -593,6 +595,7 @@ const cancelBackgroundJobs = Effect.fn("SessionRunState.cancelBackgroundJobs")(f
       { discard: true },
     )
   yield* Effect.forEach(running, (job) => background.cancel(job.id), { concurrency: "unbounded", discard: true })
+  return running.map((job) => job.id)
 })
 
 function resume(admission: Lifecycle, sessionID: SessionID): Lifecycle {
@@ -600,6 +603,17 @@ function resume(admission: Lifecycle, sessionID: SessionID): Lifecycle {
   const paused = new Set(admission.paused)
   paused.delete(sessionID)
   return { ...admission, paused }
+}
+
+// Task jobs use the Task Session ID as the job ID. Cancellation can finish delivering a Task result later, but it
+// must stop the Task runner first, so a cancelled Task cannot keep working, for example after a revert restores files.
+function stopTaskRunners(data: State, jobIDs: readonly string[]) {
+  // Only Task jobs have a Session runner. Other job IDs are not Session IDs, and decoding them must not fail abort.
+  return Effect.forEach(
+    jobIDs.flatMap((id) => Option.toArray(Schema.decodeUnknownOption(SessionID)(id))),
+    (id) => data.runners.get(id)?.cancel ?? Effect.void,
+    { concurrency: "unbounded", discard: true },
+  )
 }
 
 function publishRevertChange(data: State, sessionID: SessionID) {

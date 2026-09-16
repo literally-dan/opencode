@@ -3,6 +3,7 @@ import { httpClient } from "@opencode-ai/core/effect/app-node-platform"
 import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { PlanExitTool } from "./plan"
 import { Session } from "@/session/session"
+import { SessionTaskState } from "@/session/task-state"
 import { QuestionTool } from "./question"
 import { CompactResultsTool } from "./compact_results"
 import { ReadPartTool } from "./read_part"
@@ -30,6 +31,7 @@ import { Schema } from "effect"
 import z from "zod"
 import { Plugin } from "../plugin"
 import { Provider } from "@/provider/provider"
+import { LLM } from "@/session/llm"
 
 import { WebSearchTool } from "./websearch"
 import { LspTool } from "./lsp"
@@ -493,8 +495,10 @@ export const node = LayerNode.make({
     Agent.node,
     Skill.node,
     Session.node,
+    SessionTaskState.node,
     BackgroundJob.node,
     Provider.node,
+    LLM.node,
     LSP.node,
     Instruction.node,
     FSUtil.node,

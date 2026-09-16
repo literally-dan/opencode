@@ -23,6 +23,8 @@ import { Permission } from "@/permission"
 import { Todo } from "@/session/todo"
 import { Session } from "@/session/session"
 import { SessionStatus } from "@/session/status"
+import { SessionActivity } from "@/session/activity"
+import { SessionTaskState } from "@/session/task-state"
 import { SessionRunState } from "@/session/run-state"
 import { SessionProcessor } from "@/session/processor"
 import { SessionCompaction } from "@/session/compaction"
@@ -79,7 +81,9 @@ export const AppLayer = AppNodeBuilderV1.build(
     Todo.node,
     Session.node,
     SessionProjector.node,
+    SessionActivity.node,
     SessionStatus.node,
+    SessionTaskState.node,
     BackgroundJob.node,
     RuntimeFlags.node,
     EventV2Bridge.node,

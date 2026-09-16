@@ -18,6 +18,7 @@ import { Session as SessionNs } from "@/session/session"
 import { MessageV2 } from "../../src/session/message-v2"
 import { MessageID, PartID, SessionID } from "../../src/session/schema"
 import { SessionStatus } from "../../src/session/status"
+import { SessionTaskState } from "../../src/session/task-state"
 import { SessionSummary } from "../../src/session/summary"
 import { SessionV2 } from "@opencode-ai/core/session"
 import { SessionExecution } from "@opencode-ai/core/session/execution"
@@ -788,7 +789,9 @@ describe("session.compaction.receipts", () => {
       const nextUser = yield* createUserMessage(session.id, "continue")
       const shell = yield* createAssistantMessage(session.id, nextUser.id, test.directory)
       const preStream = yield* compact.collapseReceipts({ sessionID: session.id })
-      const preStreamProjection = JSON.stringify(yield* MessageV2.toModelMessagesEffect(preStream, defaultProvider.model))
+      const preStreamProjection = JSON.stringify(
+        yield* MessageV2.toModelMessagesEffect(preStream, defaultProvider.model),
+      )
       expect(preStreamProjection).toContain("FULL_CONTEXT_INVENTORY")
       expect(writes).toBe(0)
 
@@ -818,19 +821,26 @@ describe("session.compaction.receipts", () => {
           time: { compacted: expect.any(Number) },
         },
       })
-      expect(stored?.type === "tool" && stored.state.status === "completed" && stored.state.compactionGroup).toBeUndefined()
-      expect(stored?.type === "tool" && stored.state.status === "completed" && stored.state.compactionSummary).toBeUndefined()
-      expect(stored?.type === "tool" && stored.state.status === "completed" && stored.state.compactionGeneration).toBeUndefined()
+      expect(
+        stored?.type === "tool" && stored.state.status === "completed" && stored.state.compactionGroup,
+      ).toBeUndefined()
+      expect(
+        stored?.type === "tool" && stored.state.status === "completed" && stored.state.compactionSummary,
+      ).toBeUndefined()
+      expect(
+        stored?.type === "tool" && stored.state.status === "completed" && stored.state.compactionGeneration,
+      ).toBeUndefined()
 
       const readPart = yield* ReadPartTool.pipe(
         Effect.provide(
-          Layer.merge(
+          Layer.mergeAll(
             Layer.mock(Agent.Service, {
               get: () => Effect.succeed({ name: "build", mode: "primary", permission: [], options: {} }),
             }),
             Layer.mock(Truncate.Service, {
               output: (text) => Effect.succeed({ content: text, truncated: false }),
             }),
+            Layer.mock(SessionTaskState.Service, { withLock: () => (effect) => effect }),
           ),
         ),
         Effect.map((info) => info.init()),
@@ -1019,9 +1029,7 @@ describe("session.compaction.prune", () => {
           const storedOld = yield* ssn.findPart({ sessionID: session.id, partID: old.id })
           const storedReceipt = yield* ssn.findPart({ sessionID: session.id, partID: receipt.id })
           expect(
-            storedOld?.type === "tool" &&
-              storedOld.state.status === "completed" &&
-              storedOld.state.time.compacted,
+            storedOld?.type === "tool" && storedOld.state.status === "completed" && storedOld.state.time.compacted,
           ).toBeNumber()
           expect(
             storedReceipt?.type === "tool" &&
