@@ -28,11 +28,13 @@ import { MessageV2 } from "../../session/message-v2"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { EventV2 } from "@opencode-ai/core/event"
 import { SessionPrompt } from "@/session/prompt"
+import { SessionStatus } from "@/session/status"
 import { Git } from "@/git"
 import { setTimeout as sleep } from "node:timers/promises"
 import { Process } from "@/util/process"
 import { parseGitHubRemote } from "@/util/repository"
-import { Effect } from "effect"
+import { Deferred, Effect, Option } from "effect"
+import { sessionTreeRequestRejector } from "./github.requests"
 import { extractResponseText, formatPromptTooLargeError } from "./github.shared"
 
 type GitHubAuthor = {
@@ -382,7 +384,9 @@ export const githubRun = Effect.fn("Cli.github.run")(function* (args: { event?: 
   const sessionSvc = yield* Session.Service
   const sessionShare = yield* SessionShare.Service
   const sessionPrompt = yield* SessionPrompt.Service
+  const sessionStatus = yield* SessionStatus.Service
   const events = yield* EventV2Bridge.Service
+  const rejectSessionTreeRequests = yield* sessionTreeRequestRejector
   const runLocalEffect = <A, E>(effect: Effect.Effect<A, E>) =>
     Effect.runPromise(effect.pipe(Effect.provideService(InstanceRef, ctx)))
   yield* Effect.promise(async () => {
@@ -512,6 +516,8 @@ export const githubRun = Effect.fn("Cli.github.run")(function* (args: { event?: 
         }),
       )
       await subscribeSessionEvents()
+      // chat() waits for idle, and CI has no human to answer requests from the Session tree.
+      await runLocalEffect(rejectSessionTreeRequests(session.id))
       shareId = await (async () => {
         if (share === false) return
         if (!share && repoData.data.private) return
@@ -936,15 +942,32 @@ export const githubRun = Effect.fn("Cli.github.run")(function* (args: { event?: 
             ],
           })
 
-          if (result.info.role === "assistant" && result.info.error) {
-            const err = result.info.error
+          // Background Task results arrive in later turns. Answer from the latest turn once the Session is idle.
+          const idle = yield* Deferred.make<void>()
+          const off = yield* events.listen((evt) => {
+            if (evt.type !== SessionStatus.Event.Status.type) return Effect.void
+            const data = evt.data as EventV2.Data<typeof SessionStatus.Event.Status>
+            if (data.sessionID !== session.id || data.status.type !== "idle") return Effect.void
+            return Deferred.succeed(idle, undefined).pipe(Effect.asVoid)
+          })
+          yield* sessionStatus.get(session.id).pipe(
+            Effect.flatMap((current) => (current.type === "idle" ? Effect.void : Deferred.await(idle))),
+            Effect.ensuring(off),
+          )
+          const answer = Option.getOrElse(
+            yield* sessionSvc.findMessage(session.id, (item) => item.info.role === "assistant").pipe(Effect.orDie),
+            () => result,
+          )
+
+          if (answer.info.role === "assistant" && answer.info.error) {
+            const err = answer.info.error
             console.error("Agent error:", err)
             if (err.name === "ContextOverflowError") throw new Error(formatPromptTooLargeError(files))
             const message = "message" in err.data ? err.data.message : ""
             throw new Error(`${err.name}: ${message}`)
           }
 
-          const text = extractResponseText(result.parts)
+          const text = extractResponseText(answer.parts)
           if (text) return text
 
           console.log("Requesting summary from agent...")
