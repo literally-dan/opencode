@@ -81,4 +81,23 @@ describe("Npm.install", () => {
     await expect(fs.stat(path.join(tmp.path, "node_modules", "prod-pkg"))).resolves.toBeDefined()
     await expect(fs.stat(path.join(tmp.path, "node_modules", "dev-pkg"))).rejects.toThrow()
   })
+
+  // Installs run in the background of long-lived processes such as `opencode serve`. A signal listener added by an
+  // install can delay a termination signal until the event loop ends, which a server never reaches.
+  test("does not listen for process signals while it writes packages", async () => {
+    await using tmp = await tmpdir()
+    await writePackage(tmp.path, { name: "fixture", dependencies: { "local-pkg": "file:./local-pkg" } })
+    await fs.mkdir(path.join(tmp.path, "local-pkg"))
+    await writePackage(path.join(tmp.path, "local-pkg"), { name: "local-pkg" })
+    const signals: string[] = []
+    const observe = (event: string | symbol) => {
+      if (typeof event === "string" && event.startsWith("SIG")) signals.push(event)
+    }
+
+    process.on("newListener", observe)
+    await Npm.install(tmp.path).finally(() => process.off("newListener", observe))
+
+    expect((await fs.stat(path.join(tmp.path, "node_modules", "local-pkg"))).isDirectory()).toBe(true)
+    expect(signals).toEqual([])
+  })
 })

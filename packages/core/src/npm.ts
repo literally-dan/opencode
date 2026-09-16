@@ -1,5 +1,7 @@
+/// <reference path="./npm-arborist.d.ts" />
 export * as Npm from "./npm"
 
+import { EventEmitter } from "events"
 import path from "path"
 import npa from "npm-package-arg"
 import { Effect, Schema, Context, Layer, Option, FileSystem } from "effect"
@@ -80,7 +82,13 @@ const layer = Layer.effect(
     const reify = (input: { dir: string; add?: string[] }) =>
       Effect.gen(function* () {
         yield* flock.acquire(`npm-install:${input.dir}`)
-        const { Arborist } = yield* Effect.promise(() => import("@npmcli/arborist"))
+        const [{ Arborist }, signalHandling] = yield* Effect.promise(() =>
+          Promise.all([import("@npmcli/arborist"), import("@npmcli/arborist/lib/signal-handling.js")]),
+        )
+        // While Arborist writes packages it listens for SIGTERM, SIGINT, SIGHUP and more, and re-sends a caught signal
+        // only when the event loop ends. A long-lived process such as `opencode serve` never gets there, so it would
+        // ignore the signal. Arborist reads the process to listen on from this export; give it a private emitter.
+        signalHandling.default.process = new EventEmitter()
         const add = input.add ?? []
         const npmOptions = yield* NpmConfig.load(input.dir)
         const arborist = new Arborist({
