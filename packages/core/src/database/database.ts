@@ -2,7 +2,8 @@ export * as Database from "./database"
 
 import { EffectDrizzleSqlite } from "@opencode-ai/effect-drizzle-sqlite"
 import { layer as sqliteLayer } from "#sqlite"
-import { Context, Effect, Layer } from "effect"
+import { Cause, Context, Effect, Layer, Predicate } from "effect"
+import { isSqlError } from "effect/unstable/sql/SqlError"
 import { Global } from "../global"
 import { Flag } from "../flag/flag"
 import { isAbsolute, join } from "path"
@@ -26,7 +27,9 @@ const layer = Layer.effect(
 
     yield* db.run("PRAGMA journal_mode = WAL")
     yield* db.run("PRAGMA synchronous = NORMAL")
-    yield* db.run("PRAGMA busy_timeout = 5000")
+    // Several opencode processes write to one database. A write that waited 5 seconds for the lock failed and took its
+    // turn or subagent with it. The wait blocks the process, so it must stay short enough for interactive use.
+    yield* db.run("PRAGMA busy_timeout = 15000")
     yield* db.run("PRAGMA cache_size = -64000")
     yield* db.run("PRAGMA foreign_keys = ON")
     yield* db.run("PRAGMA wal_checkpoint(PASSIVE)")
@@ -52,6 +55,29 @@ export function path() {
   )
     return join(Global.Path.data, "opencode.db")
   return join(Global.Path.data, `opencode-${InstallationChannel.replace(/[^a-zA-Z0-9._-]/g, "-")}.db`)
+}
+
+export function retryLockTimeout<A, E, R>(effect: Effect.Effect<A, E, R>, retries = 1): Effect.Effect<A, E, R> {
+  const run = (remaining: number): Effect.Effect<A, E, R> =>
+    effect.pipe(
+      Effect.catchCause((cause) => {
+        const reason = cause.reasons.length === 1 ? cause.reasons[0] : undefined
+        if (remaining === 0 || !reason || !Cause.isDieReason(reason) || !isLockTimeout(reason.defect))
+          return Effect.failCause(cause)
+        return Effect.logWarning("database lock timeout, retrying", { remaining }).pipe(
+          Effect.andThen(Effect.sleep(100)),
+          Effect.andThen(run(remaining - 1)),
+        )
+      }),
+    )
+  return run(retries)
+}
+
+function isLockTimeout(defect: unknown): boolean {
+  if (isSqlError(defect)) return defect.reason._tag === "LockTimeoutError"
+  // Drizzle statements wrap the SqlError in an EffectDrizzleQueryError whose cause is a Cause.
+  if (!Predicate.isTagged(defect, "EffectDrizzleQueryError") || !Predicate.hasProperty(defect, "cause")) return false
+  return Cause.isCause(defect.cause) && isLockTimeout(Cause.squash(defect.cause))
 }
 
 export const node = makeGlobalNode({ service: Service, layer: layerFromPath(path()), deps: [] })

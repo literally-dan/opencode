@@ -62,7 +62,10 @@ const make = (options: Config) =>
         } catch (cause) {
           return Effect.fail(
             new SqlError({
-              reason: classifySqliteError(cause, { message: "Failed to execute statement", operation: "execute" }),
+              reason: classifySqliteError(Sqlite.withErrno(cause), {
+                message: "Failed to execute statement",
+                operation: "execute",
+              }),
             }),
           )
         }
@@ -80,7 +83,10 @@ const make = (options: Config) =>
         } catch (cause) {
           return Effect.fail(
             new SqlError({
-              reason: classifySqliteError(cause, { message: "Failed to execute statement", operation: "execute" }),
+              reason: classifySqliteError(Sqlite.withErrno(cause), {
+                message: "Failed to execute statement",
+                operation: "execute",
+              }),
             }),
           )
         }
@@ -107,7 +113,10 @@ const make = (options: Config) =>
           try: () => native.loadExtension(path),
           catch: (cause) =>
             new SqlError({
-              reason: classifySqliteError(cause, { message: "Failed to load extension", operation: "loadExtension" }),
+              reason: classifySqliteError(Sqlite.withErrno(cause), {
+                message: "Failed to load extension",
+                operation: "loadExtension",
+              }),
             }),
         }),
     })

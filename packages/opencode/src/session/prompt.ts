@@ -1295,20 +1295,22 @@ const layer = Layer.effect(
         session.model?.id !== message.info.model.modelID ||
         (session.model?.variant === "default" ? undefined : session.model?.variant) !== message.info.model.variant
       ) {
-        yield* sessions.setAgentModel({
-          sessionID: input.sessionID,
-          agent: message.info.agent,
-          model: {
-            id: message.info.model.modelID,
-            providerID: message.info.model.providerID,
-            variant: message.info.model.variant ?? "default",
-          },
-          time: message.info.time.created,
-        })
+        yield* Database.retryLockTimeout(
+          sessions.setAgentModel({
+            sessionID: input.sessionID,
+            agent: message.info.agent,
+            model: {
+              id: message.info.model.modelID,
+              providerID: message.info.model.providerID,
+              variant: message.info.model.variant ?? "default",
+            },
+            time: message.info.time.created,
+          }),
+        )
       }
-      yield* sessions.updateMessage(message.info)
-      for (const part of message.parts) yield* sessions.updatePart(part)
-      yield* sessions.touch(input.sessionID)
+      yield* Database.retryLockTimeout(sessions.updateMessage(message.info))
+      for (const part of message.parts) yield* Database.retryLockTimeout(sessions.updatePart(part))
+      yield* Database.retryLockTimeout(sessions.touch(input.sessionID))
 
       const permissions: PermissionV1.Rule[] = []
       for (const [t, enabled] of Object.entries(input.tools ?? {})) {
@@ -1316,7 +1318,7 @@ const layer = Layer.effect(
       }
       if (permissions.length > 0) {
         session.permission = permissions
-        yield* sessions.setPermission({ sessionID: session.id, permission: permissions })
+        yield* Database.retryLockTimeout(sessions.setPermission({ sessionID: session.id, permission: permissions }))
       }
 
       return message
