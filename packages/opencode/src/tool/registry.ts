@@ -31,6 +31,7 @@ import { Schema } from "effect"
 import z from "zod"
 import { Plugin } from "../plugin"
 import { Provider } from "@/provider/provider"
+import { LLM } from "@/session/llm"
 
 import { WebSearchTool } from "./websearch"
 import { LspTool } from "./lsp"
@@ -497,6 +498,7 @@ export const node = LayerNode.make({
     SessionTaskState.node,
     BackgroundJob.node,
     Provider.node,
+    LLM.node,
     LSP.node,
     Instruction.node,
     FSUtil.node,

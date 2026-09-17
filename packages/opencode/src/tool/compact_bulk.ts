@@ -1,8 +1,13 @@
 import * as Tool from "./tool"
 import DESCRIPTION from "./compact_bulk.txt"
+import type { Agent } from "@/agent/agent"
 import { Session } from "@/session/session"
+import { LLM } from "@/session/llm"
+import { MessageID } from "@/session/schema"
 import { Provider } from "@/provider/provider"
+import { errorMessage } from "@/util/error"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
+import { LLMEvent } from "@opencode-ai/llm"
 import {
   COMPACTION_SUMMARY_MAX_CHARS,
   compactionInput,
@@ -13,8 +18,7 @@ import {
   setCompaction,
   withCompactionLock,
 } from "@/session/compaction-pruning"
-import { generateObject } from "ai"
-import { Cause, Effect, Exit, Ref, Schema } from "effect"
+import { Cause, Effect, Exit, Option, Ref, Schema, Stream } from "effect"
 import { Buffer } from "node:buffer"
 
 const id = "compact_bulk"
@@ -65,6 +69,8 @@ const Summaries = Schema.Struct({
   ),
 })
 
+const decodeSummaries = Schema.decodeUnknownOption(Schema.fromJsonString(Summaries))
+
 const SYSTEM = [
   "You compress segments of an AI agent's own conversation transcript so it can reclaim context while staying effective.",
   "You are given structured data containing a focus, the request being served, and an ordered transcript of messages.",
@@ -74,7 +80,18 @@ const SYSTEM = [
   "For each item with an `id`, write a concise summary that PRESERVES every detail relevant to the focus — file paths, identifiers, decisions, numeric values, error messages, commands, and conclusions — and DROPS boilerplate, repeated verbatim output, and noise.",
   'Write each summary so it stands alone once the original is gone: name what the item was and what came of it, rather than referring to it as "this output".',
   "Return exactly one entry per item with an `id`, echoing that id verbatim. Never summarize a context-only item, never invent ids, and never merge items.",
+  'Reply with only a JSON object of this shape and no other text: {"summaries":[{"id":"<item id>","summary":"<summary>"}]}',
 ].join("\n")
+
+// Its prompt replaces the provider's default agent prompt, so the summarizer
+// sees only its own instructions.
+const SUMMARIZER: Agent.Info = {
+  name: id,
+  mode: "primary",
+  permission: [],
+  options: {},
+  prompt: SYSTEM,
+}
 
 type Outcome =
   | { partID: string; status: "compacted"; label: string; freed: number }
@@ -97,11 +114,16 @@ type Metadata = {
   persistenceError?: string
 }
 
-export const CompactBulkTool = Tool.define<typeof Parameters, Metadata, Session.Service | Provider.Service>(
+export const CompactBulkTool = Tool.define<
+  typeof Parameters,
+  Metadata,
+  Session.Service | Provider.Service | LLM.Service
+>(
   id,
   Effect.gen(function* () {
     const sessions = yield* Session.Service
     const provider = yield* Provider.Service
+    const llm = yield* LLM.Service
 
     return {
       description: DESCRIPTION,
@@ -260,13 +282,17 @@ export const CompactBulkTool = Tool.define<typeof Parameters, Metadata, Session.
               const target =
                 turnModel(messages) ??
                 (yield* provider.defaultModel().pipe(Effect.catch(() => Effect.succeed(undefined))))
-              const language = target
+              const model = target
                 ? yield* provider.getModel(target.providerID, target.modelID).pipe(
-                    Effect.flatMap((model) => provider.getLanguage(model)),
+                    // Loaded here only to degrade before any spend. The session
+                    // stream reuses Provider's cached language model.
+                    Effect.tap((model) => provider.getLanguage(model)),
                     Effect.catch(() => Effect.succeed(undefined)),
                   )
                 : undefined
-              if (!language)
+              // A GitLab Duo workflow model runs its own agent loop, and a session
+              // stream rewires the shared model instance that the running turn uses.
+              if (!model || (model.providerID === "gitlab" && model.api.id.startsWith("duo-workflow-")))
                 return {
                   title: "Bulk compaction unavailable",
                   metadata: {
@@ -300,44 +326,63 @@ export const CompactBulkTool = Tool.define<typeof Parameters, Metadata, Session.
                 (group) =>
                   Effect.gen(function* () {
                     yield* Ref.update(callsRef, (calls) => calls + 1)
-                    const result = yield* Effect.tryPromise({
-                      try: (signal) =>
-                        abortable(
-                          generateObject({
-                            model: language,
-                            schema: Object.assign(
-                              Schema.toStandardSchemaV1(Summaries),
-                              Schema.toStandardJSONSchemaV1(Summaries),
-                            ),
-                            temperature: 0.2,
-                            system: SYSTEM,
-                            prompt: renderPrompt(params.focus, group, surrounding),
-                            abortSignal: AbortSignal.any([ctx.abort, signal]),
-                          }),
-                          ctx.abort,
-                        ),
-                      catch: (error) => (error instanceof Error ? error : new Error(String(error))),
-                    })
+                    // The session request path applies capability-aware sampling,
+                    // provider options, and headers. Some providers accept only
+                    // streaming calls, so the JSON arrives as text. ctx.abort
+                    // interrupts this fiber through the compaction lock, and the
+                    // interruption aborts the provider request.
+                    const events = yield* llm
+                      .stream({
+                        agent: SUMMARIZER,
+                        user: {
+                          id: MessageID.ascending(),
+                          sessionID: ctx.sessionID,
+                          role: "user",
+                          time: { created: Date.now() },
+                          agent: SUMMARIZER.name,
+                          model: { providerID: model.providerID, modelID: model.id },
+                        },
+                        sessionID: ctx.sessionID,
+                        model,
+                        system: [],
+                        messages: [{ role: "user", content: renderPrompt(params.focus, group, surrounding) }],
+                        tools: {},
+                        retries: 2,
+                      })
+                      .pipe(Stream.runCollect)
+                    const failure = events.find(LLMEvent.is.providerError)
+                    if (failure) return rejectAll(group, `secondary summarization failed — ${failure.message}`)
+                    const finish = events.findLast(LLMEvent.is.finish)
                     yield* Ref.update(usageRef, (usage) => ({
-                      inputTokens: usage.inputTokens + (result.usage.inputTokens ?? 0),
-                      outputTokens: usage.outputTokens + (result.usage.outputTokens ?? 0),
-                      totalTokens: usage.totalTokens + (result.usage.totalTokens ?? 0),
+                      inputTokens: usage.inputTokens + (finish?.usage?.inputTokens ?? 0),
+                      outputTokens: usage.outputTokens + (finish?.usage?.outputTokens ?? 0),
+                      totalTokens: usage.totalTokens + (finish?.usage?.totalTokens ?? 0),
                     }))
-                    return validateSummaries(group, result.object.summaries)
+                    // A provider safety classifier can refuse a transcript that quotes
+                    // tool instructions. That is not a parse failure, and retrying the
+                    // same data is unlikely to help.
+                    if (finish?.reason === "content-filter")
+                      return rejectAll(group, "summarizer refused the request (content filter)")
+                    const parsed = parseSummaries(
+                      events
+                        .filter(LLMEvent.is.textDelta)
+                        .map((event) => event.text)
+                        .join(""),
+                    )
+                    if (!parsed) return rejectAll(group, "summarizer returned invalid JSON")
+                    return validateSummaries(group, parsed.summaries)
                   }).pipe(
                     // Contained per chunk: one failed call must not discard the
                     // summaries the other calls already paid for and got right.
-                    Effect.catch((error) =>
-                      ctx.abort.aborted
-                        ? Effect.interrupt
-                        : Effect.succeed({
-                            accepted: [] as { id: string; summary: string }[],
-                            rejected: group.map((item) => ({
-                              id: item.id,
-                              reason: `secondary summarization failed — ${error.message}`,
-                            })),
-                          }),
-                    ),
+                    // Plugin hooks on the request path fail as defects, so the
+                    // whole cause is contained, not only typed errors.
+                    Effect.catchCause((cause) => {
+                      if (ctx.abort.aborted) return Effect.interrupt
+                      if (Cause.hasInterrupts(cause)) return Effect.failCause(cause)
+                      return Effect.succeed(
+                        rejectAll(group, `secondary summarization failed — ${errorMessage(Cause.squash(cause))}`),
+                      )
+                    }),
                   ),
                 { concurrency: 4 },
               )
@@ -657,6 +702,19 @@ function validateInput(focus: string, partIDs: readonly string[]) {
   if (oversizedID) return `Part IDs are limited to ${MAX_PART_ID_BYTES} bytes.`
 }
 
+// Without a structured-output mode, models often wrap the JSON in a code fence
+// or a sentence. The first candidate that decodes to the exact shape wins.
+function parseSummaries(text: string) {
+  const start = text.search(/\{\s*"summaries"\s*:/)
+  return [
+    text,
+    ...Array.from(text.matchAll(/```[a-z]*\s*([\s\S]*?)```/gi), (match) => match[1] ?? ""),
+    ...(start === -1 ? [] : [text.slice(start, text.lastIndexOf("}") + 1)]),
+  ]
+    .map((candidate) => decodeSummaries(candidate))
+    .find(Option.isSome)?.value
+}
+
 // Judged one part at a time. A summarizer that returns junk for a single item —
 // or silently drops it — used to cost the caller every other summary in the same
 // call, which is the opposite of what a batch tool is for: each part either gets
@@ -692,30 +750,19 @@ function validateSummaries(
   return { accepted, rejected }
 }
 
+function rejectAll(group: readonly { id: string }[], reason: string) {
+  return {
+    accepted: [] as { id: string; summary: string }[],
+    rejected: group.map((item) => ({ id: item.id, reason })),
+  }
+}
+
 function rejected(reason: string, skipped: number) {
   return {
     title: "Bulk compaction rejected",
     metadata: { compacted: 0, skipped, charsFreed: 0, summarizerCalls: 0 },
     output: `${reason} No parts were compacted; reduce the selection and retry.`,
   }
-}
-
-function abortable<T>(promise: Promise<T>, signal: AbortSignal) {
-  if (signal.aborted) return Promise.reject(signal.reason)
-  return new Promise<T>((resolve, reject) => {
-    const abort = () => reject(signal.reason)
-    signal.addEventListener("abort", abort, { once: true })
-    promise.then(
-      (value) => {
-        signal.removeEventListener("abort", abort)
-        resolve(value)
-      },
-      (error) => {
-        signal.removeEventListener("abort", abort)
-        reject(error)
-      },
-    )
-  })
 }
 
 export * as CompactBulk from "./compact_bulk"
