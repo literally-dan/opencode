@@ -312,11 +312,30 @@ export function Prompt(props: PromptProps) {
     ),
   )
 
-  // Initialize agent/model/variant from last user message when session changes
+  // The agent and model of the Session's newest prompt. Only the newest messages are loaded, so a long turn can leave
+  // no user message in them. The Session records the same values, and they are the fallback: without it the prompt
+  // keeps the default model, and the next prompt moves the Session to that model.
+  const lastPrompt = createMemo(() => {
+    const msg = lastUserMessage()
+    if (msg) return msg
+    if (!props.sessionID || !sync.data.message[props.sessionID]) return undefined
+    const session = sync.session.get(props.sessionID)
+    if (!session?.agent || !session.model) return undefined
+    return {
+      agent: session.agent,
+      model: {
+        providerID: session.model.providerID,
+        modelID: session.model.id,
+        variant: session.model.variant === "default" ? undefined : session.model.variant,
+      },
+    }
+  })
+
+  // Initialize agent/model/variant from the newest prompt when session changes
   let syncedSessionID: string | undefined
   createEffect(() => {
     const sessionID = props.sessionID
-    const msg = lastUserMessage()
+    const msg = lastPrompt()
 
     if (sessionID !== syncedSessionID) {
       if (!sessionID || !msg) return

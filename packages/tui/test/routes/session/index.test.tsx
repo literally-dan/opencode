@@ -438,3 +438,82 @@ test("ignores subagent session loads aborted by quitting", async () => {
     if (!mounted.app.renderer.isDestroyed) mounted.app.renderer.destroy()
   }
 })
+
+test("keeps the session's agent and model when no user message is loaded", async () => {
+  await using tmp = await tmpdir()
+  const model = (id: string, name: string) => ({
+    id,
+    providerID: "test",
+    api: { id, url: "http://test", npm: "test" },
+    name,
+    capabilities: {
+      temperature: true,
+      reasoning: true,
+      attachment: false,
+      toolcall: true,
+      input: { text: true, audio: false, image: false, video: false, pdf: false },
+      output: { text: true, audio: false, image: false, video: false, pdf: false },
+      interleaved: false,
+    },
+    cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+    limit: { context: 1000, output: 1000 },
+    status: "active",
+    options: {},
+    headers: {},
+    release_date: "2026-01-01",
+    variants: { high: {} },
+  })
+  const provider = {
+    id: "test",
+    name: "Test provider",
+    source: "custom",
+    env: [],
+    options: {},
+    models: { fallback: model("fallback", "Fallback model"), chosen: model("chosen", "Chosen model") },
+  }
+  // The Session records the agent and model of its newest prompt.
+  const session = {
+    ...root,
+    agent: "build",
+    model: { id: "chosen", providerID: "test", variant: "high" },
+  } satisfies SessionInfo
+  // Only the newest messages are loaded. After a long turn they hold no user message.
+  const assistant = {
+    id: "msg_assistant",
+    sessionID: root.id,
+    role: "assistant",
+    agent: "build",
+    modelID: "chosen",
+    providerID: "test",
+    mode: "build",
+    parentID: "msg_user_not_loaded",
+    path: { cwd: directory, root: directory },
+    cost: 0,
+    tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+    time: { created: 2, completed: 3 },
+  } satisfies AssistantMessage
+  const mounted = await mountRoute(
+    tmp.path,
+    () => <Prompt sessionID={root.id} visible />,
+    (request) => {
+      const url = new URL(request.url)
+      if (url.pathname === "/agent")
+        return json([{ name: "build", mode: "primary", hidden: false, permission: [], options: {} }])
+      if (url.pathname === "/config/providers")
+        return json({ providers: [provider], default: { test: "fallback" }, connected: ["test"] })
+      if (url.pathname === "/session" && request.method === "GET") return json([session, child])
+      if (url.pathname === `/session/${root.id}`) return json(session)
+      if (url.pathname === `/session/${root.id}/message`) return json([{ info: assistant, parts: [] }])
+    },
+  )
+
+  try {
+    // Before the messages are loaded the prompt shows the default model.
+    await waitForText(mounted.app, "Fallback model")
+    await mounted.sync.session.sync(root.id)
+    expect(await waitForText(mounted.app, "Chosen model")).not.toContain("Fallback model")
+    await waitForText(mounted.app, "high")
+  } finally {
+    mounted.app.renderer.destroy()
+  }
+})
